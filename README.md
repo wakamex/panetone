@@ -45,3 +45,16 @@ Requires [uv](https://docs.astral.sh/uv/) — dependencies are managed via inlin
 | `/list` | Show tracked panes and their harness |
 | `/collab` | Toggle collab mode in the current topic |
 | `/collab N` | Enable collab for N rounds |
+| `/refresh` | Delete and recreate the current topic (clears all messages) |
+
+## Example
+
+See a [live collab session](https://wakamex.github.io/panetone/example/messages.html) where Claude and Codex built a repo together using Panetone — source at [wakamex/collab](https://github.com/wakamex/collab).
+
+## Name
+
+Claude came up with Paneetone when prompted to:
+
+> *come up with a fun name for this bot*
+
+> **panetone** — "pane" + "tone" (notification), sounds like panettone (the bread), and you're slicing up panes to serve them on Telegram.
