@@ -33,10 +33,10 @@ WEZ_TG_OWNER=your-telegram-user-id         # optional
 4. Run:
 
 ```
-./bridge.py
+uv run bridge.py
 ```
 
-Requires [uv](https://docs.astral.sh/uv/) — dependencies are managed via inline script metadata.
+Requires [uv](https://docs.astral.sh/uv/) — dependencies are installed automatically via inline script metadata.
 
 ## Commands
 
