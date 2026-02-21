@@ -116,7 +116,7 @@ def _codex_find_session(cwd):
     global _codex_cache, _codex_cache_t
     now = time.time()
 
-    if now - _codex_cache_t > 30:
+    if now - _codex_cache_t > 5:
         _codex_cache = {}
         for days_ago in range(2):
             t = time.gmtime(now - days_ago * 86400)
@@ -156,27 +156,10 @@ def _claude_format(record):
     content = record.get("message", {}).get("content", [])
     parts = []
     for block in content:
-        btype = block.get("type")
-        if btype == "text":
+        if block.get("type") == "text":
             t = block.get("text", "").strip()
             if t:
                 parts.append(t)
-        elif btype == "tool_use":
-            name = block.get("name", "?")
-            inp = block.get("input", {})
-            if name in ("Read", "Glob", "Grep"):
-                target = (
-                    inp.get("file_path") or inp.get("pattern") or inp.get("path", "")
-                )
-                parts.append(f"[{name}: {target}]")
-            elif name in ("Edit", "Write"):
-                parts.append(f"[{name}: {inp.get('file_path', '?')}]")
-            elif name == "Bash":
-                parts.append(f"[$ {inp.get('command', '')[:80]}]")
-            elif name == "Task":
-                parts.append(f"[Task: {inp.get('description', '?')}]")
-            else:
-                parts.append(f"[{name}]")
     return "\n".join(parts) if parts else None
 
 
@@ -184,7 +167,6 @@ def _codex_format(record):
     if record.get("type") != "response_item":
         return None
     p = record.get("payload", {})
-
     if p.get("type") == "message" and p.get("role") == "assistant":
         parts = []
         for block in p.get("content", []):
@@ -193,20 +175,6 @@ def _codex_format(record):
                 if t:
                     parts.append(t)
         return "\n".join(parts) if parts else None
-
-    if p.get("type") == "function_call":
-        name = p.get("name", "?")
-        try:
-            args = json.loads(p.get("arguments", "{}"))
-            if name == "exec_command":
-                return f"[$ {args.get('cmd', '')[:80]}]"
-        except json.JSONDecodeError:
-            pass
-        return f"[{name}]"
-
-    if p.get("type") == "custom_tool_call":
-        return f"[{p.get('name', '?')}]"
-
     return None
 
 
@@ -219,6 +187,7 @@ class Harness:
         self.bot = Bot(token)
         self.find_session = find_session
         self.format_record = format_record
+        self.display_name = name  # updated from bot profile at startup
 
 
 harnesses = {}  # name -> Harness
@@ -284,7 +253,10 @@ def _rebuild():
 
 
 def _persist():
-    _save({str(k): v for k, v in tab_topic.items()})
+    _save({
+        "topics": {str(k): v for k, v in tab_topic.items()},
+        "collab": {str(k): v for k, v in collab_tabs.items()},
+    })
 
 
 def _seek_to_end(pid):
@@ -303,7 +275,7 @@ def _seek_to_end(pid):
 
 _SHELLS = frozenset({
     "zsh", "bash", "fish", "sh", "dash",
-    "node", "uv", "python", "python3", "ruby",
+    "uv", "python", "python3", "ruby",
     "nvim", "vim", "nano", "htop", "top", "less", "man",
 })
 
@@ -478,8 +450,9 @@ async def check_output():
             # collab: forward to other harness panes in this tab
             tab_id = pane_tab.get(pid)
             if tab_id and tab_id in collab_tabs:
+                prefixed = f"{h.display_name} says:\n{msg}"
                 for target_pid in _other_panes(tab_id, pid):
-                    await send_text(target_pid, msg)
+                    await send_text(target_pid, prefixed)
                 # decrement rounds if limited
                 rounds = collab_tabs[tab_id]
                 if rounds > 0:
@@ -500,11 +473,10 @@ collab_tabs = {}  # tab_id -> rounds_remaining (0 = infinite)
 
 
 def _other_panes(tab_id, src_pid):
-    """Find panes in the same tab belonging to different harnesses."""
-    src_h = pane_harness.get(src_pid)
+    """Find other panes in the same tab."""
     return [
-        p for p, h in pane_harness.items()
-        if pane_tab.get(p) == tab_id and h != src_h
+        p for p, t in pane_tab.items()
+        if t == tab_id and p != src_pid
     ]
 
 
@@ -547,12 +519,11 @@ async def on_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     if pid is not None:
         tab_id = pane_tab.get(pid)
         if tab_id and tab_id in collab_tabs:
-            # send to all harness panes in this tab
-            seen = set()
-            for p, h in pane_harness.items():
-                if pane_tab.get(p) == tab_id and p not in seen:
-                    await send_text(p, m.text)
-                    seen.add(p)
+            # send to all panes in this tab (matched or not)
+            targets = [p for p, t in pane_tab.items() if t == tab_id]
+            print(f"[collab] tab={tab_id} targets={targets}")
+            for p in targets:
+                await send_text(p, m.text)
         else:
             await send_text(pid, m.text)
 
@@ -567,6 +538,7 @@ async def on_collab(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 
     if tab_id in collab_tabs:
         del collab_tabs[tab_id]
+        _persist()
         await m.reply_text("collab off")
     else:
         # parse optional rounds: /collab 10
@@ -578,6 +550,7 @@ async def on_collab(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
             except ValueError:
                 pass
         collab_tabs[tab_id] = rounds
+        _persist()
         label = f"collab on ({rounds} rounds)" if rounds else "collab on"
         await m.reply_text(label)
 
@@ -587,16 +560,53 @@ async def on_list(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     if not matched and not unmatched:
         await update.message.reply_text("no panes")
         return
+    collab_tab_ids = set(collab_tabs.keys())
     lines = []
     for p, h_name in matched:
         tab = html.escape(p.get("tab_title", ""))
         title = html.escape(p.get("title", "?"))
-        lines.append(f"<code>{h_name:6}</code> <b>{tab}</b> {title}")
+        flag = " 🤝" if p["tab_id"] in collab_tab_ids else ""
+        lines.append(f"<code>{h_name:6}</code> <b>{tab}</b> {title}{flag}")
     for p, _ in unmatched:
         tab = html.escape(p.get("tab_title", ""))
         title = html.escape(p.get("title", "?"))
-        lines.append(f"<code>{'--':6}</code> <b>{tab}</b> {title}")
+        flag = " 🤝" if p["tab_id"] in collab_tab_ids else ""
+        lines.append(f"<code>{'--':6}</code> <b>{tab}</b> {title}{flag}")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def on_clear(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    m = update.message
+    if not m or not m.message_thread_id or not _is_owner(update):
+        return
+    tid = m.message_thread_id
+    tab_id = topic_tab.get(tid)
+    if not tab_id:
+        return
+    # get tab title for recreation
+    matched, unmatched = await discover()
+    name = f"tab-{tab_id}"
+    for p, _ in matched + unmatched:
+        if p["tab_id"] == tab_id:
+            name = p.get("tab_title", name)[:128]
+            break
+    try:
+        await _primary_bot.delete_forum_topic(CHAT, tid)
+        t = await _primary_bot.create_forum_topic(CHAT, name)
+        tab_topic[tab_id] = t.message_thread_id
+        _rebuild()
+        _persist()
+        # clear tracked messages for this topic
+        for mid in [k for k, v in msg_pane.items()
+                    if pane_tab.get(v) == tab_id]:
+            msg_pane.pop(mid, None)
+        # re-seek so we don't replay old output
+        for pid, tab in pane_tab.items():
+            if tab == tab_id:
+                _seek_to_end(pid)
+        print(f"[clear] recreated topic for tab {tab_id}")
+    except Exception as e:
+        print(f"clear: {e}")
 
 
 # --- lifecycle -------------------------------------------------------------
@@ -618,9 +628,21 @@ async def startup(app: Application):
     _init_harnesses()
     _primary_bot = harnesses["claude"].bot
 
+    # fetch bot display names
+    for h in harnesses.values():
+        try:
+            me = await h.bot.get_me()
+            h.display_name = me.first_name
+        except Exception:
+            pass
+
     saved = _load()
-    for k, v in saved.items():
+    # migrate flat format (old) to nested format
+    topics = saved.get("topics", saved) if "topics" in saved else saved
+    for k, v in topics.items():
         tab_topic[int(k)] = v
+    for k, v in saved.get("collab", {}).items():
+        collab_tabs[int(k)] = v
     _rebuild()
 
     matched, unmatched = await discover()
@@ -642,6 +664,7 @@ def main():
     app = Application.builder().token(CLAUDE_TOKEN).post_init(startup).build()
     app.add_handler(CommandHandler("list", on_list))
     app.add_handler(CommandHandler("collab", on_collab))
+    app.add_handler(CommandHandler("refresh", on_clear))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     names = ", ".join(harnesses.keys())
     print(f"panetone: [{names}] polling chat {CHAT} every {POLL}s")
