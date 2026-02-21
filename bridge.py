@@ -449,6 +449,38 @@ async def check_output():
                 except Exception as e:
                     print(f"send err [{h.name}/{pid}]: {e}")
 
+            # collab: forward to other harness panes in this tab
+            tab_id = pane_tab.get(pid)
+            if tab_id and tab_id in collab_tabs:
+                for target_pid in _other_panes(tab_id, pid):
+                    await send_text(target_pid, msg)
+                # decrement rounds if limited
+                rounds = collab_tabs[tab_id]
+                if rounds > 0:
+                    collab_tabs[tab_id] = rounds - 1
+                    if rounds - 1 <= 0:
+                        del collab_tabs[tab_id]
+                        try:
+                            await _primary_bot.send_message(
+                                CHAT, "collab done", message_thread_id=tid
+                            )
+                        except Exception:
+                            pass
+
+
+# --- collab mode -----------------------------------------------------------
+
+collab_tabs = {}  # tab_id -> rounds_remaining (0 = infinite)
+
+
+def _other_panes(tab_id, src_pid):
+    """Find panes in the same tab belonging to different harnesses."""
+    src_h = pane_harness.get(src_pid)
+    return [
+        p for p, h in pane_harness.items()
+        if pane_tab.get(p) == tab_id and h != src_h
+    ]
+
 
 # --- telegram handlers -----------------------------------------------------
 
@@ -481,6 +513,31 @@ async def on_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 
     if pid is not None:
         await send_text(pid, m.text)
+
+
+async def on_collab(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    m = update.message
+    if not m or not m.message_thread_id or not _is_owner(update):
+        return
+    tab_id = topic_tab.get(m.message_thread_id)
+    if not tab_id:
+        return
+
+    if tab_id in collab_tabs:
+        del collab_tabs[tab_id]
+        await m.reply_text("collab off")
+    else:
+        # parse optional rounds: /collab 10
+        rounds = 0
+        args = (m.text or "").split()
+        if len(args) > 1:
+            try:
+                rounds = int(args[1])
+            except ValueError:
+                pass
+        collab_tabs[tab_id] = rounds
+        label = f"collab on ({rounds} rounds)" if rounds else "collab on"
+        await m.reply_text(label)
 
 
 async def on_list(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
@@ -535,6 +592,7 @@ def main():
     _init_harnesses()
     app = Application.builder().token(CLAUDE_TOKEN).post_init(startup).build()
     app.add_handler(CommandHandler("list", on_list))
+    app.add_handler(CommandHandler("collab", on_collab))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     names = ", ".join(harnesses.keys())
     print(f"panetone: [{names}] polling chat {CHAT} every {POLL}s")
