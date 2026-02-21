@@ -59,12 +59,6 @@ CODEX_DIR = Path.home() / ".codex" / "sessions"
 
 # --- wezterm cli -----------------------------------------------------------
 
-_SHELLS = frozenset({
-    "zsh", "bash", "fish", "sh", "dash",
-    "node", "uv", "python", "python3", "ruby",
-    "nvim", "vim", "nano", "htop", "top", "less", "man",
-})
-
 
 def _wez_sync(*args):
     try:
@@ -307,14 +301,23 @@ def _seek_to_end(pid):
 # --- pane discovery --------------------------------------------------------
 
 
+_SHELLS = frozenset({
+    "zsh", "bash", "fish", "sh", "dash",
+    "node", "uv", "python", "python3", "ruby",
+    "nvim", "vim", "nano", "htop", "top", "less", "man",
+})
+
+
 def _discover_sync():
-    """Find non-shell panes, classify by harness."""
+    """Find all panes, classify by harness where possible."""
     all_panes = _all_panes_sync()
     by_tab = {}
     for p in all_panes:
         by_tab.setdefault(p["tab_id"], []).append(p)
 
-    result = []  # (pane, harness_name)
+    matched = []  # (pane, harness_name) — have a session file
+    unmatched = []  # (pane, None) — no session but not a shell
+
     for panes in by_tab.values():
         claimed = set()
         for h_name, h in harnesses.items():
@@ -329,9 +332,14 @@ def _discover_sync():
                     if mt > best_mt:
                         best_pane, best_mt = p, mt
             if best_pane:
-                result.append((best_pane, h_name))
+                matched.append((best_pane, h_name))
                 claimed.add(best_pane["pane_id"])
-    return result
+        # also track non-shell panes without sessions (for topic creation + input)
+        for p in panes:
+            if p["pane_id"] not in claimed:
+                if p["title"].strip().lower() not in _SHELLS:
+                    unmatched.append((p, None))
+    return matched, unmatched
 
 
 async def discover():
@@ -343,12 +351,13 @@ async def discover():
 _primary_bot = None  # set in startup, used for topic management
 
 
-async def sync_topics(panes):
+async def sync_topics(matched, unmatched):
     active_pids = set()
     active_tabs = set()
     dirty = False
 
-    for p, h_name in panes:
+    # track harness-matched panes (have session files, output works)
+    for p, h_name in matched:
         pid = p["pane_id"]
         tab_id = p["tab_id"]
         cwd = _parse_cwd(p.get("cwd", ""))
@@ -368,7 +377,24 @@ async def sync_topics(panes):
         if pid not in file_pos:
             _seek_to_end(pid)
 
-    for pid in [p for p in list(pane_harness) if p not in active_pids]:
+    # also create topics + track panes that don't have sessions yet (input only)
+    for p, _ in unmatched:
+        pid = p["pane_id"]
+        tab_id = p["tab_id"]
+        cwd = _parse_cwd(p.get("cwd", ""))
+        title = p.get("tab_title", f"tab-{tab_id}")[:128]
+
+        active_pids.add(pid)
+        active_tabs.add(tab_id)
+        pane_tab[pid] = tab_id
+        pane_cwds[pid] = cwd
+
+        if tab_id not in tab_topic:
+            t = await _primary_bot.create_forum_topic(CHAT, title)
+            tab_topic[tab_id] = t.message_thread_id
+            dirty = True
+
+    for pid in [p for p in list(pane_tab) if p not in active_pids]:
         pane_harness.pop(pid, None)
         pane_tab.pop(pid, None)
         pane_cwds.pop(pid, None)
@@ -500,16 +526,23 @@ async def on_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     if m.reply_to_message:
         pid = msg_pane.get(m.reply_to_message.message_id)
 
-    # otherwise -> first pane in this tab (prefer claude)
+    # otherwise -> first pane in this tab (prefer claude, then any tracked pane)
     if pid is None:
         tab_id = topic_tab.get(m.message_thread_id)
         if tab_id:
+            # prefer harness-matched panes (claude first)
             for p, h in sorted(
                 pane_harness.items(), key=lambda x: x[1] != "claude"
             ):
                 if pane_tab.get(p) == tab_id:
                     pid = p
                     break
+            # fall back to any pane in this tab
+            if pid is None:
+                for p, t in pane_tab.items():
+                    if t == tab_id:
+                        pid = p
+                        break
 
     if pid is not None:
         tab_id = pane_tab.get(pid)
@@ -550,15 +583,19 @@ async def on_collab(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_list(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
-    panes = await discover()
-    if not panes:
+    matched, unmatched = await discover()
+    if not matched and not unmatched:
         await update.message.reply_text("no panes")
         return
     lines = []
-    for p, h_name in panes:
+    for p, h_name in matched:
         tab = html.escape(p.get("tab_title", ""))
         title = html.escape(p.get("title", "?"))
         lines.append(f"<code>{h_name:6}</code> <b>{tab}</b> {title}")
+    for p, _ in unmatched:
+        tab = html.escape(p.get("tab_title", ""))
+        title = html.escape(p.get("title", "?"))
+        lines.append(f"<code>{'--':6}</code> <b>{tab}</b> {title}")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
@@ -568,8 +605,8 @@ async def on_list(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 async def poll_loop():
     while True:
         try:
-            panes = await discover()
-            await sync_topics(panes)
+            matched, unmatched = await discover()
+            await sync_topics(matched, unmatched)
             await check_output()
         except Exception as e:
             print(f"tick: {e}")
@@ -586,13 +623,16 @@ async def startup(app: Application):
         tab_topic[int(k)] = v
     _rebuild()
 
-    panes = await discover()
-    for p, h_name in panes:
+    matched, unmatched = await discover()
+    for p, h_name in matched:
         pid = p["pane_id"]
         pane_harness[pid] = h_name
         pane_tab[pid] = p["tab_id"]
         pane_cwds[pid] = _parse_cwd(p.get("cwd", ""))
         _seek_to_end(pid)
+    for p, _ in unmatched:
+        pane_tab[p["pane_id"]] = p["tab_id"]
+        pane_cwds[p["pane_id"]] = _parse_cwd(p.get("cwd", ""))
 
     asyncio.create_task(poll_loop())
 
