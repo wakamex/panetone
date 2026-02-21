@@ -512,7 +512,16 @@ async def on_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
                     break
 
     if pid is not None:
-        await send_text(pid, m.text)
+        tab_id = pane_tab.get(pid)
+        if tab_id and tab_id in collab_tabs:
+            # send to all harness panes in this tab
+            seen = set()
+            for p, h in pane_harness.items():
+                if pane_tab.get(p) == tab_id and p not in seen:
+                    await send_text(p, m.text)
+                    seen.add(p)
+        else:
+            await send_text(pid, m.text)
 
 
 async def on_collab(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
