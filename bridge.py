@@ -3,18 +3,24 @@
 # requires-python = ">=3.14"
 # dependencies = ["python-telegram-bot>=22.0"]
 # ///
-"""panetone: wezterm <> telegram bridge for multiple AI coding agents
+"""panetone: wezterm <> telegram/signal bridge for multiple AI coding agents
 
-Each wezterm tab gets one Telegram forum topic (by tab_title).
-Multiple harnesses (Claude, Codex, ...) share the topic but post
-via their own bot identity. Replies route to the right pane.
+Each wezterm tab gets one Telegram forum topic (by tab_title) and/or
+one Signal group chat. Multiple harnesses (Claude, Codex, ...) share
+the channel but post via their own identity. Replies route to the right pane.
 
-Env:
-  WEZ_TG_TOKEN_CLAUDE  - bot token for Claude messages (required)
-  WEZ_TG_TOKEN_CODEX   - bot token for Codex messages (optional)
-  WEZ_TG_CHAT          - forum group chat id
-  WEZ_TG_OWNER         - your telegram user id (optional lock)
-  WEZ_TG_POLL          - poll interval seconds (default 2)
+Env (Telegram):
+  WEZ_TG_TOKEN_CLAUDE   - bot token for Claude messages (required)
+  WEZ_TG_TOKEN_CODEX    - bot token for Codex messages (optional)
+  WEZ_TG_TOKEN_OPENCODE - bot token for OpenCode messages (optional)
+  WEZ_TG_CHAT           - forum group chat id
+  WEZ_TG_OWNER          - your telegram user id (optional lock)
+  WEZ_TG_POLL           - poll interval seconds (default 2)
+
+Env (Signal — all three required to enable):
+  WEZ_SIG_SOCKET         - path to signal-cli UNIX socket
+  WEZ_SIG_ACCOUNT        - signal-cli registered number (the "bot")
+  WEZ_SIG_OWNER          - your personal Signal number (invited to groups)
 """
 
 import asyncio
@@ -22,7 +28,9 @@ import html
 import json
 import os
 import re
+import sqlite3
 import subprocess
+import sys
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -54,8 +62,20 @@ POLL = float(os.environ.get("WEZ_TG_POLL", "2"))
 STATE = Path(
     os.environ.get("WEZ_TG_STATE", "~/.config/wez-tg/state.json")
 ).expanduser()
+OPENCODE_TOKEN = os.environ.get("WEZ_TG_TOKEN_OPENCODE", "")
+GEMINI_TOKEN = os.environ.get("WEZ_TG_TOKEN_GEMINI", "")
 CLAUDE_DIR = Path.home() / ".claude" / "projects"
 CODEX_DIR = Path.home() / ".codex" / "sessions"
+OPENCODE_DB = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+GEMINI_DIR = Path.home() / ".gemini" / "tmp"
+
+SIGNAL_SOCKET = os.environ.get("WEZ_SIG_SOCKET", "")
+SIGNAL_ACCOUNT = os.environ.get("WEZ_SIG_ACCOUNT", "")
+SIGNAL_OWNER = os.environ.get("WEZ_SIG_OWNER", "")
+SIGNAL_ENABLED = bool(SIGNAL_SOCKET and SIGNAL_ACCOUNT and SIGNAL_OWNER)
+SIGNAL_TABS = [t.strip().lower() for t in os.environ.get("WEZ_SIG_TABS", "").split(",") if t.strip()]
+SIGNAL_ALLOWED = {s.strip() for s in os.environ.get("WEZ_SIG_ALLOWED", "").split(",") if s.strip()}
+SIGNAL_MEMBERS = [s.strip() for s in os.environ.get("WEZ_SIG_MEMBERS", "").split(",") if s.strip()]
 
 # --- wezterm cli -----------------------------------------------------------
 
@@ -79,7 +99,7 @@ def _send_text_sync(pid, text):
     try:
         pane = ["wezterm", "cli", "send-text", "--pane-id", str(pid)]
         subprocess.run(pane, input=text.encode(), capture_output=True, timeout=5)
-        time.sleep(0.1)
+        time.sleep(0.2)
         subprocess.run(
             pane + ["--no-paste"], input=b"\x0d", capture_output=True, timeout=5
         )
@@ -87,8 +107,71 @@ def _send_text_sync(pid, text):
         pass
 
 
+def _send_enter_sync(pid):
+    try:
+        pane = ["wezterm", "cli", "send-text", "--pane-id", str(pid), "--no-paste"]
+        subprocess.run(pane, input=b"\x0d", capture_output=True, timeout=5)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+
 async def send_text(pid, text):
     await asyncio.to_thread(_send_text_sync, pid, text)
+
+
+def _get_session_path(pid):
+    """Return the session file path for a pane, or None."""
+    h = harnesses.get(pane_harness.get(pid, ""))
+    cwd = pane_cwds.get(pid)
+    if not h or not cwd:
+        return None
+    if h.name == "opencode":
+        return None  # DB-based, can't watch mtime
+    session = h.find_session(cwd)
+    return str(session) if session else None
+
+
+def _watch_mtime_sync(path, baseline_mtime, timeout_s):
+    """Poll file mtime until it changes from baseline. Return ms elapsed or None."""
+    start = time.monotonic()
+    deadline = start + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            mt = os.path.getmtime(path)
+            if mt != baseline_mtime:
+                return int((time.monotonic() - start) * 1000)
+        except OSError:
+            pass
+        time.sleep(0.01)  # 10ms poll
+    return None
+
+
+async def send_and_verify(pid, text):
+    """Send text to pane, watch session file for update, retry Enter if needed."""
+    path = _get_session_path(pid)
+    if not path:
+        await send_text(pid, text)
+        return "?"
+    try:
+        baseline = os.path.getmtime(path)
+    except OSError:
+        await send_text(pid, text)
+        return "?"
+    await send_text(pid, text)
+    ms = await asyncio.to_thread(_watch_mtime_sync, path, baseline, 2.0)
+    if ms is not None:
+        return f"\u2713 {ms}ms"
+    # Enter might not have registered — retry Enter
+    await asyncio.to_thread(_send_enter_sync, pid)
+    ms = await asyncio.to_thread(_watch_mtime_sync, path, baseline, 2.0)
+    if ms is not None:
+        return f"\u2713 {ms}ms (enter retry)"
+    # paste itself may have been dropped — full resend
+    await send_text(pid, text)
+    ms = await asyncio.to_thread(_watch_mtime_sync, path, baseline, 2.0)
+    if ms is not None:
+        return f"\u2713 {ms}ms (resend)"
+    return "\u2717 >6s"
 
 
 def _parse_cwd(cwd_url):
@@ -147,6 +230,134 @@ def _codex_find_session(cwd):
     return best
 
 
+def _opencode_find_session(cwd):
+    """Return (db_path, session_id) or None."""
+    if not OPENCODE_DB.exists():
+        print(f"[opencode] db not found: {OPENCODE_DB}")
+        return None
+    try:
+        con = sqlite3.connect(str(OPENCODE_DB), timeout=2)
+        row = con.execute(
+            "SELECT id FROM session WHERE directory = ? "
+            "ORDER BY rowid DESC LIMIT 1",
+            (cwd,),
+        ).fetchone()
+        con.close()
+        if row:
+            return (OPENCODE_DB, row[0])
+    except (sqlite3.Error, OSError) as e:
+        print(f"[opencode] find_session error: {e}")
+    return None
+
+
+# opencode state: session_id -> last seen part rowid
+_oc_cursors = {}  # session_id -> max_rowid
+
+
+def _opencode_seek_end(session_info):
+    """Set cursor to max rowid so we skip existing messages."""
+    db_path, session_id = session_info
+    try:
+        con = sqlite3.connect(str(db_path), timeout=2)
+        row = con.execute(
+            "SELECT MAX(rowid) FROM part WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        con.close()
+        if row and row[0]:
+            _oc_cursors[session_id] = row[0]
+    except (sqlite3.Error, OSError):
+        pass
+
+
+def _opencode_read_new(session_info):
+    """Read new assistant text parts from opencode DB. Returns list of strings."""
+    db_path, session_id = session_info
+    cursor = _oc_cursors.get(session_id, 0)
+    messages = []
+    try:
+        con = sqlite3.connect(str(db_path), timeout=2)
+        # ensure we see latest WAL writes
+        con.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        rows = con.execute(
+            "SELECT p.rowid, p.data, m.data FROM part p "
+            "JOIN message m ON p.message_id = m.id "
+            "WHERE p.session_id = ? AND p.rowid > ? "
+            "ORDER BY p.rowid",
+            (session_id, cursor),
+        ).fetchall()
+        con.close()
+    except (sqlite3.Error, OSError) as e:
+        print(f"[opencode] read error: {e}")
+        return []
+
+    max_rowid = cursor
+    for rowid, pdata_str, mdata_str in rows:
+        max_rowid = max(max_rowid, rowid)
+        try:
+            pdata = json.loads(pdata_str)
+            mdata = json.loads(mdata_str)
+        except json.JSONDecodeError:
+            continue
+        if mdata.get("role") != "assistant":
+            continue
+        formatted = _opencode_format(pdata)
+        if formatted:
+            messages.append(formatted)
+    if max_rowid > cursor:
+        _oc_cursors[session_id] = max_rowid
+        if messages:
+            print(f"[opencode] read {len(rows)} parts, {len(messages)} messages")
+    return messages
+
+
+# gemini state: session_path_str -> message count already seen
+_gemini_cursors = {}
+
+
+def _gemini_find_session(cwd):
+    """Find most recent Gemini session file for a project cwd."""
+    project_name = Path(cwd).name
+    chats_dir = GEMINI_DIR / project_name / "chats"
+    if not chats_dir.is_dir():
+        return None
+    files = list(chats_dir.glob("session-*.json"))
+    return max(files, key=lambda f: f.stat().st_mtime) if files else None
+
+
+def _gemini_seek_end(session):
+    """Set cursor to current message count so we skip existing messages."""
+    try:
+        data = json.loads(session.read_text())
+        _gemini_cursors[str(session)] = len(data.get("messages", []))
+    except (json.JSONDecodeError, OSError):
+        pass
+
+
+def _gemini_read_new(session):
+    """Read new gemini-type messages. Returns list of strings."""
+    key = str(session)
+    cursor = _gemini_cursors.get(key, 0)
+    try:
+        data = json.loads(session.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+    messages = data.get("messages", [])
+    if len(messages) <= cursor:
+        return []
+    new_msgs = messages[cursor:]
+    _gemini_cursors[key] = len(messages)
+    results = []
+    for msg in new_msgs:
+        if msg.get("type") == "gemini":
+            text = (msg.get("content") or "").strip()
+            if text:
+                results.append(text)
+    if results:
+        print(f"[gemini] read {len(new_msgs)} new, {len(results)} assistant messages")
+    return results
+
+
 # --- harness: message formatters ------------------------------------------
 
 
@@ -160,6 +371,10 @@ def _claude_format(record):
             t = block.get("text", "").strip()
             if t:
                 parts.append(t)
+        elif block.get("type") == "tool_use" and block.get("name") == "ExitPlanMode":
+            plan = block.get("input", {}).get("plan", "")
+            if plan:
+                parts.append(f"📋 PLAN PROPOSAL:\n{plan}")
     return "\n".join(parts) if parts else None
 
 
@@ -178,16 +393,27 @@ def _codex_format(record):
     return None
 
 
+def _opencode_format(part):
+    """Format an opencode part record (from the part.data column)."""
+    if part.get("type") == "text":
+        t = part.get("text", "").strip()
+        return t if t else None
+    return None
+
+
 # --- harness registry ------------------------------------------------------
 
 
 class Harness:
-    def __init__(self, name, token, find_session, format_record):
+    def __init__(self, name, token, find_session, format_record,
+                 read_new=None, proc_hints=()):
         self.name = name
         self.bot = Bot(token)
         self.find_session = find_session
         self.format_record = format_record
+        self.read_new = read_new  # optional override for non-file-based sessions
         self.display_name = name  # updated from bot profile at startup
+        self.proc_hints = proc_hints
 
 
 harnesses = {}  # name -> Harness
@@ -195,11 +421,25 @@ harnesses = {}  # name -> Harness
 
 def _init_harnesses():
     harnesses["claude"] = Harness(
-        "claude", CLAUDE_TOKEN, _claude_find_session, _claude_format
+        "claude", CLAUDE_TOKEN, _claude_find_session, _claude_format,
+        proc_hints=("claude",),
     )
     if CODEX_TOKEN:
         harnesses["codex"] = Harness(
-            "codex", CODEX_TOKEN, _codex_find_session, _codex_format
+            "codex", CODEX_TOKEN, _codex_find_session, _codex_format,
+            proc_hints=("codex",),
+        )
+    if OPENCODE_TOKEN:
+        harnesses["opencode"] = Harness(
+            "opencode", OPENCODE_TOKEN, _opencode_find_session, _opencode_format,
+            read_new=_opencode_read_new,
+            proc_hints=("opencode",),
+        )
+    if GEMINI_TOKEN:
+        harnesses["gemini"] = Harness(
+            "gemini", GEMINI_TOKEN, _gemini_find_session, None,
+            read_new=_gemini_read_new,
+            proc_hints=("gemini",),
         )
 
 
@@ -216,6 +456,143 @@ def _chunkify(text, limit=4000):
         length += len(line) + 1
     if buf:
         yield "\n".join(buf)
+
+
+# --- signal-cli JSON-RPC client --------------------------------------------
+
+
+class SignalClient:
+    """Two-connection client: one for RPC calls, one for receiving notifications."""
+
+    def __init__(self, socket_path):
+        self._path = socket_path
+        # call connection (for send, createGroup, etc.)
+        self._call_reader = None
+        self._call_writer = None
+        self._req_id = 0
+        self._call_lock = asyncio.Lock()
+        # receive connection (subscribe + notifications)
+        self._recv_reader = None
+        self._recv_writer = None
+
+    async def connect(self):
+        self._call_reader, self._call_writer = (
+            await asyncio.open_unix_connection(self._path)
+        )
+
+    async def close(self):
+        for w in (self._call_writer, self._recv_writer):
+            if w:
+                try:
+                    w.close()
+                    await w.wait_closed()
+                except Exception:
+                    pass
+        self._call_writer = self._call_reader = None
+        self._recv_writer = self._recv_reader = None
+
+    async def _call(self, method, params=None):
+        async with self._call_lock:
+            self._req_id += 1
+            rid = self._req_id
+            req = {"jsonrpc": "2.0", "id": rid, "method": method}
+            if params:
+                req["params"] = params
+            line = json.dumps(req) + "\n"
+            self._call_writer.write(line.encode())
+            await self._call_writer.drain()
+            # read lines until we get our response (skip stale notifications)
+            while True:
+                resp_line = await self._call_reader.readline()
+                if not resp_line:
+                    raise ConnectionError("signal-cli call socket closed")
+                msg = json.loads(resp_line)
+                if msg.get("id") != rid:
+                    continue  # skip notifications / stale data
+                if "error" in msg:
+                    raise RuntimeError(f"signal-cli: {msg['error']}")
+                return msg.get("result")
+
+    @property
+    def connected(self):
+        return self._call_writer is not None
+
+    async def send_message(self, group_id, text):
+        return await self._call("send", {
+            "groupId": group_id,
+            "message": text,
+            "account": SIGNAL_ACCOUNT,
+        })
+
+    async def create_group(self, name, members):
+        return await self._call("updateGroup", {
+            "name": name,
+            "members": members,
+            "account": SIGNAL_ACCOUNT,
+        })
+
+    async def rename_group(self, group_id, name):
+        return await self._call("updateGroup", {
+            "groupId": group_id,
+            "name": name,
+            "account": SIGNAL_ACCOUNT,
+        })
+
+    async def leave_group(self, group_id):
+        return await self._call("quitGroup", {
+            "groupId": group_id,
+            "admin": [SIGNAL_OWNER],
+            "account": SIGNAL_ACCOUNT,
+        })
+
+    async def list_groups(self):
+        return await self._call("listGroups", {
+            "account": SIGNAL_ACCOUNT,
+        })
+
+    async def receive_loop(self, callback):
+        # open a dedicated connection for receiving
+        self._recv_reader, self._recv_writer = (
+            await asyncio.open_unix_connection(self._path)
+        )
+        # subscribe
+        req = json.dumps({"jsonrpc": "2.0", "id": 1,
+                          "method": "subscribeReceive",
+                          "params": {"account": SIGNAL_ACCOUNT}}) + "\n"
+        self._recv_writer.write(req.encode())
+        await self._recv_writer.drain()
+        while True:
+            line = await self._recv_reader.readline()
+            if not line:
+                raise ConnectionError("signal-cli recv socket closed")
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            # skip RPC responses (subscribe ack, etc.)
+            if "id" in msg and "method" not in msg:
+                continue
+            # notification
+            if "method" in msg and callback:
+                try:
+                    await callback(msg)
+                except Exception as e:
+                    print(f"[signal] callback error: {e}")
+
+
+def _normalize_signal_group_id(group_id):
+    if group_id is None:
+        return ""
+    if isinstance(group_id, bytes):
+        group_id = group_id.decode(errors="ignore")
+    gid = str(group_id).strip()
+    if not gid:
+        return ""
+    # signal-cli may vary padding across endpoints
+    return gid.rstrip("=")
+
+
+
 
 
 # --- persistent state ------------------------------------------------------
@@ -235,6 +612,7 @@ def _save(data):
 # --- bridge state ----------------------------------------------------------
 
 tab_topic = {}  # tab_id -> topic_id
+tab_topic_name = {}  # tab_id -> last known topic name
 topic_tab = {}  # topic_id -> tab_id
 
 # per pane
@@ -245,28 +623,58 @@ file_pos = {}  # pane_id -> (path_str, offset)
 
 # reply routing
 msg_pane = {}  # telegram_msg_id -> pane_id
+tab_last_pid = {}  # tab_id -> pane_id of last agent to send a message
+
+
+# signal bridge state
+sig_tab_group = {}    # tab_id -> signal group_id
+sig_group_tab = {}    # group_id -> tab_id
+sig_tab_name = {}     # tab_id -> last known group name
+sig_msg_pane = {}     # signal_timestamp -> pane_id
+sig_tab_last_pid = {} # tab_id -> pane_id
+_signal_client = None
+_signal_cmd_queue = []  # [(text, group_id, tab_id), ...]
+_signal_input_queue = []  # [(text, tab_id), ...]
 
 
 def _rebuild():
-    global topic_tab
+    global topic_tab, sig_group_tab
     topic_tab = {tid: tab for tab, tid in tab_topic.items()}
+    sig_group_tab = {}
+    for tab, gid in sig_tab_group.items():
+        ngid = _normalize_signal_group_id(gid)
+        if ngid:
+            sig_group_tab[ngid] = tab
 
 
 def _persist():
-    _save({
+    data = {
         "topics": {str(k): v for k, v in tab_topic.items()},
         "collab": {str(k): v for k, v in collab_tabs.items()},
-    })
+    }
+    if sig_tab_group:
+        data["signal_groups"] = {str(k): v for k, v in sig_tab_group.items()}
+    _save(data)
+
+
+_seeked = set()  # pids that have been seeked
 
 
 def _seek_to_end(pid):
-    """Position at end of session file so we don't replay."""
+    """Position at end of session so we don't replay."""
     cwd = pane_cwds.get(pid)
     h = harnesses.get(pane_harness.get(pid, ""))
     if not cwd or not h:
         return
     session = h.find_session(cwd)
-    if session:
+    if not session:
+        return
+    if h.read_new:
+        if h.name == "opencode":
+            _opencode_seek_end(session)
+        elif h.name == "gemini":
+            _gemini_seek_end(session)
+    else:
         file_pos[pid] = (str(session), session.stat().st_size)
 
 
@@ -280,6 +688,27 @@ _SHELLS = frozenset({
 })
 
 
+def _pane_procs(tty_name):
+    """Return set of command names running on a pane's TTY."""
+    pts = tty_name.replace("/dev/", "") if tty_name else ""
+    if not pts:
+        return set()
+    try:
+        r = subprocess.run(
+            ["ps", "-t", pts, "-o", "args", "--no-headers"],
+            capture_output=True, text=True, timeout=3,
+        )
+        cmds = set()
+        for line in r.stdout.strip().splitlines():
+            # extract binary name from args (e.g. "/path/to/gemini --yolo" -> "gemini")
+            parts = line.strip().split()
+            if parts:
+                cmds.add(Path(parts[0]).name)
+        return cmds
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return set()
+
+
 def _discover_sync():
     """Find all panes, classify by harness where possible."""
     all_panes = _all_panes_sync()
@@ -287,25 +716,41 @@ def _discover_sync():
     for p in all_panes:
         by_tab.setdefault(p["tab_id"], []).append(p)
 
+    # cache process info per pane (one ps call per pane)
+    pane_procs = {}
+    for p in all_panes:
+        pane_procs[p["pane_id"]] = _pane_procs(p.get("tty_name", ""))
+
     matched = []  # (pane, harness_name) — have a session file
     unmatched = []  # (pane, None) — no session but not a shell
+    claimed_sessions = set()  # global: session keys already taken
 
     for panes in by_tab.values():
         claimed = set()
         for h_name, h in harnesses.items():
-            best_pane, best_mt = None, 0.0
+            best_pane, best_mt, best_key, best_proc = None, 0.0, None, False
             for p in panes:
                 if p["pane_id"] in claimed:
                     continue
                 cwd = _parse_cwd(p.get("cwd", ""))
                 session = h.find_session(cwd)
                 if session:
-                    mt = session.stat().st_mtime
-                    if mt > best_mt:
-                        best_pane, best_mt = p, mt
+                    key = (h_name, str(session) if isinstance(session, Path)
+                           else session[1])
+                    if key in claimed_sessions:
+                        continue
+                    # file-based returns Path, DB-based returns tuple
+                    mt = (session.stat().st_mtime
+                          if isinstance(session, Path) else time.time())
+                    procs = pane_procs.get(p["pane_id"], set())
+                    proc_match = any(h in procs for h in h.proc_hints)
+                    # prefer process-matching panes, then newest session
+                    if proc_match and not best_proc or (proc_match == best_proc and mt > best_mt):
+                        best_pane, best_mt, best_key, best_proc = p, mt, key, proc_match
             if best_pane:
                 matched.append((best_pane, h_name))
                 claimed.add(best_pane["pane_id"])
+                claimed_sessions.add(best_key)
         # also track non-shell panes without sessions (for topic creation + input)
         for p in panes:
             if p["pane_id"] not in claimed:
@@ -333,7 +778,7 @@ async def sync_topics(matched, unmatched):
         pid = p["pane_id"]
         tab_id = p["tab_id"]
         cwd = _parse_cwd(p.get("cwd", ""))
-        title = p.get("tab_title", f"tab-{tab_id}")[:128]
+        title = (p.get("tab_title") or f"tab-{tab_id}").strip()[:128] or f"tab-{tab_id}"
 
         active_pids.add(pid)
         active_tabs.add(tab_id)
@@ -344,17 +789,19 @@ async def sync_topics(matched, unmatched):
         if tab_id not in tab_topic:
             t = await _primary_bot.create_forum_topic(CHAT, title)
             tab_topic[tab_id] = t.message_thread_id
+            tab_topic_name[tab_id] = title
             dirty = True
 
-        if pid not in file_pos:
+        if pid not in _seeked:
             _seek_to_end(pid)
+            _seeked.add(pid)
 
     # also create topics + track panes that don't have sessions yet (input only)
     for p, _ in unmatched:
         pid = p["pane_id"]
         tab_id = p["tab_id"]
         cwd = _parse_cwd(p.get("cwd", ""))
-        title = p.get("tab_title", f"tab-{tab_id}")[:128]
+        title = (p.get("tab_title") or f"tab-{tab_id}").strip()[:128] or f"tab-{tab_id}"
 
         active_pids.add(pid)
         active_tabs.add(tab_id)
@@ -364,7 +811,22 @@ async def sync_topics(matched, unmatched):
         if tab_id not in tab_topic:
             t = await _primary_bot.create_forum_topic(CHAT, title)
             tab_topic[tab_id] = t.message_thread_id
+            tab_topic_name[tab_id] = title
             dirty = True
+
+    # rename topics whose tab title changed
+    for p, _ in matched + unmatched:
+        tab_id = p["tab_id"]
+        if tab_id not in tab_topic:
+            continue
+        title = (p.get("tab_title") or f"tab-{tab_id}").strip()[:128] or f"tab-{tab_id}"
+        if tab_topic_name.get(tab_id) != title:
+            try:
+                await _primary_bot.edit_forum_topic(CHAT, tab_topic[tab_id], name=title)
+                print(f"[tg] renamed topic {tab_id} -> '{title}'")
+            except Exception:
+                pass  # Topic_not_modified or other non-fatal error
+            tab_topic_name[tab_id] = title
 
     for pid in [p for p in list(pane_tab) if p not in active_pids]:
         pane_harness.pop(pid, None)
@@ -374,10 +836,133 @@ async def sync_topics(matched, unmatched):
 
     for tab_id in [t for t in list(tab_topic) if t not in active_tabs]:
         try:
-            await _primary_bot.close_forum_topic(CHAT, tab_topic[tab_id])
+            await _primary_bot.delete_forum_topic(CHAT, tab_topic[tab_id])
         except Exception:
             pass
         tab_topic.pop(tab_id, None)
+        dirty = True
+
+    if dirty:
+        _rebuild()
+        _persist()
+
+
+def _sig_tab_match(title):
+    """Check if a tab title matches the SIGNAL_TABS filter (empty = all)."""
+    if not SIGNAL_TABS:
+        return True
+    t = title.lower()
+    return any(pat in t for pat in SIGNAL_TABS)
+
+
+_sig_greeted = set()  # group_ids we've sent a startup message to
+_sig_groups_verified = False
+
+
+async def sync_signal_groups(matched, unmatched):
+    if not SIGNAL_ENABLED or not _signal_client or not _signal_client.connected:
+        return
+
+    # one-time: verify stored groups are still valid on first call
+    global _sig_groups_verified
+    if not _sig_groups_verified and sig_tab_group:
+        _sig_groups_verified = True
+        try:
+            groups = await _signal_client.list_groups()
+            valid_ids = {
+                _normalize_signal_group_id(g.get("id"))
+                for g in (groups or [])
+                if g.get("isMember")
+            }
+            valid_ids.discard("")
+            stale = [tid for tid, gid in list(sig_tab_group.items())
+                     if _normalize_signal_group_id(gid) not in valid_ids]
+            if stale:
+                for tid in stale:
+                    sig_tab_group.pop(tid)
+                    sig_tab_last_pid.pop(tid, None)
+                _rebuild()
+                _persist()
+                print(f"[signal] removed {len(stale)} stale group(s)")
+        except Exception as e:
+            print(f"[signal] group verification error: {e}")
+
+    active_tabs = set()
+    dirty = False
+
+    for p, h_name in matched:
+        tab_id = p["tab_id"]
+        title = (p.get("tab_title") or f"tab-{tab_id}").strip()[:128] or f"tab-{tab_id}"
+        if not _sig_tab_match(title):
+            continue
+        active_tabs.add(tab_id)
+        if tab_id not in sig_tab_group:
+            try:
+                result = await _signal_client.create_group(
+                    title, [SIGNAL_OWNER] + SIGNAL_MEMBERS
+                )
+                gid = result.get("groupId") if isinstance(result, dict) else result
+                if gid:
+                    sig_tab_group[tab_id] = gid
+                    sig_tab_name[tab_id] = title
+                    dirty = True
+                    print(f"[signal] created group '{title}' -> {gid}")
+                else:
+                    print(f"[signal] create group returned no group id: {result}")
+            except Exception as e:
+                print(f"[signal] create group error: {e}")
+
+    for p, _ in unmatched:
+        tab_id = p["tab_id"]
+        title = (p.get("tab_title") or f"tab-{tab_id}").strip()[:128] or f"tab-{tab_id}"
+        if not _sig_tab_match(title):
+            continue
+        active_tabs.add(tab_id)
+        if tab_id not in sig_tab_group:
+            try:
+                result = await _signal_client.create_group(
+                    title, [SIGNAL_OWNER] + SIGNAL_MEMBERS
+                )
+                gid = result.get("groupId") if isinstance(result, dict) else result
+                if gid:
+                    sig_tab_group[tab_id] = gid
+                    sig_tab_name[tab_id] = title
+                    dirty = True
+                    print(f"[signal] created group '{title}' -> {gid}")
+                else:
+                    print(f"[signal] create group returned no group id: {result}")
+            except Exception as e:
+                print(f"[signal] create group error: {e}")
+
+    # rename groups whose tab title changed
+    for p, _ in matched + [(p, None) for p, _ in unmatched]:
+        tab_id = p["tab_id"]
+        if tab_id not in sig_tab_group:
+            continue
+        title = (p.get("tab_title") or f"tab-{tab_id}").strip()[:128] or f"tab-{tab_id}"
+        if sig_tab_name.get(tab_id) != title:
+            try:
+                await _signal_client.rename_group(sig_tab_group[tab_id], title)
+                print(f"[signal] renamed group {tab_id} -> '{title}'")
+            except Exception:
+                pass
+            sig_tab_name[tab_id] = title
+
+    # track greeted groups (no greeting message sent)
+    for tab_id in active_tabs:
+        gid = sig_tab_group.get(tab_id)
+        if gid:
+            _sig_greeted.add(gid)
+
+    # leave groups for closed tabs or tabs not in active_tabs (non-matching)
+    for tab_id in [t for t in list(sig_tab_group) if t not in active_tabs]:
+        try:
+            await _signal_client.leave_group(sig_tab_group[tab_id])
+            print(f"[signal] left group for tab {tab_id}")
+        except Exception as e:
+            print(f"[signal] leave group error: {e}")
+        sig_tab_group.pop(tab_id, None)
+        sig_tab_last_pid.pop(tab_id, None)
         dirty = True
 
     if dirty:
@@ -394,6 +979,13 @@ def _read_new_sync(pid):
     session = h.find_session(cwd)
     if not session:
         return []
+
+    # opencode (and other DB-based harnesses) handle their own reading
+    if h.read_new:
+        msgs = h.read_new(session)
+        if msgs:
+            print(f"[{h.name}/{pid}] db read: {len(msgs)} messages")
+        return msgs
 
     session_str = str(session)
     prev_path, prev_pos = file_pos.get(pid, (None, 0))
@@ -434,31 +1026,75 @@ async def check_output():
     )
     for pid, messages in zip(pids, results):
         h = harnesses.get(pane_harness.get(pid, ""))
-        tid = tab_topic.get(pane_tab.get(pid))
-        if not h or not tid or not messages:
+        if not h or not messages:
             continue
+        tab_id = pane_tab.get(pid)
+        if tab_id:
+            tab_last_pid[tab_id] = pid
+            sig_tab_last_pid[tab_id] = pid
+        tid = tab_topic.get(tab_id)
+        gid = sig_tab_group.get(tab_id) if SIGNAL_ENABLED else None
         for msg in messages:
-            for chunk in _chunkify(msg):
-                try:
-                    sent = await h.bot.send_message(
-                        CHAT, chunk, message_thread_id=tid
-                    )
-                    msg_pane[sent.message_id] = pid
-                except Exception as e:
-                    print(f"send err [{h.name}/{pid}]: {e}")
+            # telegram
+            if tid:
+                for chunk in _chunkify(msg):
+                    try:
+                        sent = await h.bot.send_message(
+                            CHAT, chunk, message_thread_id=tid
+                        )
+                        msg_pane[sent.message_id] = pid
+                    except Exception as e:
+                        print(f"send err [{h.name}/{pid}]: {e}")
+            # signal
+            if gid and _signal_client:
+                for chunk in _chunkify(f"{h.display_name}: {msg}"):
+                    try:
+                        result = await _signal_client.send_message(gid, chunk)
+                        ts = result.get("timestamp") if isinstance(result, dict) else None
+                        if ts:
+                            sig_msg_pane[ts] = pid
+                    except Exception as e:
+                        print(f"signal send err [{h.name}/{pid}]: {e}")
 
             # collab: forward to other harness panes in this tab
             tab_id = pane_tab.get(pid)
             if tab_id and tab_id in collab_tabs:
-                prefixed = f"{h.display_name} says:\n{msg}"
+                # check for /signoff
+                if "/signoff" in msg.lower():
+                    signoffs = collab_signoffs.setdefault(tab_id, set())
+                    signoffs.add(pid)
+                    # check if all harness panes in this tab signed off
+                    tab_panes = {p for p, t in pane_tab.items()
+                                 if t == tab_id and p in pane_harness}
+                    if tab_panes and signoffs >= tab_panes:
+                        del collab_tabs[tab_id]
+                        collab_signoffs.pop(tab_id, None)
+                        _persist()
+                        try:
+                            await _primary_bot.send_message(
+                                CHAT, "all agents signed off, collab done",
+                                message_thread_id=tid,
+                            )
+                        except Exception:
+                            pass
+                        continue
+                else:
+                    # non-signoff message resets that pane's signoff
+                    signoffs = collab_signoffs.get(tab_id)
+                    if signoffs:
+                        signoffs.discard(pid)
+
+                prefixed = f"{h.display_name} says: {msg}"
                 for target_pid in _other_panes(tab_id, pid):
                     await send_text(target_pid, prefixed)
                 # decrement rounds if limited
-                rounds = collab_tabs[tab_id]
-                if rounds > 0:
+                rounds = collab_tabs.get(tab_id)
+                if rounds and rounds > 0:
                     collab_tabs[tab_id] = rounds - 1
                     if rounds - 1 <= 0:
                         del collab_tabs[tab_id]
+                        collab_signoffs.pop(tab_id, None)
+                        _persist()
                         try:
                             await _primary_bot.send_message(
                                 CHAT, "collab done", message_thread_id=tid
@@ -470,6 +1106,7 @@ async def check_output():
 # --- collab mode -----------------------------------------------------------
 
 collab_tabs = {}  # tab_id -> rounds_remaining (0 = infinite)
+collab_signoffs = {}  # tab_id -> set of pane_ids that signed off
 
 
 def _other_panes(tab_id, src_pid):
@@ -498,34 +1135,30 @@ async def on_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     if m.reply_to_message:
         pid = msg_pane.get(m.reply_to_message.message_id)
 
-    # otherwise -> first pane in this tab (prefer claude, then any tracked pane)
+    # otherwise -> last agent that messaged in this tab, then any pane
     if pid is None:
         tab_id = topic_tab.get(m.message_thread_id)
         if tab_id:
-            # prefer harness-matched panes (claude first)
-            for p, h in sorted(
-                pane_harness.items(), key=lambda x: x[1] != "claude"
-            ):
-                if pane_tab.get(p) == tab_id:
-                    pid = p
-                    break
-            # fall back to any pane in this tab
-            if pid is None:
-                for p, t in pane_tab.items():
-                    if t == tab_id:
-                        pid = p
-                        break
+            pid = tab_last_pid.get(tab_id)
+            if pid is not None and pane_tab.get(pid) != tab_id:
+                pid = None
 
     if pid is not None:
+        h_name = pane_harness.get(pid, "?")
+        snippet = m.text[:50].replace("\n", " ")
         tab_id = pane_tab.get(pid)
         if tab_id and tab_id in collab_tabs:
-            # send to all panes in this tab (matched or not)
             targets = [p for p, t in pane_tab.items() if t == tab_id]
-            print(f"[collab] tab={tab_id} targets={targets}")
             for p in targets:
-                await send_text(p, m.text)
+                status = await send_and_verify(p, m.text)
+                print(f"[tg>collab/{p}] '{snippet}' {status}")
         else:
-            await send_text(pid, m.text)
+            status = await send_and_verify(pid, m.text)
+            print(f"[tg>{h_name}/{pid}] '{snippet}' {status}")
+    else:
+        tid = m.message_thread_id
+        print(f"[tg] no pane for topic {tid}, dropped: '{m.text[:50]}'")
+
 
 
 async def on_collab(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
@@ -538,6 +1171,7 @@ async def on_collab(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 
     if tab_id in collab_tabs:
         del collab_tabs[tab_id]
+        collab_signoffs.pop(tab_id, None)
         _persist()
         await m.reply_text("collab off")
     else:
@@ -550,6 +1184,7 @@ async def on_collab(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
             except ValueError:
                 pass
         collab_tabs[tab_id] = rounds
+        collab_signoffs.pop(tab_id, None)
         _persist()
         label = f"collab on ({rounds} rounds)" if rounds else "collab on"
         await m.reply_text(label)
@@ -596,10 +1231,11 @@ async def on_clear(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         tab_topic[tab_id] = t.message_thread_id
         _rebuild()
         _persist()
-        # clear tracked messages for this topic
+        # clear tracked messages and signoffs for this topic
         for mid in [k for k, v in msg_pane.items()
                     if pane_tab.get(v) == tab_id]:
             msg_pane.pop(mid, None)
+        collab_signoffs.pop(tab_id, None)
         # re-seek so we don't replay old output
         for pid, tab in pane_tab.items():
             if tab == tab_id:
@@ -609,14 +1245,222 @@ async def on_clear(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         print(f"clear: {e}")
 
 
+# --- signal handlers -------------------------------------------------------
+
+
+async def _signal_handle_command(text, group_id, tab_id):
+    cmd = text.strip().split()[0].lower()
+    if cmd == "/list":
+        matched, unmatched = await discover()
+        if not matched and not unmatched:
+            await _signal_client.send_message(group_id, "no panes")
+            return
+        collab_tab_ids = set(collab_tabs.keys())
+        lines = []
+        for p, h_name in matched:
+            tab = p.get("tab_title", "")
+            title = p.get("title", "?")
+            flag = " collab" if p["tab_id"] in collab_tab_ids else ""
+            lines.append(f"[{h_name}] {tab} — {title}{flag}")
+        for p, _ in unmatched:
+            tab = p.get("tab_title", "")
+            title = p.get("title", "?")
+            flag = " collab" if p["tab_id"] in collab_tab_ids else ""
+            lines.append(f"[--] {tab} — {title}{flag}")
+        await _signal_client.send_message(group_id, "\n".join(lines))
+
+    elif cmd == "/collab":
+        if not tab_id:
+            return
+        if tab_id in collab_tabs:
+            del collab_tabs[tab_id]
+            collab_signoffs.pop(tab_id, None)
+            _persist()
+            await _signal_client.send_message(group_id, "collab off")
+        else:
+            rounds = 0
+            args = text.strip().split()
+            if len(args) > 1:
+                try:
+                    rounds = int(args[1])
+                except ValueError:
+                    pass
+            collab_tabs[tab_id] = rounds
+            collab_signoffs.pop(tab_id, None)
+            _persist()
+            label = f"collab on ({rounds} rounds)" if rounds else "collab on"
+            await _signal_client.send_message(group_id, label)
+
+    elif cmd == "/refresh":
+        if not tab_id:
+            return
+        old_gid = sig_tab_group.get(tab_id)
+        if not old_gid:
+            return
+        matched, unmatched = await discover()
+        name = f"tab-{tab_id}"
+        for p, _ in matched + unmatched:
+            if p["tab_id"] == tab_id:
+                name = p.get("tab_title", name)[:128]
+                break
+        try:
+            # create new group first, then try to leave old (best-effort)
+            result = await _signal_client.create_group(name, [SIGNAL_OWNER] + SIGNAL_MEMBERS)
+            new_gid = result.get("groupId") if isinstance(result, dict) else result
+            if not new_gid:
+                raise RuntimeError(f"refresh create_group returned no group id: {result}")
+            sig_tab_group[tab_id] = new_gid
+            _rebuild()
+            _persist()
+            await _signal_client.send_message(new_gid, "refreshed")
+            _sig_greeted.add(new_gid)
+            # clear tracked signal messages for this tab
+            for ts in [k for k, v in sig_msg_pane.items()
+                       if pane_tab.get(v) == tab_id]:
+                sig_msg_pane.pop(ts, None)
+            collab_signoffs.pop(tab_id, None)
+            for pid, tab in pane_tab.items():
+                if tab == tab_id:
+                    _seek_to_end(pid)
+            print(f"[signal] refreshed group for tab {tab_id} -> {new_gid}")
+            # leave old group (best-effort — fails if bot is last admin)
+            try:
+                await _signal_client.leave_group(old_gid)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[signal] refresh error: {e}")
+
+
+_sig_seen_ts = set()  # dedup: envelope timestamps we've already processed
+
+
+async def _on_signal_message(notification):
+    params = notification.get("params", {})
+    # notifications come in two formats:
+    # direct: {"params": {"envelope": {...}}}
+    # wrapped: {"params": {"subscription": N, "result": {"envelope": {...}}}}
+    envelope = params.get("envelope") or params.get("result", {}).get("envelope", {})
+
+    # dedup by envelope timestamp (signal-cli may deliver same msg twice)
+    env_ts = envelope.get("timestamp")
+    if env_ts:
+        if env_ts in _sig_seen_ts:
+            return
+        _sig_seen_ts.add(env_ts)
+        # keep set bounded
+        if len(_sig_seen_ts) > 200:
+            _sig_seen_ts.clear()
+
+    source = (envelope.get("sourceNumber")
+              or envelope.get("sourceUuid")
+              or envelope.get("source", ""))
+    data = envelope.get("dataMessage", {})
+    msg_text = data.get("message") or ""
+    text = msg_text
+    for att in data.get("attachments") or []:
+        att_id = att.get("id", "")
+        if att_id:
+            text = text + " " + str(Path.home() / ".local/share/signal-cli/attachments" / att_id)
+    text = text.strip()
+    group_info = data.get("groupInfo", {})
+    group_id = _normalize_signal_group_id(group_info.get("groupId", ""))
+
+    source_name = envelope.get("sourceName") or source[:12]
+    if not text or not group_id:
+        return
+    source_number = envelope.get("sourceNumber", "")
+    if (source != SIGNAL_OWNER
+            and source not in SIGNAL_ALLOWED
+            and source_number not in SIGNAL_MEMBERS):
+        print(f"[signal] ignoring message from {source_name} ({source})")
+        return
+
+    tab_id = sig_group_tab.get(group_id)
+
+    # queue for processing in poll_loop (avoid _call deadlock)
+    if msg_text.strip().startswith("/"):
+        _signal_cmd_queue.append((msg_text, group_id, tab_id))
+    elif tab_id:
+        _signal_input_queue.append((text, data, tab_id, source_name))
+
+
+async def _process_signal_queues():
+    """Process queued Signal commands and input (called from poll_loop)."""
+    # commands
+    while _signal_cmd_queue:
+        text, group_id, tab_id = _signal_cmd_queue.pop(0)
+        await _signal_handle_command(text, group_id, tab_id)
+
+    # input routing
+    while _signal_input_queue:
+        text, data, tab_id, sender = _signal_input_queue.pop(0)
+        pid = None
+        quote = data.get("quote", {})
+        if quote:
+            quote_ts = quote.get("id")
+            if quote_ts:
+                pid = sig_msg_pane.get(quote_ts)
+        if pid is None:
+            pid = sig_tab_last_pid.get(tab_id)
+            if pid is not None and pane_tab.get(pid) != tab_id:
+                pid = None
+        if pid is not None:
+            h_name = pane_harness.get(pid, "?")
+            snippet = text[:50].replace("\n", " ")
+            prefixed = f"{sender} says: {text}"
+            if tab_id in collab_tabs:
+                targets = [p for p, t in pane_tab.items() if t == tab_id]
+                for p in targets:
+                    status = await send_and_verify(p, prefixed)
+                    print(f"[sig>collab/{p}] {sender}: '{snippet}' {status}")
+            else:
+                status = await send_and_verify(pid, prefixed)
+                print(f"[sig>{h_name}/{pid}] {sender}: '{snippet}' {status}")
+        else:
+            print(f"[sig] no pane for tab {tab_id}, dropped: '{text[:50]}'")
+
+
+async def _signal_receive_task():
+    while True:
+        try:
+            global _signal_client
+            if not _signal_client:
+                _signal_client = SignalClient(SIGNAL_SOCKET)
+            await _signal_client.connect()
+            print(f"[signal] connected to {SIGNAL_SOCKET}")
+            await _signal_client.receive_loop(_on_signal_message)
+        except Exception as e:
+            print(f"[signal] disconnected: {e}, reconnecting...")
+            try:
+                await _signal_client.close()
+            except Exception:
+                pass
+            await asyncio.sleep(5)
+
+
 # --- lifecycle -------------------------------------------------------------
+
+_script_path = Path(__file__).resolve()
+_script_mtime = _script_path.stat().st_mtime
 
 
 async def poll_loop():
+    global _script_mtime
     while True:
         try:
+            # hot reload: re-exec if bridge.py changed on disk
+            mt = _script_path.stat().st_mtime
+            if mt != _script_mtime:
+                print("bridge.py changed, reloading...")
+                _persist()
+                os.execv(sys.executable, [sys.executable, str(_script_path)])
+
             matched, unmatched = await discover()
             await sync_topics(matched, unmatched)
+            if SIGNAL_ENABLED:
+                await sync_signal_groups(matched, unmatched)
+                await _process_signal_queues()
             await check_output()
         except Exception as e:
             print(f"tick: {e}")
@@ -643,7 +1487,32 @@ async def startup(app: Application):
         tab_topic[int(k)] = v
     for k, v in saved.get("collab", {}).items():
         collab_tabs[int(k)] = v
+    for k, v in saved.get("signal_groups", {}).items():
+        gid = _normalize_signal_group_id(v)
+        if gid:
+            sig_tab_group[int(k)] = gid
     _rebuild()
+    if sig_tab_group:
+        print(f"[signal] loaded {len(sig_tab_group)} group(s) from state")
+
+    # start signal
+    if SIGNAL_ENABLED:
+        # set profile name via a one-shot connection
+        try:
+            _r, _w = await asyncio.open_unix_connection(SIGNAL_SOCKET)
+            req = json.dumps({"jsonrpc": "2.0", "id": 1,
+                              "method": "updateProfile",
+                              "params": {"givenName": "Debater",
+                                         "account": SIGNAL_ACCOUNT}}) + "\n"
+            _w.write(req.encode())
+            await _w.drain()
+            await asyncio.wait_for(_r.readline(), timeout=5)
+            _w.close()
+            await _w.wait_closed()
+            print("[signal] profile set to Debater")
+        except Exception as e:
+            print(f"[signal] profile set error: {e}")
+        asyncio.create_task(_signal_receive_task())
 
     matched, unmatched = await discover()
     for p, h_name in matched:
@@ -652,9 +1521,22 @@ async def startup(app: Application):
         pane_tab[pid] = p["tab_id"]
         pane_cwds[pid] = _parse_cwd(p.get("cwd", ""))
         _seek_to_end(pid)
+        _seeked.add(pid)
     for p, _ in unmatched:
         pane_tab[p["pane_id"]] = p["tab_id"]
         pane_cwds[p["pane_id"]] = _parse_cwd(p.get("cwd", ""))
+
+    # print tab summary
+    tabs = {}
+    for p, h_name in matched:
+        tabs.setdefault(p["tab_id"], []).append((p, h_name))
+    for p, _ in unmatched:
+        tabs.setdefault(p["tab_id"], []).append((p, "--"))
+    for tab_id in sorted(tabs):
+        panes = tabs[tab_id]
+        title = panes[0][0].get("tab_title", f"tab-{tab_id}")
+        parts = " ".join(f"{h}:{p['pane_id']}" for p, h in panes)
+        print(f"  {title}: {parts}")
 
     asyncio.create_task(poll_loop())
 
@@ -667,7 +1549,8 @@ def main():
     app.add_handler(CommandHandler("refresh", on_clear))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     names = ", ".join(harnesses.keys())
-    print(f"panetone: [{names}] polling chat {CHAT} every {POLL}s")
+    sig = f" +signal({SIGNAL_ACCOUNT})" if SIGNAL_ENABLED else ""
+    print(f"panetone: [{names}] polling chat {CHAT} every {POLL}s{sig}")
     app.run_polling(drop_pending_updates=True)
 
 
