@@ -77,6 +77,10 @@ SIGNAL_TABS = [t.strip().lower() for t in os.environ.get("WEZ_SIG_TABS", "").spl
 SIGNAL_ALLOWED = {s.strip() for s in os.environ.get("WEZ_SIG_ALLOWED", "").split(",") if s.strip()}
 SIGNAL_MEMBERS = [s.strip() for s in os.environ.get("WEZ_SIG_MEMBERS", "").split(",") if s.strip()]
 
+DEBATE_CHAT = int(os.environ.get("WEZ_TG_DEBATE_CHAT", "0"))
+DEBATE_TABS = [t.strip().lower() for t in os.environ.get("WEZ_TG_DEBATE_TABS", "").split(",") if t.strip()]
+DEBATE_ENABLED = bool(DEBATE_CHAT and DEBATE_TABS)
+
 # --- wezterm cli -----------------------------------------------------------
 
 
@@ -176,18 +180,28 @@ async def send_and_verify(pid, text):
 
 def _parse_cwd(cwd_url):
     if cwd_url.startswith("file://"):
-        return urlparse(cwd_url).path
-    return cwd_url
+        return urlparse(cwd_url).path.rstrip("/")
+    return cwd_url.rstrip("/")
 
 
 # --- harness: session finders ---------------------------------------------
+
+
+def _claude_is_interactive(path):
+    """Check if a Claude session is interactive (not a -p oneshot)."""
+    try:
+        with open(path) as f:
+            first = json.loads(f.readline())
+        return first.get("type") != "queue-operation"
+    except (json.JSONDecodeError, OSError):
+        return True
 
 
 def _claude_find_session(cwd):
     proj_dir = CLAUDE_DIR / cwd.replace("/", "-")
     if not proj_dir.is_dir():
         return None
-    files = list(proj_dir.glob("*.jsonl"))
+    files = [f for f in proj_dir.glob("*.jsonl") if _claude_is_interactive(f)]
     return max(files, key=lambda f: f.stat().st_mtime) if files else None
 
 
@@ -306,8 +320,7 @@ def _opencode_read_new(session_info):
             messages.append(formatted)
     if max_rowid > cursor:
         _oc_cursors[session_id] = max_rowid
-        if messages:
-            print(f"[opencode] read {len(rows)} parts, {len(messages)} messages")
+        pass
     return messages
 
 
@@ -353,8 +366,6 @@ def _gemini_read_new(session):
             text = (msg.get("content") or "").strip()
             if text:
                 results.append(text)
-    if results:
-        print(f"[gemini] read {len(new_msgs)} new, {len(results)} assistant messages")
     return results
 
 
@@ -700,10 +711,10 @@ def _pane_procs(tty_name):
         )
         cmds = set()
         for line in r.stdout.strip().splitlines():
-            # extract binary name from args (e.g. "/path/to/gemini --yolo" -> "gemini")
-            parts = line.strip().split()
-            if parts:
-                cmds.add(Path(parts[0]).name)
+            # extract binary names from all args (catches "node /path/to/gemini --yolo")
+            for part in line.strip().split():
+                if not part.startswith("-"):
+                    cmds.add(Path(part).name)
         return cmds
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return set()
@@ -834,13 +845,7 @@ async def sync_topics(matched, unmatched):
         pane_cwds.pop(pid, None)
         file_pos.pop(pid, None)
 
-    for tab_id in [t for t in list(tab_topic) if t not in active_tabs]:
-        try:
-            await _primary_bot.delete_forum_topic(CHAT, tab_topic[tab_id])
-        except Exception:
-            pass
-        tab_topic.pop(tab_id, None)
-        dirty = True
+    # keep topics for tabs that disappeared (mux restart, etc.)
 
     if dirty:
         _rebuild()
@@ -853,6 +858,14 @@ def _sig_tab_match(title):
         return True
     t = title.lower()
     return any(pat in t for pat in SIGNAL_TABS)
+
+
+def _debate_tab_match(title):
+    """Check if a tab title matches the DEBATE_TABS filter."""
+    if not DEBATE_TABS:
+        return False
+    t = title.lower()
+    return any(pat in t for pat in DEBATE_TABS)
 
 
 _sig_greeted = set()  # group_ids we've sent a startup message to
@@ -890,12 +903,28 @@ async def sync_signal_groups(matched, unmatched):
     active_tabs = set()
     dirty = False
 
+    # build reverse map: title -> existing tab_id (for reassigning after tab_id changes)
+    _title_to_old_tab = {}
+    for tid, name in sig_tab_name.items():
+        if tid in sig_tab_group:
+            _title_to_old_tab[name.lower()] = tid
+
     for p, h_name in matched:
         tab_id = p["tab_id"]
         title = (p.get("tab_title") or f"tab-{tab_id}").strip()[:128] or f"tab-{tab_id}"
         if not _sig_tab_match(title):
             continue
         active_tabs.add(tab_id)
+        # reassign group if tab_id changed but title matches
+        if tab_id not in sig_tab_group:
+            old_tid = _title_to_old_tab.get(title.lower())
+            if old_tid and old_tid != tab_id and old_tid in sig_tab_group:
+                sig_tab_group[tab_id] = sig_tab_group.pop(old_tid)
+                sig_tab_name[tab_id] = sig_tab_name.pop(old_tid, title)
+                sig_tab_last_pid.pop(old_tid, None)
+                active_tabs.discard(old_tid)
+                dirty = True
+                print(f"[signal] reassigned group '{title}' from tab {old_tid} -> {tab_id}")
         if tab_id not in sig_tab_group:
             try:
                 result = await _signal_client.create_group(
@@ -918,6 +947,16 @@ async def sync_signal_groups(matched, unmatched):
         if not _sig_tab_match(title):
             continue
         active_tabs.add(tab_id)
+        # reassign group if tab_id changed but title matches
+        if tab_id not in sig_tab_group:
+            old_tid = _title_to_old_tab.get(title.lower())
+            if old_tid and old_tid != tab_id and old_tid in sig_tab_group:
+                sig_tab_group[tab_id] = sig_tab_group.pop(old_tid)
+                sig_tab_name[tab_id] = sig_tab_name.pop(old_tid, title)
+                sig_tab_last_pid.pop(old_tid, None)
+                active_tabs.discard(old_tid)
+                dirty = True
+                print(f"[signal] reassigned group '{title}' from tab {old_tid} -> {tab_id}")
         if tab_id not in sig_tab_group:
             try:
                 result = await _signal_client.create_group(
@@ -984,7 +1023,8 @@ def _read_new_sync(pid):
     if h.read_new:
         msgs = h.read_new(session)
         if msgs:
-            print(f"[{h.name}/{pid}] db read: {len(msgs)} messages")
+            tab = tab_topic_name.get(pane_tab.get(pid, -1), "?")
+            print(f"[{tab}/{h.name}] db read: {len(msgs)} messages")
         return msgs
 
     session_str = str(session)
@@ -1015,7 +1055,8 @@ def _read_new_sync(pid):
         if formatted:
             messages.append(formatted)
     if lines:
-        print(f"[{h.name}/{pid}] read {len(lines)} records, {len(messages)} messages")
+        tab = tab_topic_name.get(pane_tab.get(pid, -1), "?")
+        print(f"[{tab}/{h.name}] read {len(lines)} records, {len(messages)} messages")
     return messages
 
 
@@ -1055,6 +1096,14 @@ async def check_output():
                             sig_msg_pane[ts] = pid
                     except Exception as e:
                         print(f"signal send err [{h.name}/{pid}]: {e}")
+            # debate chat (each bot posts as itself, no prefix)
+            if DEBATE_ENABLED and _debate_tab_match(tab_topic_name.get(tab_id, "")):
+                for chunk in _chunkify(msg):
+                    try:
+                        sent = await h.bot.send_message(DEBATE_CHAT, chunk)
+                        debate_msg_pane[sent.message_id] = pid
+                    except Exception as e:
+                        print(f"debate send err [{h.name}/{pid}]: {e}")
 
             # collab: forward to other harness panes in this tab
             tab_id = pane_tab.get(pid)
@@ -1107,6 +1156,7 @@ async def check_output():
 
 collab_tabs = {}  # tab_id -> rounds_remaining (0 = infinite)
 collab_signoffs = {}  # tab_id -> set of pane_ids that signed off
+debate_msg_pane = {}  # msg_id -> pane_id (reply routing for debate chat)
 
 
 def _other_panes(tab_id, src_pid):
@@ -1124,40 +1174,92 @@ def _is_owner(update):
     return not OWNER or (update.effective_user and update.effective_user.id == OWNER)
 
 
-async def on_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
-    m = update.message
-    if not m or not m.message_thread_id or not m.text or not _is_owner(update):
+def _resolve_pid(tab_id, reply_pid=None):
+    """Resolve target pane: explicit reply > last active > sole pane in tab."""
+    pid = reply_pid
+    if pid is None:
+        pid = tab_last_pid.get(tab_id)
+        if pid is not None and pane_tab.get(pid) != tab_id:
+            pid = None
+    if pid is None:
+        tab_panes = [p for p, t in pane_tab.items() if t == tab_id and p in pane_harness]
+        if len(tab_panes) == 1:
+            pid = tab_panes[0]
+    return pid
+
+
+async def _route_to_pane(pid, tab_id, text, label="tg"):
+    """Send text to pane (or all panes if collab). Returns True if routed."""
+    if pid is None:
+        tab = tab_topic_name.get(tab_id, "?")
+        print(f"[{label}] no target in {tab}, dropped: '{text[:50]}' (no agent has spoken yet)")
+        return False
+    h_name = pane_harness.get(pid, "?")
+    tab = tab_topic_name.get(tab_id, "?")
+    snippet = text[:50].replace("\n", " ")
+    if tab_id and tab_id in collab_tabs:
+        targets = [p for p, t in pane_tab.items() if t == tab_id]
+        for p in targets:
+            h = pane_harness.get(p, "?")
+            status = await send_and_verify(p, text)
+            print(f"[{label}>{tab}/{h}] '{snippet}' {status}")
+    else:
+        status = await send_and_verify(pid, text)
+        print(f"[{label}>{tab}/{h_name}] '{snippet}' {status}")
+    return True
+
+
+def _find_debate_tab():
+    """Find the tab_id of the first tab matching DEBATE_TABS."""
+    for tid, name in tab_topic_name.items():
+        if _debate_tab_match(name):
+            return tid
+    return None
+
+
+async def _handle_debate_message(m):
+    """Route incoming debate chat message to pane(s)."""
+    text = m.text
+    if text.strip().startswith("/"):
+        await _debate_handle_command(m)
         return
 
-    pid = None
+    tab_id = _find_debate_tab()
+    if not tab_id:
+        print(f"[debate] no matching tab, dropped: '{text[:50]}'")
+        return
 
-    # reply to a bot message -> route to that pane
-    if m.reply_to_message:
-        pid = msg_pane.get(m.reply_to_message.message_id)
+    reply_pid = debate_msg_pane.get(m.reply_to_message.message_id) if m.reply_to_message else None
+    pid = _resolve_pid(tab_id, reply_pid)
+    await _route_to_pane(pid, tab_id, text, "debate")
 
-    # otherwise -> last agent that messaged in this tab, then any pane
-    if pid is None:
-        tab_id = topic_tab.get(m.message_thread_id)
-        if tab_id:
-            pid = tab_last_pid.get(tab_id)
-            if pid is not None and pane_tab.get(pid) != tab_id:
-                pid = None
 
-    if pid is not None:
-        h_name = pane_harness.get(pid, "?")
-        snippet = m.text[:50].replace("\n", " ")
-        tab_id = pane_tab.get(pid)
-        if tab_id and tab_id in collab_tabs:
-            targets = [p for p, t in pane_tab.items() if t == tab_id]
-            for p in targets:
-                status = await send_and_verify(p, m.text)
-                print(f"[tg>collab/{p}] '{snippet}' {status}")
-        else:
-            status = await send_and_verify(pid, m.text)
-            print(f"[tg>{h_name}/{pid}] '{snippet}' {status}")
-    else:
-        tid = m.message_thread_id
-        print(f"[tg] no pane for topic {tid}, dropped: '{m.text[:50]}'")
+async def _debate_handle_command(m):
+    """Handle /commands in the debate chat (currently none — just ignore)."""
+    pass
+
+
+async def on_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    m = update.message
+    if not m or not m.text:
+        return
+
+    # === debate chat (open to all members) ===
+    if DEBATE_ENABLED and m.chat_id == DEBATE_CHAT:
+        u = update.effective_user
+        if u:
+            print(f"[debate] from {u.first_name} (uid={u.id})")
+        await _handle_debate_message(m)
+        return
+
+    # === forum topics (existing flow, requires owner + thread_id) ===
+    if not _is_owner(update) or not m.message_thread_id:
+        return
+
+    reply_pid = msg_pane.get(m.reply_to_message.message_id) if m.reply_to_message else None
+    tab_id = topic_tab.get(m.message_thread_id) if reply_pid is None else pane_tab.get(reply_pid)
+    pid = _resolve_pid(tab_id, reply_pid) if tab_id else reply_pid
+    await _route_to_pane(pid, tab_id, m.text, "tg")
 
 
 
@@ -1175,19 +1277,29 @@ async def on_collab(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         _persist()
         await m.reply_text("collab off")
     else:
-        # parse optional rounds: /collab 10
+        # parse: /collab [rounds] [msg...]
         rounds = 0
-        args = (m.text or "").split()
-        if len(args) > 1:
+        msg = ""
+        rest = (m.text or "").split(None, 1)[1] if len((m.text or "").split()) > 1 else ""
+        if rest:
+            first_word = rest.split()[0]
             try:
-                rounds = int(args[1])
+                rounds = int(first_word)
+                msg = rest.split(None, 1)[1] if len(rest.split()) > 1 else ""
             except ValueError:
-                pass
+                msg = rest
         collab_tabs[tab_id] = rounds
         collab_signoffs.pop(tab_id, None)
         _persist()
         label = f"collab on ({rounds} rounds)" if rounds else "collab on"
         await m.reply_text(label)
+        if msg:
+            tab = tab_topic_name.get(tab_id, "?")
+            targets = [p for p, t in pane_tab.items() if t == tab_id and p in pane_harness]
+            for p in targets:
+                h = pane_harness.get(p, "?")
+                status = await send_and_verify(p, msg)
+                print(f"[collab>{tab}/{h}] '{msg[:50]}' {status}")
 
 
 async def on_list(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
@@ -1279,17 +1391,27 @@ async def _signal_handle_command(text, group_id, tab_id):
             await _signal_client.send_message(group_id, "collab off")
         else:
             rounds = 0
-            args = text.strip().split()
-            if len(args) > 1:
+            msg = ""
+            rest = text.strip().split(None, 1)[1] if len(text.strip().split()) > 1 else ""
+            if rest:
+                first_word = rest.split()[0]
                 try:
-                    rounds = int(args[1])
+                    rounds = int(first_word)
+                    msg = rest.split(None, 1)[1] if len(rest.split()) > 1 else ""
                 except ValueError:
-                    pass
+                    msg = rest
             collab_tabs[tab_id] = rounds
             collab_signoffs.pop(tab_id, None)
             _persist()
             label = f"collab on ({rounds} rounds)" if rounds else "collab on"
             await _signal_client.send_message(group_id, label)
+            if msg:
+                tab = tab_topic_name.get(tab_id, "?")
+                targets = [p for p, t in pane_tab.items() if t == tab_id and p in pane_harness]
+                for p in targets:
+                    h = pane_harness.get(p, "?")
+                    status = await send_and_verify(p, msg)
+                    print(f"[collab>{tab}/{h}] '{msg[:50]}' {status}")
 
     elif cmd == "/refresh":
         if not tab_id:
@@ -1395,30 +1517,15 @@ async def _process_signal_queues():
     # input routing
     while _signal_input_queue:
         text, data, tab_id, sender = _signal_input_queue.pop(0)
-        pid = None
         quote = data.get("quote", {})
+        reply_pid = None
         if quote:
             quote_ts = quote.get("id")
             if quote_ts:
-                pid = sig_msg_pane.get(quote_ts)
-        if pid is None:
-            pid = sig_tab_last_pid.get(tab_id)
-            if pid is not None and pane_tab.get(pid) != tab_id:
-                pid = None
-        if pid is not None:
-            h_name = pane_harness.get(pid, "?")
-            snippet = text[:50].replace("\n", " ")
-            prefixed = f"{sender} says: {text}"
-            if tab_id in collab_tabs:
-                targets = [p for p, t in pane_tab.items() if t == tab_id]
-                for p in targets:
-                    status = await send_and_verify(p, prefixed)
-                    print(f"[sig>collab/{p}] {sender}: '{snippet}' {status}")
-            else:
-                status = await send_and_verify(pid, prefixed)
-                print(f"[sig>{h_name}/{pid}] {sender}: '{snippet}' {status}")
-        else:
-            print(f"[sig] no pane for tab {tab_id}, dropped: '{text[:50]}'")
+                reply_pid = sig_msg_pane.get(quote_ts)
+        pid = _resolve_pid(tab_id, reply_pid)
+        prefixed = f"{sender} says: {text}"
+        await _route_to_pane(pid, tab_id, prefixed, "sig")
 
 
 async def _signal_receive_task():
@@ -1550,7 +1657,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     names = ", ".join(harnesses.keys())
     sig = f" +signal({SIGNAL_ACCOUNT})" if SIGNAL_ENABLED else ""
-    print(f"panetone: [{names}] polling chat {CHAT} every {POLL}s{sig}")
+    deb = f" +debate({DEBATE_CHAT})" if DEBATE_ENABLED else ""
+    print(f"panetone: [{names}] polling chat {CHAT} every {POLL}s{sig}{deb}")
     app.run_polling(drop_pending_updates=True)
 
 
