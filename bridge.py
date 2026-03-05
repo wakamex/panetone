@@ -469,6 +469,34 @@ def _init_harnesses():
 # --- text helpers ----------------------------------------------------------
 
 
+def _md_tables_to_slack(text):
+    """Convert markdown tables to monospace code blocks for Slack."""
+    lines = text.split("\n")
+    out, table, in_table = [], [], False
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^\|.*\|$", stripped):
+            if re.match(r"^\|[-\s|:]+\|$", stripped):
+                continue  # skip separator row
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            table.append(cells)
+            in_table = True
+        else:
+            if in_table:
+                # compute column widths and format
+                widths = [max(len(r[i]) for r in table) for i in range(len(table[0]))]
+                for row in table:
+                    out.append("  ".join(c.ljust(widths[i]) for i, c in enumerate(row)))
+                out.append("")
+                table, in_table = [], False
+            out.append(line)
+    if table:
+        widths = [max(len(r[i]) for r in table) for i in range(len(table[0]))]
+        for row in table:
+            out.append("  ".join(c.ljust(widths[i]) for i, c in enumerate(row)))
+    return "\n".join(out)
+
+
 def _chunkify(text, limit=4000):
     buf, length = [], 0
     for line in text.split("\n"):
@@ -660,9 +688,9 @@ _signal_cmd_queue = []  # [(text, group_id, tab_id), ...]
 _signal_input_queue = []  # [(text, tab_id), ...]
 
 # slack observer state
-_slack_msg_buffer = {}     # channel_id -> [(user_id_or_None, text), ...]
+_slack_msg_buffer = {}     # channel_id -> [(ts, user_id_or_None, text), ...]
 _slack_obs_queue = []      # [(extra_text, user_id, channel_id), ...] !obs triggers
-_slack_reply_channel = None  # channel_id of last !obs, output goes here
+_slack_reply_channel = None  # set by !obs, cleared after agent responds
 _slack_web_client = None   # AsyncWebClient, set in startup
 _slack_bot_user_id = None  # our own bot user id, to skip self-echo
 
@@ -1095,6 +1123,7 @@ def _read_new_sync(pid):
 
 
 async def check_output():
+    global _slack_reply_channel
     pids = list(pane_harness.keys())
     results = await asyncio.gather(
         *(asyncio.to_thread(_read_new_sync, pid) for pid in pids)
@@ -1139,13 +1168,15 @@ async def check_output():
                         debate_msg_pane[sent.message_id] = pid
                     except Exception as e:
                         print(f"debate send err [{h.name}/{pid}]: {e}")
-            # slack observer (send to the channel that last !obs'd)
+            # slack observer (reply to !obs, then clear)
             if SLACK_ENABLED and _slack_reply_channel and _slack_tab_match(tab_topic_name.get(tab_id, "")):
-                for chunk in _chunkify(msg):
+                slack_msg = _md_tables_to_slack(msg)
+                for chunk in _chunkify(slack_msg):
                     try:
                         await _slack_web_client.chat_postMessage(channel=_slack_reply_channel, text=chunk)
                     except Exception as e:
                         print(f"slack send err [{h.name}/{pid}]: {e}")
+                _slack_reply_channel = None
 
             # collab: forward to other harness panes in this tab
             tab_id = pane_tab.get(pid)
@@ -1361,7 +1392,7 @@ async def _process_slack_queue():
             print("[slack] no matching tab for !obs")
             continue
         _slack_reply_channel = channel
-        # collect and sort all buffered messages by timestamp
+        # flush Slack message buffer → pane
         all_msgs = []
         for ch_id in list(_slack_msg_buffer):
             buf = _slack_msg_buffer.pop(ch_id)
@@ -1380,12 +1411,11 @@ async def _process_slack_queue():
             ch_name = await _resolve_slack_channel(channel)
             name = await _resolve_slack_user(obs_user_id)
             parts.append(f"[slack: {ch_name}] {name}: {extra}")
-        if not parts:
-            continue
-        payload = "\n".join(parts)
-        pid = _resolve_pid(tab_id)
-        await _route_to_pane(pid, tab_id, payload, "slack")
-        print(f"[slack] flushed {len(parts)} messages to pane ({channel})")
+        if parts:
+            payload = "\n".join(parts)
+            pid = _resolve_pid(tab_id)
+            await _route_to_pane(pid, tab_id, payload, "slack")
+            print(f"[slack] flushed {len(parts)} input messages to pane ({channel})")
 
 
 async def on_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
