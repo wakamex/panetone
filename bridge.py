@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.14"
-# dependencies = ["python-telegram-bot>=22.0"]
+# dependencies = ["python-telegram-bot>=22.0", "slack-sdk>=3.0", "aiohttp"]
 # ///
 """panetone: wezterm <> telegram/signal bridge for multiple AI coding agents
 
@@ -21,6 +21,12 @@ Env (Signal — all three required to enable):
   WEZ_SIG_SOCKET         - path to signal-cli UNIX socket
   WEZ_SIG_ACCOUNT        - signal-cli registered number (the "bot")
   WEZ_SIG_OWNER          - your personal Signal number (invited to groups)
+
+Env (Slack observer — all three required to enable):
+  WEZ_SLACK_BOT_TOKEN    - Slack bot user OAuth token (xoxb-...)
+  WEZ_SLACK_APP_TOKEN    - Slack app-level token for Socket Mode (xapp-...)
+  WEZ_SLACK_CHANNELS     - comma-separated Slack channel IDs to observe
+  WEZ_SLACK_TABS         - comma-separated tab name patterns to observe
 """
 
 import asyncio
@@ -80,6 +86,12 @@ SIGNAL_MEMBERS = [s.strip() for s in os.environ.get("WEZ_SIG_MEMBERS", "").split
 DEBATE_CHAT = int(os.environ.get("WEZ_TG_DEBATE_CHAT", "0"))
 DEBATE_TABS = [t.strip().lower() for t in os.environ.get("WEZ_TG_DEBATE_TABS", "").split(",") if t.strip()]
 DEBATE_ENABLED = bool(DEBATE_CHAT and DEBATE_TABS)
+
+SLACK_BOT_TOKEN = os.environ.get("WEZ_SLACK_BOT_TOKEN", "")
+SLACK_APP_TOKEN = os.environ.get("WEZ_SLACK_APP_TOKEN", "")
+SLACK_CHANNELS = {s.strip() for s in os.environ.get("WEZ_SLACK_CHANNELS", "").split(",") if s.strip()}
+SLACK_TABS = [t.strip().lower() for t in os.environ.get("WEZ_SLACK_TABS", "").split(",") if t.strip()]
+SLACK_ENABLED = bool(SLACK_BOT_TOKEN and SLACK_APP_TOKEN and SLACK_CHANNELS)
 
 # --- wezterm cli -----------------------------------------------------------
 
@@ -647,6 +659,13 @@ _signal_client = None
 _signal_cmd_queue = []  # [(text, group_id, tab_id), ...]
 _signal_input_queue = []  # [(text, tab_id), ...]
 
+# slack observer state
+_slack_msg_buffer = {}     # channel_id -> [(user_id_or_None, text), ...]
+_slack_obs_queue = []      # [(extra_text, user_id, channel_id), ...] !obs triggers
+_slack_reply_channel = None  # channel_id of last !obs, output goes here
+_slack_web_client = None   # AsyncWebClient, set in startup
+_slack_bot_user_id = None  # our own bot user id, to skip self-echo
+
 
 def _rebuild():
     global topic_tab, sig_group_tab
@@ -755,9 +774,10 @@ def _discover_sync():
                           if isinstance(session, Path) else time.time())
                     procs = pane_procs.get(p["pane_id"], set())
                     proc_match = any(h in procs for h in h.proc_hints)
-                    # prefer process-matching panes, then newest session
-                    if proc_match and not best_proc or (proc_match == best_proc and mt > best_mt):
-                        best_pane, best_mt, best_key, best_proc = p, mt, key, proc_match
+                    if not proc_match:
+                        continue
+                    if mt > best_mt:
+                        best_pane, best_mt, best_key = p, mt, key
             if best_pane:
                 matched.append((best_pane, h_name))
                 claimed.add(best_pane["pane_id"])
@@ -866,6 +886,20 @@ def _debate_tab_match(title):
         return False
     t = title.lower()
     return any(pat in t for pat in DEBATE_TABS)
+
+
+def _slack_tab_match(title):
+    if not SLACK_TABS:
+        return False
+    t = title.lower()
+    return any(pat in t for pat in SLACK_TABS)
+
+
+def _find_slack_tab():
+    for tid, name in tab_topic_name.items():
+        if _slack_tab_match(name):
+            return tid
+    return None
 
 
 _sig_greeted = set()  # group_ids we've sent a startup message to
@@ -1075,9 +1109,10 @@ async def check_output():
             sig_tab_last_pid[tab_id] = pid
         tid = tab_topic.get(tab_id)
         gid = sig_tab_group.get(tab_id) if SIGNAL_ENABLED else None
+        source = tab_last_source.get(tab_id, "tg")
         for msg in messages:
-            # telegram
-            if tid:
+            # telegram topic (default output channel)
+            if tid and source == "tg":
                 for chunk in _chunkify(msg):
                     try:
                         sent = await h.bot.send_message(
@@ -1087,7 +1122,7 @@ async def check_output():
                     except Exception as e:
                         print(f"send err [{h.name}/{pid}]: {e}")
             # signal
-            if gid and _signal_client:
+            if gid and _signal_client and source == "sig":
                 for chunk in _chunkify(f"{h.display_name}: {msg}"):
                     try:
                         result = await _signal_client.send_message(gid, chunk)
@@ -1097,13 +1132,20 @@ async def check_output():
                     except Exception as e:
                         print(f"signal send err [{h.name}/{pid}]: {e}")
             # debate chat (each bot posts as itself, no prefix)
-            if DEBATE_ENABLED and _debate_tab_match(tab_topic_name.get(tab_id, "")):
+            if DEBATE_ENABLED and source == "debate" and _debate_tab_match(tab_topic_name.get(tab_id, "")):
                 for chunk in _chunkify(msg):
                     try:
                         sent = await h.bot.send_message(DEBATE_CHAT, chunk)
                         debate_msg_pane[sent.message_id] = pid
                     except Exception as e:
                         print(f"debate send err [{h.name}/{pid}]: {e}")
+            # slack observer (send to the channel that last !obs'd)
+            if SLACK_ENABLED and _slack_reply_channel and _slack_tab_match(tab_topic_name.get(tab_id, "")):
+                for chunk in _chunkify(msg):
+                    try:
+                        await _slack_web_client.chat_postMessage(channel=_slack_reply_channel, text=chunk)
+                    except Exception as e:
+                        print(f"slack send err [{h.name}/{pid}]: {e}")
 
             # collab: forward to other harness panes in this tab
             tab_id = pane_tab.get(pid)
@@ -1157,6 +1199,7 @@ async def check_output():
 collab_tabs = {}  # tab_id -> rounds_remaining (0 = infinite)
 collab_signoffs = {}  # tab_id -> set of pane_ids that signed off
 debate_msg_pane = {}  # msg_id -> pane_id (reply routing for debate chat)
+tab_last_source = {}  # tab_id -> "tg"|"sig"|"debate"|"slack" (last input channel)
 
 
 def _other_panes(tab_id, src_pid):
@@ -1231,12 +1274,118 @@ async def _handle_debate_message(m):
 
     reply_pid = debate_msg_pane.get(m.reply_to_message.message_id) if m.reply_to_message else None
     pid = _resolve_pid(tab_id, reply_pid)
+    tab_last_source[tab_id] = "debate"
     await _route_to_pane(pid, tab_id, text, "debate")
 
 
 async def _debate_handle_command(m):
     """Handle /commands in the debate chat (currently none — just ignore)."""
     pass
+
+
+# --- slack observer -------------------------------------------------------
+
+async def _slack_receive_task():
+    from slack_sdk.socket_mode.aiohttp import SocketModeClient as SMClient
+    from slack_sdk.socket_mode.response import SocketModeResponse
+
+    sm = SMClient(app_token=SLACK_APP_TOKEN, web_client=_slack_web_client)
+
+    async def handler(client, req):
+        if req.type == "events_api":
+            event = req.payload.get("event", {})
+            subtype = event.get("subtype")
+            if (event.get("type") == "message"
+                    and subtype in (None, "bot_message")
+                    and event.get("channel") in SLACK_CHANNELS):
+                text = event.get("text", "")
+                user_id = event.get("user", "")
+                channel = event.get("channel")
+                bot_id = event.get("bot_id")
+                ts = float(event.get("ts", 0))
+                buf = _slack_msg_buffer.setdefault(channel, [])
+                if bot_id and bot_id == _slack_bot_user_id:
+                    pass  # skip our own output
+                elif bot_id:
+                    buf.append((ts, None, text))
+                elif text.startswith("!obs"):
+                    _slack_obs_queue.append((text[4:].strip(), user_id, channel))
+                else:
+                    buf.append((ts, user_id, text))
+            await client.send_socket_mode_response(
+                SocketModeResponse(envelope_id=req.envelope_id))
+
+    sm.socket_mode_request_listeners.append(handler)
+    await sm.connect()
+    while True:
+        await asyncio.sleep(60)
+
+
+_slack_user_cache = {}     # user_id -> display_name
+_slack_channel_cache = {}  # channel_id -> #channel_name
+
+
+async def _resolve_slack_user(user_id):
+    if user_id not in _slack_user_cache:
+        try:
+            info = await _slack_web_client.users_info(user=user_id)
+            profile = info["user"]["profile"]
+            _slack_user_cache[user_id] = (
+                profile.get("display_name_normalized")
+                or profile.get("real_name_normalized")
+                or info["user"].get("real_name")
+                or user_id
+            )
+        except Exception as e:
+            print(f"[slack] users_info({user_id}) failed: {e}")
+            _slack_user_cache[user_id] = user_id
+    return _slack_user_cache[user_id]
+
+
+async def _resolve_slack_channel(channel_id):
+    if channel_id not in _slack_channel_cache:
+        try:
+            info = await _slack_web_client.conversations_info(channel=channel_id)
+            _slack_channel_cache[channel_id] = f"#{info['channel']['name']}"
+        except Exception:
+            _slack_channel_cache[channel_id] = f"#{channel_id}"
+    return _slack_channel_cache[channel_id]
+
+
+async def _process_slack_queue():
+    global _slack_reply_channel
+    while _slack_obs_queue:
+        extra, obs_user_id, channel = _slack_obs_queue.pop(0)
+        tab_id = _find_slack_tab()
+        if not tab_id:
+            print("[slack] no matching tab for !obs")
+            continue
+        _slack_reply_channel = channel
+        # collect and sort all buffered messages by timestamp
+        all_msgs = []
+        for ch_id in list(_slack_msg_buffer):
+            buf = _slack_msg_buffer.pop(ch_id)
+            for ts, uid, text in buf:
+                all_msgs.append((ts, ch_id, uid, text))
+        all_msgs.sort(key=lambda x: x[0])
+        parts = []
+        for _, ch_id, uid, text in all_msgs:
+            ch_name = await _resolve_slack_channel(ch_id)
+            if uid:
+                name = await _resolve_slack_user(uid)
+                parts.append(f"[slack: {ch_name}] {name}: {text}")
+            else:
+                parts.append(f"[slack: {ch_name}] {text}")
+        if extra:
+            ch_name = await _resolve_slack_channel(channel)
+            name = await _resolve_slack_user(obs_user_id)
+            parts.append(f"[slack: {ch_name}] {name}: {extra}")
+        if not parts:
+            continue
+        payload = "\n".join(parts)
+        pid = _resolve_pid(tab_id)
+        await _route_to_pane(pid, tab_id, payload, "slack")
+        print(f"[slack] flushed {len(parts)} messages to pane ({channel})")
 
 
 async def on_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
@@ -1259,6 +1408,8 @@ async def on_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     reply_pid = msg_pane.get(m.reply_to_message.message_id) if m.reply_to_message else None
     tab_id = topic_tab.get(m.message_thread_id) if reply_pid is None else pane_tab.get(reply_pid)
     pid = _resolve_pid(tab_id, reply_pid) if tab_id else reply_pid
+    if tab_id:
+        tab_last_source[tab_id] = "tg"
     await _route_to_pane(pid, tab_id, m.text, "tg")
 
 
@@ -1524,6 +1675,7 @@ async def _process_signal_queues():
             if quote_ts:
                 reply_pid = sig_msg_pane.get(quote_ts)
         pid = _resolve_pid(tab_id, reply_pid)
+        tab_last_source[tab_id] = "sig"
         prefixed = f"{sender} says: {text}"
         await _route_to_pane(pid, tab_id, prefixed, "sig")
 
@@ -1568,6 +1720,8 @@ async def poll_loop():
             if SIGNAL_ENABLED:
                 await sync_signal_groups(matched, unmatched)
                 await _process_signal_queues()
+            if SLACK_ENABLED:
+                await _process_slack_queue()
             await check_output()
         except Exception as e:
             print(f"tick: {e}")
@@ -1621,6 +1775,17 @@ async def startup(app: Application):
             print(f"[signal] profile set error: {e}")
         asyncio.create_task(_signal_receive_task())
 
+    if SLACK_ENABLED:
+        from slack_sdk.web.async_client import AsyncWebClient
+        global _slack_web_client, _slack_bot_user_id
+        _slack_web_client = AsyncWebClient(token=SLACK_BOT_TOKEN)
+        try:
+            auth = await _slack_web_client.auth_test()
+            _slack_bot_user_id = auth["bot_id"]
+        except Exception as e:
+            print(f"[slack] auth_test failed: {e}")
+        asyncio.create_task(_slack_receive_task())
+
     matched, unmatched = await discover()
     for p, h_name in matched:
         pid = p["pane_id"]
@@ -1658,7 +1823,8 @@ def main():
     names = ", ".join(harnesses.keys())
     sig = f" +signal({SIGNAL_ACCOUNT})" if SIGNAL_ENABLED else ""
     deb = f" +debate({DEBATE_CHAT})" if DEBATE_ENABLED else ""
-    print(f"panetone: [{names}] polling chat {CHAT} every {POLL}s{sig}{deb}")
+    slk = f" +slack({','.join(SLACK_CHANNELS)})" if SLACK_ENABLED else ""
+    print(f"panetone: [{names}] polling chat {CHAT} every {POLL}s{sig}{deb}{slk}")
     app.run_polling(drop_pending_updates=True)
 
 
