@@ -1391,7 +1391,6 @@ async def _process_slack_queue():
         if not tab_id:
             print("[slack] no matching tab for !obs")
             continue
-        _slack_reply_channel = channel
         # flush Slack message buffer → pane
         all_msgs = []
         for ch_id in list(_slack_msg_buffer):
@@ -1400,21 +1399,25 @@ async def _process_slack_queue():
                 all_msgs.append((ts, ch_id, uid, text))
         all_msgs.sort(key=lambda x: x[0])
         parts = []
-        for _, ch_id, uid, text in all_msgs:
+        from datetime import datetime
+        for ts, ch_id, uid, text in all_msgs:
             ch_name = await _resolve_slack_channel(ch_id)
+            t = datetime.fromtimestamp(ts).strftime("%H:%M") if ts else "??:??"
             if uid:
                 name = await _resolve_slack_user(uid)
-                parts.append(f"[slack: {ch_name}] {name}: {text}")
+                parts.append(f"[slack: {ch_name} {t}] {name}: {text}")
             else:
-                parts.append(f"[slack: {ch_name}] {text}")
+                parts.append(f"[slack: {ch_name} {t}] {text}")
         if extra:
             ch_name = await _resolve_slack_channel(channel)
             name = await _resolve_slack_user(obs_user_id)
-            parts.append(f"[slack: {ch_name}] {name}: {extra}")
+            t = datetime.now().strftime("%H:%M")
+            parts.append(f"[slack: {ch_name} {t}] {name}: {extra}")
         if parts:
             payload = "\n".join(parts)
             pid = _resolve_pid(tab_id)
             await _route_to_pane(pid, tab_id, payload, "slack")
+            _slack_reply_channel = channel
             print(f"[slack] flushed {len(parts)} input messages to pane ({channel})")
 
 
