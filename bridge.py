@@ -93,6 +93,9 @@ SLACK_CHANNELS = {s.strip() for s in os.environ.get("WEZ_SLACK_CHANNELS", "").sp
 SLACK_TABS = [t.strip().lower() for t in os.environ.get("WEZ_SLACK_TABS", "").split(",") if t.strip()]
 SLACK_ENABLED = bool(SLACK_BOT_TOKEN and SLACK_APP_TOKEN and SLACK_CHANNELS)
 
+MSG_TZ = os.environ.get("WEZ_MSG_TZ", "America/New_York")
+MSG_TIMESTAMPS = os.environ.get("WEZ_MSG_TIMESTAMPS", "1") != "0"
+
 # --- wezterm cli -----------------------------------------------------------
 
 
@@ -467,6 +470,15 @@ def _init_harnesses():
 
 
 # --- text helpers ----------------------------------------------------------
+
+
+def _now_ts():
+    """Return short timestamp like '14:03' in configured timezone, or '' if disabled."""
+    if not MSG_TIMESTAMPS:
+        return ""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo(MSG_TZ)).strftime("%H:%M")
 
 
 def _md_tables_to_slack(text):
@@ -1206,7 +1218,8 @@ async def check_output():
                     if signoffs:
                         signoffs.discard(pid)
 
-                prefixed = f"{h.display_name} says: {msg}"
+                ts = f" [{_now_ts()}]" if MSG_TIMESTAMPS else ""
+                prefixed = f"{h.display_name}{ts} says: {msg}"
                 for target_pid in _other_panes(tab_id, pid):
                     await send_text(target_pid, prefixed)
                 # decrement rounds if limited
@@ -1709,7 +1722,8 @@ async def _process_signal_queues():
                 reply_pid = sig_msg_pane.get(quote_ts)
         pid = _resolve_pid(tab_id, reply_pid)
         tab_last_source[tab_id] = "sig"
-        prefixed = f"{sender} says: {text}"
+        ts = f" [{_now_ts()}]" if MSG_TIMESTAMPS else ""
+        prefixed = f"{sender}{ts} says: {text}"
         await _route_to_pane(pid, tab_id, prefixed, "sig")
 
 
