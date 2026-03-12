@@ -912,32 +912,18 @@ async def sync_topics(matched, unmatched):
         _persist()
 
 
-def _sig_tab_match(title):
-    """Check if a tab title matches the SIGNAL_TABS filter (empty = all)."""
-    if not SIGNAL_TABS:
-        return True
+def _tab_match(title, patterns, empty_means_all=False):
+    """Check if a tab title matches any pattern in the list."""
+    if not patterns:
+        return empty_means_all
     t = title.lower()
-    return any(pat in t for pat in SIGNAL_TABS)
+    return any(pat in t for pat in patterns)
 
 
-def _debate_tab_match(title):
-    """Check if a tab title matches the DEBATE_TABS filter."""
-    if not DEBATE_TABS:
-        return False
-    t = title.lower()
-    return any(pat in t for pat in DEBATE_TABS)
-
-
-def _slack_tab_match(title):
-    if not SLACK_TABS:
-        return False
-    t = title.lower()
-    return any(pat in t for pat in SLACK_TABS)
-
-
-def _find_slack_tab():
+def _find_tab(patterns, **kw):
+    """Find the first tab_id matching patterns."""
     for tid, name in tab_topic_name.items():
-        if _slack_tab_match(name):
+        if _tab_match(name, patterns, **kw):
             return tid
     return None
 
@@ -986,7 +972,7 @@ async def sync_signal_groups(matched, unmatched):
     for p, h_name in matched:
         tab_id = p["tab_id"]
         title = (p.get("tab_title") or f"tab-{tab_id}").strip()[:128] or f"tab-{tab_id}"
-        if not _sig_tab_match(title):
+        if not _tab_match(title, SIGNAL_TABS, empty_means_all=True):
             continue
         active_tabs.add(tab_id)
         # reassign group if tab_id changed but title matches
@@ -1018,7 +1004,7 @@ async def sync_signal_groups(matched, unmatched):
     for p, _ in unmatched:
         tab_id = p["tab_id"]
         title = (p.get("tab_title") or f"tab-{tab_id}").strip()[:128] or f"tab-{tab_id}"
-        if not _sig_tab_match(title):
+        if not _tab_match(title, SIGNAL_TABS, empty_means_all=True):
             continue
         active_tabs.add(tab_id)
         # reassign group if tab_id changed but title matches
@@ -1173,7 +1159,7 @@ async def check_output():
                     except Exception as e:
                         print(f"signal send err [{h.name}/{pid}]: {e}")
             # debate chat (each bot posts as itself, no prefix)
-            if DEBATE_ENABLED and source == "debate" and _debate_tab_match(tab_topic_name.get(tab_id, "")):
+            if DEBATE_ENABLED and source == "debate" and _tab_match(tab_topic_name.get(tab_id, ""), DEBATE_TABS):
                 for chunk in _chunkify(msg):
                     try:
                         sent = await h.bot.send_message(DEBATE_CHAT, chunk)
@@ -1181,7 +1167,7 @@ async def check_output():
                     except Exception as e:
                         print(f"debate send err [{h.name}/{pid}]: {e}")
             # slack observer (reply to !obs, then clear)
-            if SLACK_ENABLED and _slack_reply_channel and _slack_tab_match(tab_topic_name.get(tab_id, "")):
+            if SLACK_ENABLED and _slack_reply_channel and _tab_match(tab_topic_name.get(tab_id, ""), SLACK_TABS):
                 slack_msg = _md_tables_to_slack(msg)
                 for chunk in _chunkify(slack_msg):
                     try:
@@ -1221,7 +1207,7 @@ async def check_output():
                 ts = f" [{_now_ts()}]" if MSG_TIMESTAMPS else ""
                 prefixed = f"{h.display_name}{ts} says: {msg}"
                 for target_pid in _other_panes(tab_id, pid):
-                    await send_text(target_pid, prefixed)
+                    await send_and_verify(target_pid, prefixed)
                 # decrement rounds if limited
                 rounds = collab_tabs.get(tab_id)
                 if rounds and rounds > 0:
@@ -1296,12 +1282,6 @@ async def _route_to_pane(pid, tab_id, text, label="tg"):
     return True
 
 
-def _find_debate_tab():
-    """Find the tab_id of the first tab matching DEBATE_TABS."""
-    for tid, name in tab_topic_name.items():
-        if _debate_tab_match(name):
-            return tid
-    return None
 
 
 async def _handle_debate_message(m):
@@ -1311,7 +1291,7 @@ async def _handle_debate_message(m):
         await _debate_handle_command(m)
         return
 
-    tab_id = _find_debate_tab()
+    tab_id = _find_tab(DEBATE_TABS)
     if not tab_id:
         print(f"[debate] no matching tab, dropped: '{text[:50]}'")
         return
@@ -1400,7 +1380,7 @@ async def _process_slack_queue():
     global _slack_reply_channel
     while _slack_obs_queue:
         extra, obs_user_id, channel = _slack_obs_queue.pop(0)
-        tab_id = _find_slack_tab()
+        tab_id = _find_tab(SLACK_TABS)
         if not tab_id:
             print("[slack] no matching tab for !obs")
             continue
