@@ -82,6 +82,15 @@ SIGNAL_ENABLED = bool(SIGNAL_SOCKET and SIGNAL_ACCOUNT and SIGNAL_OWNER)
 SIGNAL_TABS = [t.strip().lower() for t in os.environ.get("WEZ_SIG_TABS", "").split(",") if t.strip()]
 SIGNAL_ALLOWED = {s.strip() for s in os.environ.get("WEZ_SIG_ALLOWED", "").split(",") if s.strip()}
 SIGNAL_MEMBERS = [s.strip() for s in os.environ.get("WEZ_SIG_MEMBERS", "").split(",") if s.strip()]
+# per-tab members: WEZ_SIG_MEMBERS_<TAB>=+number also implies tab is signal-enabled
+SIGNAL_TAB_MEMBERS = {}
+_SIG_PREFIX = "WEZ_SIG_MEMBERS_"
+for _k, _v in os.environ.items():
+    if _k.startswith(_SIG_PREFIX) and _v.strip():
+        _pat = _k[len(_SIG_PREFIX):].lower()
+        SIGNAL_TAB_MEMBERS[_pat] = [s.strip() for s in _v.split(",") if s.strip()]
+        if _pat not in SIGNAL_TABS:
+            SIGNAL_TABS.append(_pat)
 
 DEBATE_CHAT = int(os.environ.get("WEZ_TG_DEBATE_CHAT", "0"))
 DEBATE_TABS = [t.strip().lower() for t in os.environ.get("WEZ_TG_DEBATE_TABS", "").split(",") if t.strip()]
@@ -169,6 +178,8 @@ async def send_and_verify(pid, text):
     """Send text to pane, watch session file for update, retry Enter if needed."""
     path = _get_session_path(pid)
     if not path:
+        h_name = pane_harness.get(pid, "?")
+        print(f"[verify] {h_name}/{pid}: no session path, sending blind")
         await send_text(pid, text)
         return "?"
     try:
@@ -185,12 +196,9 @@ async def send_and_verify(pid, text):
     ms = await asyncio.to_thread(_watch_mtime_sync, path, baseline, 2.0)
     if ms is not None:
         return f"\u2713 {ms}ms (enter retry)"
-    # paste itself may have been dropped — full resend
-    await send_text(pid, text)
-    ms = await asyncio.to_thread(_watch_mtime_sync, path, baseline, 2.0)
-    if ms is not None:
-        return f"\u2713 {ms}ms (resend)"
-    return "\u2717 >6s"
+    h_name = pane_harness.get(pid, "?")
+    print(f"[verify] {h_name}/{pid}: >4s watching {path} (baseline mtime={baseline})")
+    return "\u2717 >4s"
 
 
 def _parse_cwd(cwd_url):
@@ -608,6 +616,20 @@ class SignalClient:
             "account": SIGNAL_ACCOUNT,
         })
 
+    async def add_members(self, group_id, members):
+        return await self._call("updateGroup", {
+            "groupId": group_id,
+            "addMember": members,
+            "account": SIGNAL_ACCOUNT,
+        })
+
+    async def remove_members(self, group_id, members):
+        return await self._call("updateGroup", {
+            "groupId": group_id,
+            "removeMember": members,
+            "account": SIGNAL_ACCOUNT,
+        })
+
     async def list_groups(self):
         return await self._call("listGroups", {
             "account": SIGNAL_ACCOUNT,
@@ -724,6 +746,7 @@ def _persist():
     }
     if sig_tab_group:
         data["signal_groups"] = {str(k): v for k, v in sig_tab_group.items()}
+        data["signal_group_names"] = {str(k): v for k, v in sig_tab_name.items()}
     _save(data)
 
 
@@ -798,9 +821,14 @@ def _discover_sync():
     for panes in by_tab.values():
         claimed = set()
         for h_name, h in harnesses.items():
-            best_pane, best_mt, best_key, best_proc = None, 0.0, None, False
+            best_pane, best_mt, best_key = None, 0.0, None
+            proc_only_pane = None  # process match but no session
             for p in panes:
                 if p["pane_id"] in claimed:
+                    continue
+                procs = pane_procs.get(p["pane_id"], set())
+                proc_match = any(h in procs for h in h.proc_hints)
+                if not proc_match:
                     continue
                 cwd = _parse_cwd(p.get("cwd", ""))
                 session = h.find_session(cwd)
@@ -809,19 +837,20 @@ def _discover_sync():
                            else session[1])
                     if key in claimed_sessions:
                         continue
-                    # file-based returns Path, DB-based returns tuple
                     mt = (session.stat().st_mtime
                           if isinstance(session, Path) else time.time())
-                    procs = pane_procs.get(p["pane_id"], set())
-                    proc_match = any(h in procs for h in h.proc_hints)
-                    if not proc_match:
-                        continue
                     if mt > best_mt:
                         best_pane, best_mt, best_key = p, mt, key
+                elif proc_only_pane is None:
+                    proc_only_pane = p
             if best_pane:
                 matched.append((best_pane, h_name))
                 claimed.add(best_pane["pane_id"])
                 claimed_sessions.add(best_key)
+            elif proc_only_pane:
+                # process running but no session yet — claim for input routing
+                matched.append((proc_only_pane, h_name))
+                claimed.add(proc_only_pane["pane_id"])
         # also track non-shell panes without sessions (for topic creation + input)
         for p in panes:
             if p["pane_id"] not in claimed:
@@ -920,6 +949,15 @@ def _tab_match(title, patterns, empty_means_all=False):
     return any(pat in t for pat in patterns)
 
 
+def _sig_members_for(title):
+    """Return the member list for a signal group based on tab title."""
+    t = title.lower()
+    members = SIGNAL_TAB_MEMBERS.get(t)
+    if members is not None:
+        return [SIGNAL_OWNER] + members
+    return [SIGNAL_OWNER] + SIGNAL_MEMBERS
+
+
 def _find_tab(patterns, **kw):
     """Find the first tab_id matching patterns."""
     for tid, name in tab_topic_name.items():
@@ -988,7 +1026,7 @@ async def sync_signal_groups(matched, unmatched):
         if tab_id not in sig_tab_group:
             try:
                 result = await _signal_client.create_group(
-                    title, [SIGNAL_OWNER] + SIGNAL_MEMBERS
+                    title, _sig_members_for(title)
                 )
                 gid = result.get("groupId") if isinstance(result, dict) else result
                 if gid:
@@ -1020,7 +1058,7 @@ async def sync_signal_groups(matched, unmatched):
         if tab_id not in sig_tab_group:
             try:
                 result = await _signal_client.create_group(
-                    title, [SIGNAL_OWNER] + SIGNAL_MEMBERS
+                    title, _sig_members_for(title)
                 )
                 gid = result.get("groupId") if isinstance(result, dict) else result
                 if gid:
@@ -1033,12 +1071,20 @@ async def sync_signal_groups(matched, unmatched):
             except Exception as e:
                 print(f"[signal] create group error: {e}")
 
-    # rename groups whose tab title changed
+    # rename groups whose tab title changed (only for signal-matched tabs)
     for p, _ in matched + [(p, None) for p, _ in unmatched]:
         tab_id = p["tab_id"]
         if tab_id not in sig_tab_group:
             continue
         title = (p.get("tab_title") or f"tab-{tab_id}").strip()[:128] or f"tab-{tab_id}"
+        if not _tab_match(title, SIGNAL_TABS, empty_means_all=True):
+            # tab_id was reused by a non-signal tab — detach the group
+            old_name = sig_tab_name.get(tab_id, "?")
+            print(f"[signal] tab_id {tab_id} reused (was '{old_name}', now '{title}'), detaching group")
+            sig_tab_group.pop(tab_id, None)
+            sig_tab_name.pop(tab_id, None)
+            dirty = True
+            continue
         if sig_tab_name.get(tab_id) != title:
             try:
                 await _signal_client.rename_group(sig_tab_group[tab_id], title)
@@ -1053,16 +1099,9 @@ async def sync_signal_groups(matched, unmatched):
         if gid:
             _sig_greeted.add(gid)
 
-    # leave groups for closed tabs or tabs not in active_tabs (non-matching)
-    for tab_id in [t for t in list(sig_tab_group) if t not in active_tabs]:
-        try:
-            await _signal_client.leave_group(sig_tab_group[tab_id])
-            print(f"[signal] left group for tab {tab_id}")
-        except Exception as e:
-            print(f"[signal] leave group error: {e}")
-        sig_tab_group.pop(tab_id, None)
-        sig_tab_last_pid.pop(tab_id, None)
-        dirty = True
+    # note: we don't auto-leave groups for missing tabs — discover() can
+    # return partial results and we'd lose groups permanently. Use /refresh
+    # to explicitly recreate a group.
 
     if dirty:
         _rebuild()
@@ -1078,6 +1117,11 @@ def _read_new_sync(pid):
     session = h.find_session(cwd)
     if not session:
         return []
+
+    # first time seeing a session for this pane? seek to end
+    if pid not in _seeked:
+        _seek_to_end(pid)
+        _seeked.add(pid)
 
     # opencode (and other DB-based harnesses) handle their own reading
     if h.read_new:
@@ -1136,7 +1180,9 @@ async def check_output():
             sig_tab_last_pid[tab_id] = pid
         tid = tab_topic.get(tab_id)
         gid = sig_tab_group.get(tab_id) if SIGNAL_ENABLED else None
-        source = tab_last_source.get(tab_id, "tg")
+        source = tab_last_source.get(tab_id)
+        if source is None:
+            source = "sig" if gid and not tid else "tg"
         for msg in messages:
             # telegram topic (default output channel)
             if tid and source == "tg":
@@ -1150,6 +1196,8 @@ async def check_output():
                         print(f"send err [{h.name}/{pid}]: {e}")
             # signal
             if gid and _signal_client and source == "sig":
+                tab = tab_topic_name.get(tab_id, "?")
+                print(f"[check_output] sending to signal: {tab}/{h.name} msg={msg[:60]}")
                 for chunk in _chunkify(f"{h.display_name}: {msg}"):
                     try:
                         result = await _signal_client.send_message(gid, chunk)
@@ -1255,8 +1303,13 @@ def _resolve_pid(tab_id, reply_pid=None):
         if pid is not None and pane_tab.get(pid) != tab_id:
             pid = None
     if pid is None:
-        tab_panes = [p for p, t in pane_tab.items() if t == tab_id and p in pane_harness]
-        if len(tab_panes) == 1:
+        tab_panes = sorted(p for p, t in pane_tab.items() if t == tab_id and p in pane_harness)
+        if tab_panes:
+            pid = tab_panes[0]
+    if pid is None:
+        # fall back to any tracked (non-shell) pane
+        tab_panes = sorted(p for p, t in pane_tab.items() if t == tab_id)
+        if tab_panes:
             pid = tab_panes[0]
     return pid
 
@@ -1590,6 +1643,42 @@ async def _signal_handle_command(text, group_id, tab_id):
                     status = await send_and_verify(p, msg)
                     print(f"[collab>{tab}/{h}] '{msg[:50]}' {status}")
 
+    elif cmd == "/invite":
+        args = text.strip().split()[1:]
+        if not args:
+            await _signal_client.send_message(group_id, "usage: /invite +1234567890")
+            return
+        try:
+            result = await _signal_client.add_members(group_id, args)
+            await _signal_client.send_message(group_id, f"invited {', '.join(args)}")
+        except Exception as e:
+            await _signal_client.send_message(group_id, f"invite error: {e}")
+
+    elif cmd == "/kick":
+        args = text.strip().split()[1:]
+        if not args:
+            await _signal_client.send_message(group_id, "usage: /kick +1234567890")
+            return
+        try:
+            await _signal_client.remove_members(group_id, args)
+            await _signal_client.send_message(group_id, f"removed {', '.join(args)}")
+        except Exception as e:
+            await _signal_client.send_message(group_id, f"kick error: {e}")
+
+    elif cmd == "/newgroup":
+        args = text.strip().split()[1:]
+        if len(args) < 2:
+            await _signal_client.send_message(group_id, "usage: /newgroup <name> <+number> [+number...]")
+            return
+        name = args[0]
+        members = args[1:]
+        try:
+            result = await _signal_client.create_group(name, members)
+            gid = result.get("groupId") if isinstance(result, dict) else result
+            await _signal_client.send_message(group_id, f"created '{name}' ({gid})")
+        except Exception as e:
+            await _signal_client.send_message(group_id, f"newgroup error: {e}")
+
     elif cmd == "/refresh":
         if not tab_id:
             return
@@ -1604,7 +1693,7 @@ async def _signal_handle_command(text, group_id, tab_id):
                 break
         try:
             # create new group first, then try to leave old (best-effort)
-            result = await _signal_client.create_group(name, [SIGNAL_OWNER] + SIGNAL_MEMBERS)
+            result = await _signal_client.create_group(name, _sig_members_for(name))
             new_gid = result.get("groupId") if isinstance(result, dict) else result
             if not new_gid:
                 raise RuntimeError(f"refresh create_group returned no group id: {result}")
@@ -1669,9 +1758,14 @@ async def _on_signal_message(notification):
     if not text or not group_id:
         return
     source_number = envelope.get("sourceNumber", "")
+    all_members = set(SIGNAL_MEMBERS)
+    for m in SIGNAL_TAB_MEMBERS.values():
+        all_members.update(m)
+    if not source_number:
+        print(f"[signal] no phone number for {source_name} ({source})")
     if (source != SIGNAL_OWNER
             and source not in SIGNAL_ALLOWED
-            and source_number not in SIGNAL_MEMBERS):
+            and source_number not in all_members):
         print(f"[signal] ignoring message from {source_name} ({source})")
         return
 
@@ -1779,6 +1873,8 @@ async def startup(app: Application):
         gid = _normalize_signal_group_id(v)
         if gid:
             sig_tab_group[int(k)] = gid
+    for k, v in saved.get("signal_group_names", {}).items():
+        sig_tab_name[int(k)] = v
     _rebuild()
     if sig_tab_group:
         print(f"[signal] loaded {len(sig_tab_group)} group(s) from state")
