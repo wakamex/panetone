@@ -1020,7 +1020,6 @@ async def sync_signal_groups(matched, unmatched):
 
     active_tabs = set()
     dirty = False
-
     # build reverse map: title -> existing tab_id (for reassigning after tab_id changes)
     _title_to_old_tab = {}
     for tid, name in sig_tab_name.items():
@@ -1202,7 +1201,7 @@ async def check_output():
         gid = sig_tab_group.get(tab_id) if SIGNAL_ENABLED else None
         source = tab_last_source.get(tab_id)
         if source is None:
-            source = "sig" if gid and not tid else "tg"
+            source = "sig" if gid else "tg"
         for msg in messages:
             # telegram topic (default output channel)
             if tid and source == "tg":
