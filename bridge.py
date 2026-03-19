@@ -107,25 +107,49 @@ MSG_TIMESTAMPS = os.environ.get("WEZ_MSG_TIMESTAMPS", "1") != "0"
 
 # --- wezterm cli -----------------------------------------------------------
 
+import shutil
+
+def _find_wezterm():
+    """Resolve wezterm binary: WEZTERM_BIN > known paths > PATH lookup."""
+    from_env = os.environ.get("WEZTERM_BIN", "")
+    if from_env:
+        return from_env
+    for p in (Path.home() / ".local/bin/wezterm", Path("/usr/local/bin/wezterm")):
+        if p.exists():
+            return str(p)
+    return shutil.which("wezterm") or "wezterm"
+
+WEZTERM_BIN = _find_wezterm()
+print(f"[wezterm] binary: {WEZTERM_BIN}, socket: {os.environ.get('WEZTERM_UNIX_SOCKET', '(auto)')}")
+
 
 def _wez_sync(*args):
     try:
         r = subprocess.run(
-            ["wezterm", "cli", *args], capture_output=True, text=True, timeout=5
+            [WEZTERM_BIN, "cli", *args], capture_output=True, text=True, timeout=5
         )
-        return r.stdout if r.returncode == 0 else ""
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+        if r.returncode != 0:
+            print(f"[wezterm] cli {' '.join(args)} failed (rc={r.returncode}): {r.stderr.strip()}")
+            return ""
+        return r.stdout
+    except subprocess.TimeoutExpired:
+        print(f"[wezterm] cli {' '.join(args)} timed out")
+        return ""
+    except FileNotFoundError:
+        print(f"[wezterm] binary not found: {WEZTERM_BIN}")
         return ""
 
 
 def _all_panes_sync():
     out = _wez_sync("list", "--format", "json")
+    if not out:
+        print("[wezterm] cli list returned empty")
     return json.loads(out) if out else []
 
 
 def _send_text_sync(pid, text):
     try:
-        pane = ["wezterm", "cli", "send-text", "--pane-id", str(pid)]
+        pane = [WEZTERM_BIN, "cli", "send-text", "--pane-id", str(pid)]
         subprocess.run(pane, input=text.encode(), capture_output=True, timeout=5)
         time.sleep(0.2)
         subprocess.run(
@@ -137,7 +161,7 @@ def _send_text_sync(pid, text):
 
 def _send_enter_sync(pid):
     try:
-        pane = ["wezterm", "cli", "send-text", "--pane-id", str(pid), "--no-paste"]
+        pane = [WEZTERM_BIN, "cli", "send-text", "--pane-id", str(pid), "--no-paste"]
         subprocess.run(pane, input=b"\x0d", capture_output=True, timeout=5)
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
@@ -774,12 +798,6 @@ def _seek_to_end(pid):
 # --- pane discovery --------------------------------------------------------
 
 
-_SHELLS = frozenset({
-    "zsh", "bash", "fish", "sh", "dash",
-    "uv", "python", "python3", "ruby",
-    "nvim", "vim", "nano", "htop", "top", "less", "man",
-})
-
 
 def _pane_procs(tty_name):
     """Return set of command names running on a pane's TTY."""
@@ -851,11 +869,13 @@ def _discover_sync():
                 # process running but no session yet — claim for input routing
                 matched.append((proc_only_pane, h_name))
                 claimed.add(proc_only_pane["pane_id"])
-        # also track non-shell panes without sessions (for topic creation + input)
+        # track one pane per tab for topic creation + input routing
+        seen_tabs = {p["tab_id"] for p, _ in matched}
         for p in panes:
-            if p["pane_id"] not in claimed:
-                if p["title"].strip().lower() not in _SHELLS:
-                    unmatched.append((p, None))
+            if p["tab_id"] not in seen_tabs and p["pane_id"] not in claimed:
+                unmatched.append((p, None))
+                seen_tabs.add(p["tab_id"])
+                claimed.add(p["pane_id"])
     return matched, unmatched
 
 
