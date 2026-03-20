@@ -3,9 +3,9 @@
 # requires-python = ">=3.14"
 # dependencies = ["python-telegram-bot>=22.0", "slack-sdk>=3.0", "aiohttp"]
 # ///
-"""panetone: wezterm <> telegram/signal bridge for multiple AI coding agents
+"""panetone: wakterm <> telegram/signal bridge for multiple AI coding agents
 
-Each wezterm tab gets one Telegram forum topic (by tab_title) and/or
+Each wakterm tab gets one Telegram forum topic (by tab_title) and/or
 one Signal group chat. Multiple harnesses (Claude, Codex, ...) share
 the channel but post via their own identity. Replies route to the right pane.
 
@@ -105,51 +105,65 @@ SLACK_ENABLED = bool(SLACK_BOT_TOKEN and SLACK_APP_TOKEN and SLACK_CHANNELS)
 MSG_TZ = os.environ.get("WEZ_MSG_TZ", "America/New_York")
 MSG_TIMESTAMPS = os.environ.get("WEZ_MSG_TIMESTAMPS", "1") != "0"
 
-# --- wezterm cli -----------------------------------------------------------
+# --- wakterm cli -----------------------------------------------------------
 
 import shutil
 
-def _find_wezterm():
-    """Resolve wezterm binary: WEZTERM_BIN > known paths > PATH lookup."""
-    from_env = os.environ.get("WEZTERM_BIN", "")
+def _get_terminal_env(*names):
+    for name in names:
+        value = os.environ.get(name, "")
+        if value:
+            return value
+    return ""
+
+
+def _find_wakterm():
+    """Resolve terminal binary: WAKTERM_BIN > WEZTERM_BIN > known paths > PATH."""
+    from_env = _get_terminal_env("WAKTERM_BIN", "WEZTERM_BIN")
     if from_env:
         return from_env
-    for p in (Path.home() / ".local/bin/wezterm", Path("/usr/local/bin/wezterm")):
+    for p in (
+        Path.home() / ".local/bin/wakterm",
+        Path("/usr/local/bin/wakterm"),
+        Path.home() / ".local/bin/wezterm",
+        Path("/usr/local/bin/wezterm"),
+    ):
         if p.exists():
             return str(p)
-    return shutil.which("wezterm") or "wezterm"
+    return shutil.which("wakterm") or shutil.which("wezterm") or "wakterm"
 
-WEZTERM_BIN = _find_wezterm()
-print(f"[wezterm] binary: {WEZTERM_BIN}, socket: {os.environ.get('WEZTERM_UNIX_SOCKET', '(auto)')}")
+WAKTERM_BIN = _find_wakterm()
+WAKTERM_SOCKET = _get_terminal_env("WAKTERM_UNIX_SOCKET", "WEZTERM_UNIX_SOCKET")
+print(f"[wakterm] binary: {WAKTERM_BIN}, socket: {WAKTERM_SOCKET or '(auto)'}")
 
 
 def _wez_sync(*args):
     try:
         r = subprocess.run(
-            [WEZTERM_BIN, "cli", *args], capture_output=True, text=True, timeout=5
+            [WAKTERM_BIN, "cli", *args], capture_output=True, text=True, timeout=5
         )
         if r.returncode != 0:
-            print(f"[wezterm] cli {' '.join(args)} failed (rc={r.returncode}): {r.stderr.strip()}")
+            print(f"[wakterm] cli {' '.join(args)} failed (rc={r.returncode}): {r.stderr.strip()}")
             return ""
         return r.stdout
     except subprocess.TimeoutExpired:
-        print(f"[wezterm] cli {' '.join(args)} timed out")
+        print(f"[wakterm] cli {' '.join(args)} timed out")
         return ""
     except FileNotFoundError:
-        print(f"[wezterm] binary not found: {WEZTERM_BIN}")
+        print(f"[wakterm] binary not found: {WAKTERM_BIN}")
         return ""
 
 
 def _all_panes_sync():
     out = _wez_sync("list", "--format", "json")
     if not out:
-        print("[wezterm] cli list returned empty")
+        print("[wakterm] cli list returned empty")
     return json.loads(out) if out else []
 
 
 def _send_text_sync(pid, text):
     try:
-        pane = [WEZTERM_BIN, "cli", "send-text", "--pane-id", str(pid)]
+        pane = [WAKTERM_BIN, "cli", "send-text", "--pane-id", str(pid)]
         subprocess.run(pane, input=text.encode(), capture_output=True, timeout=5)
         time.sleep(0.2)
         subprocess.run(
@@ -161,7 +175,7 @@ def _send_text_sync(pid, text):
 
 def _send_enter_sync(pid):
     try:
-        pane = [WEZTERM_BIN, "cli", "send-text", "--pane-id", str(pid), "--no-paste"]
+        pane = [WAKTERM_BIN, "cli", "send-text", "--pane-id", str(pid), "--no-paste"]
         subprocess.run(pane, input=b"\x0d", capture_output=True, timeout=5)
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
