@@ -1034,11 +1034,11 @@ async def sync_signal_groups(matched, unmatched):
 
     active_tabs = set()
     dirty = False
-    # build reverse map: title -> existing tab_id (for reassigning after tab_id changes)
-    _title_to_old_tab = {}
+    # build reverse map: title -> [tab_ids] (for reassigning after tab_id changes)
+    _title_to_old_tabs = {}
     for tid, name in sig_tab_name.items():
         if tid in sig_tab_group:
-            _title_to_old_tab[name.lower()] = tid
+            _title_to_old_tabs.setdefault(name.lower(), []).append(tid)
 
     for p, h_name in matched:
         tab_id = p["tab_id"]
@@ -1048,14 +1048,24 @@ async def sync_signal_groups(matched, unmatched):
         active_tabs.add(tab_id)
         # reassign group if tab_id changed but title matches
         if tab_id not in sig_tab_group:
-            old_tid = _title_to_old_tab.get(title.lower())
-            if old_tid and old_tid != tab_id and old_tid in sig_tab_group:
+            old_tids = _title_to_old_tabs.get(title.lower(), [])
+            old_tids = [t for t in old_tids if t != tab_id and t in sig_tab_group]
+            if old_tids:
+                # take the first, clean up any duplicates
+                old_tid = old_tids[0]
                 sig_tab_group[tab_id] = sig_tab_group.pop(old_tid)
                 sig_tab_name[tab_id] = sig_tab_name.pop(old_tid, title)
                 sig_tab_last_pid.pop(old_tid, None)
                 active_tabs.discard(old_tid)
                 dirty = True
                 print(f"[signal] reassigned group '{title}' from tab {old_tid} -> {tab_id}")
+                # remove orphaned duplicates
+                for dup_tid in old_tids[1:]:
+                    sig_tab_group.pop(dup_tid, None)
+                    sig_tab_name.pop(dup_tid, None)
+                    sig_tab_last_pid.pop(dup_tid, None)
+                    print(f"[signal] removed orphaned group for '{title}' (tab {dup_tid})")
+                    dirty = True
         if tab_id not in sig_tab_group:
             try:
                 result = await _signal_client.create_group(
@@ -1080,14 +1090,22 @@ async def sync_signal_groups(matched, unmatched):
         active_tabs.add(tab_id)
         # reassign group if tab_id changed but title matches
         if tab_id not in sig_tab_group:
-            old_tid = _title_to_old_tab.get(title.lower())
-            if old_tid and old_tid != tab_id and old_tid in sig_tab_group:
+            old_tids = _title_to_old_tabs.get(title.lower(), [])
+            old_tids = [t for t in old_tids if t != tab_id and t in sig_tab_group]
+            if old_tids:
+                old_tid = old_tids[0]
                 sig_tab_group[tab_id] = sig_tab_group.pop(old_tid)
                 sig_tab_name[tab_id] = sig_tab_name.pop(old_tid, title)
                 sig_tab_last_pid.pop(old_tid, None)
                 active_tabs.discard(old_tid)
                 dirty = True
                 print(f"[signal] reassigned group '{title}' from tab {old_tid} -> {tab_id}")
+                for dup_tid in old_tids[1:]:
+                    sig_tab_group.pop(dup_tid, None)
+                    sig_tab_name.pop(dup_tid, None)
+                    sig_tab_last_pid.pop(dup_tid, None)
+                    print(f"[signal] removed orphaned group for '{title}' (tab {dup_tid})")
+                    dirty = True
         if tab_id not in sig_tab_group:
             try:
                 result = await _signal_client.create_group(
@@ -1208,7 +1226,7 @@ async def check_output():
         if not h or not messages:
             continue
         tab_id = pane_tab.get(pid)
-        if tab_id:
+        if tab_id is not None:
             tab_last_pid[tab_id] = pid
             sig_tab_last_pid[tab_id] = pid
         tid = tab_topic.get(tab_id)
@@ -1378,7 +1396,7 @@ async def _handle_debate_message(m):
         return
 
     tab_id = _find_tab(DEBATE_TABS)
-    if not tab_id:
+    if tab_id is None:
         print(f"[debate] no matching tab, dropped: '{text[:50]}'")
         return
 
@@ -1467,7 +1485,7 @@ async def _process_slack_queue():
     while _slack_obs_queue:
         extra, obs_user_id, channel = _slack_obs_queue.pop(0)
         tab_id = _find_tab(SLACK_TABS)
-        if not tab_id:
+        if tab_id is None:
             print("[slack] no matching tab for !obs")
             continue
         # flush Slack message buffer → pane
@@ -1519,8 +1537,8 @@ async def on_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 
     reply_pid = msg_pane.get(m.reply_to_message.message_id) if m.reply_to_message else None
     tab_id = topic_tab.get(m.message_thread_id) if reply_pid is None else pane_tab.get(reply_pid)
-    pid = _resolve_pid(tab_id, reply_pid) if tab_id else reply_pid
-    if tab_id:
+    pid = _resolve_pid(tab_id, reply_pid) if tab_id is not None else reply_pid
+    if tab_id is not None:
         tab_last_source[tab_id] = "tg"
     await _route_to_pane(pid, tab_id, m.text, "tg")
 
@@ -1531,7 +1549,7 @@ async def on_collab(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     if not m or not m.message_thread_id or not _is_owner(update):
         return
     tab_id = topic_tab.get(m.message_thread_id)
-    if not tab_id:
+    if tab_id is None:
         return
 
     if tab_id in collab_tabs:
@@ -1591,7 +1609,7 @@ async def on_clear(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         return
     tid = m.message_thread_id
     tab_id = topic_tab.get(tid)
-    if not tab_id:
+    if tab_id is None:
         return
     # get tab title for recreation
     matched, unmatched = await discover()
@@ -1645,7 +1663,7 @@ async def _signal_handle_command(text, group_id, tab_id):
         await _signal_client.send_message(group_id, "\n".join(lines))
 
     elif cmd == "/collab":
-        if not tab_id:
+        if tab_id is None:
             return
         if tab_id in collab_tabs:
             del collab_tabs[tab_id]
@@ -1713,7 +1731,7 @@ async def _signal_handle_command(text, group_id, tab_id):
             await _signal_client.send_message(group_id, f"newgroup error: {e}")
 
     elif cmd == "/refresh":
-        if not tab_id:
+        if tab_id is None:
             return
         old_gid = sig_tab_group.get(tab_id)
         if not old_gid:
@@ -1803,11 +1821,13 @@ async def _on_signal_message(notification):
         return
 
     tab_id = sig_group_tab.get(group_id)
+    if tab_id is None:
+        print(f"[signal] unknown group from {source_name}, id={group_id[:20]}...")
 
     # queue for processing in poll_loop (avoid _call deadlock)
     if msg_text.strip().startswith("/"):
         _signal_cmd_queue.append((msg_text, group_id, tab_id))
-    elif tab_id:
+    elif tab_id is not None:
         _signal_input_queue.append((text, data, tab_id, source_name))
 
 
