@@ -234,9 +234,14 @@ async def send_and_verify(pid, text):
     ms = await asyncio.to_thread(_watch_mtime_sync, path, baseline, 2.0)
     if ms is not None:
         return f"\u2713 {ms}ms (enter retry)"
+    # paste may have been dropped — full resend
+    await send_text(pid, text)
+    ms = await asyncio.to_thread(_watch_mtime_sync, path, baseline, 2.0)
+    if ms is not None:
+        return f"\u2713 {ms}ms (resend)"
     h_name = pane_harness.get(pid, "?")
-    print(f"[verify] {h_name}/{pid}: >4s watching {path} (baseline mtime={baseline})")
-    return "\u2717 >4s"
+    print(f"[verify] {h_name}/{pid}: >6s watching {path} (baseline mtime={baseline})")
+    return "\u2717 >6s"
 
 
 def _parse_cwd(cwd_url):
@@ -1388,7 +1393,7 @@ async def _route_to_pane(pid, tab_id, text, label="tg"):
 
 
 
-async def _handle_debate_message(m):
+async def _handle_debate_message(m, sender="?"):
     """Route incoming debate chat message to pane(s)."""
     text = m.text
     if text.strip().startswith("/"):
@@ -1402,8 +1407,10 @@ async def _handle_debate_message(m):
 
     reply_pid = debate_msg_pane.get(m.reply_to_message.message_id) if m.reply_to_message else None
     pid = _resolve_pid(tab_id, reply_pid)
+    ts = f" [{_now_ts()}]" if MSG_TIMESTAMPS else ""
+    prefixed = f"{sender}{ts} says: {text}"
     tab_last_source[tab_id] = "debate"
-    await _route_to_pane(pid, tab_id, text, "debate")
+    await _route_to_pane(pid, tab_id, prefixed, "debate")
 
 
 async def _debate_handle_command(m):
@@ -1528,7 +1535,8 @@ async def on_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         u = update.effective_user
         if u:
             print(f"[debate] from {u.first_name} (uid={u.id})")
-        await _handle_debate_message(m)
+        sender = u.first_name if u else "?"
+        await _handle_debate_message(m, sender)
         return
 
     # === forum topics (existing flow, requires owner + thread_id) ===
