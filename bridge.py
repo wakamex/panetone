@@ -1893,7 +1893,9 @@ async def _process_signal_queues():
         pid = _resolve_pid(tab_id, reply_pid)
         tab_last_source[tab_id] = "sig"
         ts = f" [{_now_ts()}]" if MSG_TIMESTAMPS else ""
-        prefixed = f"{sender}{ts} says: {text}"
+        quote_text = quote.get("text", "") if quote else ""
+        reply_ctx = f" (replying to: {quote_text[:100]})" if quote_text else ""
+        prefixed = f"{sender}{ts} says{reply_ctx}: {text}"
         await _route_to_pane(pid, tab_id, prefixed, "sig")
 
 
