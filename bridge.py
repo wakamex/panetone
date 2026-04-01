@@ -100,7 +100,15 @@ SLACK_BOT_TOKEN = os.environ.get("WEZ_SLACK_BOT_TOKEN", "")
 SLACK_APP_TOKEN = os.environ.get("WEZ_SLACK_APP_TOKEN", "")
 SLACK_CHANNELS = {s.strip() for s in os.environ.get("WEZ_SLACK_CHANNELS", "").split(",") if s.strip()}
 SLACK_TABS = [t.strip().lower() for t in os.environ.get("WEZ_SLACK_TABS", "").split(",") if t.strip()]
-SLACK_ENABLED = bool(SLACK_BOT_TOKEN and SLACK_APP_TOKEN and SLACK_CHANNELS)
+# direct channels: WEZ_SLACK_DIRECT=C0CHAN1:tab1,C0CHAN2:tab2
+SLACK_DIRECT = {}  # channel_id -> tab_pattern
+for _entry in os.environ.get("WEZ_SLACK_DIRECT", "").split(","):
+    if ":" in _entry:
+        _ch, _tab = _entry.strip().split(":", 1)
+        if _ch and _tab:
+            SLACK_DIRECT[_ch.strip()] = _tab.strip().lower()
+            SLACK_CHANNELS.add(_ch.strip())
+SLACK_ENABLED = bool(SLACK_BOT_TOKEN and SLACK_APP_TOKEN and (SLACK_CHANNELS or SLACK_DIRECT))
 
 MSG_TZ = os.environ.get("WEZ_MSG_TZ", "America/New_York")
 MSG_TIMESTAMPS = os.environ.get("WEZ_MSG_TIMESTAMPS", "1") != "0"
@@ -281,21 +289,16 @@ def _codex_find_session(cwd):
 
     if now - _codex_cache_t > 5:
         _codex_cache = {}
-        for days_ago in range(2):
-            t = time.gmtime(now - days_ago * 86400)
-            day = CODEX_DIR / f"{t.tm_year:04d}/{t.tm_mon:02d}/{t.tm_mday:02d}"
-            if not day.is_dir():
+        for f in sorted(CODEX_DIR.rglob("rollout-*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True):
+            ps = str(f)
+            if ps in _codex_cache:
                 continue
-            for f in day.glob("rollout-*.jsonl"):
-                ps = str(f)
-                if ps in _codex_cache:
-                    continue
-                try:
-                    with open(f) as fh:
-                        meta = json.loads(fh.readline())
-                    _codex_cache[ps] = meta.get("payload", {}).get("cwd", "")
-                except (json.JSONDecodeError, OSError):
-                    pass
+            try:
+                with open(f) as fh:
+                    meta = json.loads(fh.readline())
+                _codex_cache[ps] = meta.get("payload", {}).get("cwd", "")
+            except (json.JSONDecodeError, OSError):
+                pass
         _codex_cache_t = now
 
     best, best_mt = None, 0.0
@@ -768,6 +771,8 @@ _signal_input_queue = []  # [(text, tab_id), ...]
 _slack_msg_buffer = {}     # channel_id -> [(ts, user_id_or_None, text), ...]
 _slack_obs_queue = []      # [(extra_text, user_id, channel_id), ...] !obs triggers
 _slack_reply_channel = None  # set by !obs, cleared after agent responds
+_slack_direct_tab = {}     # tab_id -> channel_id (for direct channel output)
+_slack_direct_queue = []   # [(text, user_id, channel_id), ...] direct channel messages
 _slack_web_client = None   # AsyncWebClient, set in startup
 _slack_bot_user_id = None  # our own bot user id, to skip self-echo
 
@@ -1127,21 +1132,13 @@ async def sync_signal_groups(matched, unmatched):
             except Exception as e:
                 print(f"[signal] create group error: {e}")
 
-    # rename groups whose tab title changed (only for signal-matched tabs)
+    # rename groups whose tab title changed
     for p, _ in matched + [(p, None) for p, _ in unmatched]:
         tab_id = p["tab_id"]
         if tab_id not in sig_tab_group:
             continue
         title = (p.get("tab_title") or f"tab-{tab_id}").strip()[:128] or f"tab-{tab_id}"
-        if not _tab_match(title, SIGNAL_TABS, empty_means_all=True):
-            # tab_id was reused by a non-signal tab — detach the group
-            old_name = sig_tab_name.get(tab_id, "?")
-            print(f"[signal] tab_id {tab_id} reused (was '{old_name}', now '{title}'), detaching group")
-            sig_tab_group.pop(tab_id, None)
-            sig_tab_name.pop(tab_id, None)
-            dirty = True
-            continue
-        if sig_tab_name.get(tab_id) != title:
+        if sig_tab_name.get(tab_id) != title and not re.match(r"^tab-\d+$", title):
             try:
                 await _signal_client.rename_group(sig_tab_group[tab_id], title)
                 print(f"[signal] renamed group {tab_id} -> '{title}'")
@@ -1279,6 +1276,15 @@ async def check_output():
                     except Exception as e:
                         print(f"slack send err [{h.name}/{pid}]: {e}")
                 _slack_reply_channel = None
+            # slack direct channel
+            if SLACK_ENABLED and source == "slack" and tab_id in _slack_direct_tab:
+                slack_msg = _md_tables_to_slack(msg)
+                ch = _slack_direct_tab[tab_id]
+                for chunk in _chunkify(slack_msg):
+                    try:
+                        await _slack_web_client.chat_postMessage(channel=ch, text=chunk)
+                    except Exception as e:
+                        print(f"slack-direct send err [{h.name}/{pid}]: {e}")
 
             # collab: forward to other harness panes in this tab
             tab_id = pane_tab.get(pid)
@@ -1441,6 +1447,9 @@ async def _slack_receive_task():
                 buf = _slack_msg_buffer.setdefault(channel, [])
                 if bot_id and bot_id == _slack_bot_user_id:
                     pass  # skip our own output
+                elif channel in SLACK_DIRECT:
+                    if not bot_id:
+                        _slack_direct_queue.append((text, user_id, channel))
                 elif bot_id:
                     buf.append((ts, None, text))
                 elif text.startswith("!obs"):
@@ -1523,6 +1532,25 @@ async def _process_slack_queue():
             await _route_to_pane(pid, tab_id, payload, "slack")
             _slack_reply_channel = channel
             print(f"[slack] flushed {len(parts)} input messages to pane ({channel})")
+
+
+async def _process_slack_direct():
+    while _slack_direct_queue:
+        text, user_id, channel = _slack_direct_queue.pop(0)
+        tab_pattern = SLACK_DIRECT.get(channel)
+        if not tab_pattern:
+            continue
+        tab_id = _find_tab([tab_pattern])
+        if tab_id is None:
+            print(f"[slack-direct] no tab matching '{tab_pattern}', dropped: '{text[:50]}'")
+            continue
+        name = await _resolve_slack_user(user_id)
+        ts = f" [{_now_ts()}]" if MSG_TIMESTAMPS else ""
+        prefixed = f"{name}{ts} says: {text}"
+        pid = _resolve_pid(tab_id)
+        tab_last_source[tab_id] = "slack"
+        _slack_direct_tab[tab_id] = channel
+        await _route_to_pane(pid, tab_id, prefixed, "slack-direct")
 
 
 async def on_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
@@ -1805,10 +1833,17 @@ async def _on_signal_message(notification):
     data = envelope.get("dataMessage", {})
     msg_text = data.get("message") or ""
     text = msg_text
-    for att in data.get("attachments") or []:
+    atts = data.get("attachments") or []
+    if atts:
+        print(f"[signal] attachments: {atts}")
+    for att in atts:
         att_id = att.get("id", "")
         if att_id:
-            text = text + " " + str(Path.home() / ".local/share/signal-cli/attachments" / att_id)
+            att_path = Path.home() / ".local/share/signal-cli/attachments" / att_id
+            ct = att.get("contentType", "")
+            text = text + f"\n[attached {ct}: {att_path}]"
+        else:
+            print(f"[signal] attachment without id: {att}")
     text = text.strip()
     group_info = data.get("groupInfo", {})
     group_id = _normalize_signal_group_id(group_info.get("groupId", ""))
@@ -1904,6 +1939,7 @@ async def poll_loop():
                 await _process_signal_queues()
             if SLACK_ENABLED:
                 await _process_slack_queue()
+                await _process_slack_direct()
             await check_output()
         except Exception as e:
             print(f"tick: {e}")
