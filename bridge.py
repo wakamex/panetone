@@ -444,7 +444,10 @@ def _gemini_read_new(session):
 def _claude_format(record):
     if record.get("type") != "assistant":
         return None
-    content = record.get("message", {}).get("content", [])
+    msg = record.get("message", {})
+    if msg.get("model") == "<synthetic>":
+        return None
+    content = msg.get("content", [])
     parts = []
     for block in content:
         if block.get("type") == "text":
@@ -990,7 +993,7 @@ def _tab_match(title, patterns, empty_means_all=False):
     if not patterns:
         return empty_means_all
     t = title.lower()
-    return any(pat in t for pat in patterns)
+    return any(re.search(rf'\b{re.escape(pat)}\b', t) for pat in patterns)
 
 
 def _sig_members_for(title):
@@ -1287,8 +1290,10 @@ async def check_output():
                         print(f"slack-direct send err [{h.name}/{pid}]: {e}")
 
             # collab: forward to other harness panes in this tab
+            # (auto-enabled for debate tabs)
             tab_id = pane_tab.get(pid)
-            if tab_id and tab_id in collab_tabs:
+            is_debate = debate_crosspost and _tab_match(tab_topic_name.get(tab_id, ""), DEBATE_TABS) if DEBATE_ENABLED else False
+            if tab_id is not None and (tab_id in collab_tabs or is_debate):
                 # check for /signoff
                 if "/signoff" in msg.lower():
                     signoffs = collab_signoffs.setdefault(tab_id, set())
@@ -1339,6 +1344,7 @@ async def check_output():
 collab_tabs = {}  # tab_id -> rounds_remaining (0 = infinite)
 collab_signoffs = {}  # tab_id -> set of pane_ids that signed off
 debate_msg_pane = {}  # msg_id -> pane_id (reply routing for debate chat)
+debate_crosspost = True  # auto-forward between harnesses in debate tabs
 tab_last_source = {}  # tab_id -> "tg"|"sig"|"debate"|"slack" (last input channel)
 
 
@@ -1729,6 +1735,12 @@ async def _signal_handle_command(text, group_id, tab_id):
                     h = pane_harness.get(p, "?")
                     status = await send_and_verify(p, msg)
                     print(f"[collab>{tab}/{h}] '{msg[:50]}' {status}")
+
+    elif cmd == "/crosspost":
+        global debate_crosspost
+        debate_crosspost = not debate_crosspost
+        state = "on" if debate_crosspost else "off"
+        await _signal_client.send_message(group_id, f"crosspost {state}")
 
     elif cmd == "/invite":
         args = text.strip().split()[1:]
