@@ -1344,7 +1344,7 @@ async def check_output():
 collab_tabs = {}  # tab_id -> rounds_remaining (0 = infinite)
 collab_signoffs = {}  # tab_id -> set of pane_ids that signed off
 debate_msg_pane = {}  # msg_id -> pane_id (reply routing for debate chat)
-debate_crosspost = True  # auto-forward between harnesses in debate tabs
+debate_crosspost = False  # auto-forward between harnesses in debate tabs (toggle with /crosspost)
 tab_last_source = {}  # tab_id -> "tg"|"sig"|"debate"|"slack" (last input channel)
 
 
