@@ -38,6 +38,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -711,7 +712,7 @@ class SignalClient:
                 try:
                     await callback(msg)
                 except Exception as e:
-                    print(f"[signal] callback error: {e}")
+                    print(f"[signal] callback error: {e}\n{traceback.format_exc()}")
 
 
 def _normalize_signal_group_id(group_id):
@@ -1841,7 +1842,7 @@ async def _on_signal_message(notification):
 
     source = (envelope.get("sourceNumber")
               or envelope.get("sourceUuid")
-              or envelope.get("source", ""))
+              or envelope.get("source") or "")
     data = envelope.get("dataMessage", {})
     msg_text = data.get("message") or ""
     text = msg_text
@@ -1943,8 +1944,13 @@ async def poll_loop():
             mt = _script_path.stat().st_mtime
             if mt != _script_mtime:
                 print("bridge.py changed, reloading...")
+                _script_mtime = mt  # update first so a failed execv can't loop
                 _persist()
-                os.execv(sys.executable, [sys.executable, str(_script_path)])
+                # re-exec through uv (not sys.executable): under `uv run
+                # --script` sys.executable is an ephemeral venv python that
+                # may have been garbage-collected, making execv raise ENOENT.
+                _uv = shutil.which("uv") or str(Path.home() / ".local/bin/uv")
+                os.execv(_uv, [_uv, "run", str(_script_path)])
 
             matched, unmatched = await discover()
             await sync_topics(matched, unmatched)
