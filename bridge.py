@@ -1144,8 +1144,69 @@ def _read_new_sync(pid):
     return messages
 
 
+# failed sends awaiting retry: (kind, target, chunk, pid, h_name).
+# The session-file cursor advances at read time, so a chunk whose send
+# fails would otherwise be lost forever — queue it and retry each tick.
+# In-memory only: a hot-reload (execv) drops anything still queued.
+_pending_sends = []
+_MAX_PENDING = 500
+
+
+async def _deliver(kind, target, chunk, pid, h_name):
+    """Send one chunk to a channel. Returns True on success."""
+    h = harnesses.get(h_name)
+    bot = h.bot if h else _primary_bot
+    try:
+        if kind == "tg":
+            sent = await bot.send_message(CHAT, chunk, message_thread_id=target)
+            msg_pane[sent.message_id] = pid
+        elif kind == "sig":
+            result = await _signal_client.send_message(target, chunk)
+            ts = result.get("timestamp") if isinstance(result, dict) else None
+            if ts:
+                sig_msg_pane[ts] = pid
+        elif kind == "debate":
+            sent = await bot.send_message(target, chunk)
+            debate_msg_pane[sent.message_id] = pid
+        elif kind == "slack":
+            await _slack_web_client.chat_postMessage(channel=target, text=chunk)
+        return True
+    except Exception as e:
+        print(f"send err [{kind}/{h_name}/{pid}]: {e}")
+        return False
+
+
+async def _send_or_queue(kind, target, chunk, pid, h_name):
+    """Deliver a chunk, or queue it for retry; keeps per-destination order."""
+    pending_here = any(k == kind and t == target
+                       for k, t, _, _, _ in _pending_sends)
+    if pending_here or not await _deliver(kind, target, chunk, pid, h_name):
+        _pending_sends.append((kind, target, chunk, pid, h_name))
+        if len(_pending_sends) > _MAX_PENDING:
+            dropped = len(_pending_sends) - _MAX_PENDING
+            del _pending_sends[:dropped]
+            print(f"[retry] queue full, dropped {dropped} oldest chunk(s)")
+
+
+async def _flush_pending():
+    """Retry queued sends; a destination that fails again stays blocked
+    this pass so its chunks keep their order."""
+    if not _pending_sends:
+        return
+    remaining, blocked = [], set()
+    for item in _pending_sends:
+        dest = (item[0], item[1])
+        if dest in blocked or not await _deliver(*item):
+            blocked.add(dest)
+            remaining.append(item)
+    _pending_sends[:] = remaining
+    if remaining:
+        print(f"[retry] {len(remaining)} chunk(s) still pending")
+
+
 async def check_output():
     global _slack_reply_channel
+    await _flush_pending()
     pids = list(pane_harness.keys())
     results = await asyncio.gather(
         *(asyncio.to_thread(_read_new_sync, pid) for pid in pids)
@@ -1167,51 +1228,29 @@ async def check_output():
             # telegram topic (default output channel)
             if tid and source == "tg":
                 for chunk in _chunkify(msg):
-                    try:
-                        sent = await h.bot.send_message(
-                            CHAT, chunk, message_thread_id=tid
-                        )
-                        msg_pane[sent.message_id] = pid
-                    except Exception as e:
-                        print(f"send err [{h.name}/{pid}]: {e}")
-            # signal
-            if gid and _signal_client and source == "sig":
+                    await _send_or_queue("tg", tid, chunk, pid, h.name)
+            # signal (queue even while the client is down/reconnecting)
+            if gid and source == "sig":
                 tab = tab_topic_name.get(tab_id, "?")
                 print(f"[check_output] sending to signal: {tab}/{h.name} msg={msg[:60]}")
                 for chunk in _chunkify(f"{h.display_name}: {msg}"):
-                    try:
-                        result = await _signal_client.send_message(gid, chunk)
-                        ts = result.get("timestamp") if isinstance(result, dict) else None
-                        if ts:
-                            sig_msg_pane[ts] = pid
-                    except Exception as e:
-                        print(f"signal send err [{h.name}/{pid}]: {e}")
+                    await _send_or_queue("sig", gid, chunk, pid, h.name)
             # debate chat (each bot posts as itself, no prefix)
             if DEBATE_ENABLED and source == "debate" and _tab_match(tab_topic_name.get(tab_id, ""), DEBATE_TABS):
                 for chunk in _chunkify(msg):
-                    try:
-                        sent = await h.bot.send_message(DEBATE_CHAT, chunk)
-                        debate_msg_pane[sent.message_id] = pid
-                    except Exception as e:
-                        print(f"debate send err [{h.name}/{pid}]: {e}")
+                    await _send_or_queue("debate", DEBATE_CHAT, chunk, pid, h.name)
             # slack observer (reply to !obs, then clear)
             if SLACK_ENABLED and _slack_reply_channel and _tab_match(tab_topic_name.get(tab_id, ""), SLACK_TABS):
                 slack_msg = _md_tables_to_slack(msg)
                 for chunk in _chunkify(slack_msg):
-                    try:
-                        await _slack_web_client.chat_postMessage(channel=_slack_reply_channel, text=chunk)
-                    except Exception as e:
-                        print(f"slack send err [{h.name}/{pid}]: {e}")
+                    await _send_or_queue("slack", _slack_reply_channel, chunk, pid, h.name)
                 _slack_reply_channel = None
             # slack direct channel
             if SLACK_ENABLED and source == "slack" and tab_id in _slack_direct_tab:
                 slack_msg = _md_tables_to_slack(msg)
                 ch = _slack_direct_tab[tab_id]
                 for chunk in _chunkify(slack_msg):
-                    try:
-                        await _slack_web_client.chat_postMessage(channel=ch, text=chunk)
-                    except Exception as e:
-                        print(f"slack-direct send err [{h.name}/{pid}]: {e}")
+                    await _send_or_queue("slack", ch, chunk, pid, h.name)
 
             # collab: forward to other harness panes in this tab
             # (auto-enabled for debate tabs)
