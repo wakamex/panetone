@@ -762,9 +762,13 @@ tab_last_pid = {}  # tab_id -> pane_id of last agent to send a message
 
 
 # signal bridge state
-sig_tab_group = {}    # tab_id -> signal group_id
-sig_group_tab = {}    # group_id -> tab_id
-sig_tab_name = {}     # tab_id -> last known group name
+# Durable source of truth: title -> group_id. wezterm renumbers tab_ids on
+# restart, so tab_id is NOT a stable key; the tab TITLE is. sig_tab_group /
+# sig_tab_name are ephemeral, rebuilt each sync from the current tab layout.
+sig_name_group = {}   # title_lower -> signal group_id (persisted)
+sig_tab_group = {}    # tab_id -> signal group_id (ephemeral, rebuilt each sync)
+sig_group_tab = {}    # group_id -> tab_id (ephemeral)
+sig_tab_name = {}     # tab_id -> group name (ephemeral)
 sig_msg_pane = {}     # signal_timestamp -> pane_id
 sig_tab_last_pid = {} # tab_id -> pane_id
 _signal_client = None
@@ -796,9 +800,9 @@ def _persist():
         "topics": {str(k): v for k, v in tab_topic.items()},
         "collab": {str(k): v for k, v in collab_tabs.items()},
     }
-    if sig_tab_group:
-        data["signal_groups"] = {str(k): v for k, v in sig_tab_group.items()}
-        data["signal_group_names"] = {str(k): v for k, v in sig_tab_name.items()}
+    if sig_name_group:
+        # keyed by tab title (stable), not tab_id (renumbers on wezterm restart)
+        data["signal_groups"] = dict(sig_name_group)
     _save(data)
 
 
@@ -1024,7 +1028,7 @@ async def sync_signal_groups(matched, unmatched):
 
     # one-time: verify stored groups are still valid on first call
     global _sig_groups_verified
-    if not _sig_groups_verified and sig_tab_group:
+    if not _sig_groups_verified and sig_name_group:
         _sig_groups_verified = True
         try:
             groups = await _signal_client.list_groups()
@@ -1034,135 +1038,54 @@ async def sync_signal_groups(matched, unmatched):
                 if g.get("isMember")
             }
             valid_ids.discard("")
-            stale = [tid for tid, gid in list(sig_tab_group.items())
+            stale = [nm for nm, gid in list(sig_name_group.items())
                      if _normalize_signal_group_id(gid) not in valid_ids]
             if stale:
-                for tid in stale:
-                    sig_tab_group.pop(tid)
-                    sig_tab_last_pid.pop(tid, None)
-                _rebuild()
+                for nm in stale:
+                    sig_name_group.pop(nm, None)
                 _persist()
-                print(f"[signal] removed {len(stale)} stale group(s)")
+                print(f"[signal] removed {len(stale)} stale group(s): {stale}")
         except Exception as e:
             print(f"[signal] group verification error: {e}")
 
-    active_tabs = set()
+    # Resolve groups by tab TITLE, not tab_id. wezterm renumbers tab_ids on
+    # restart, so the tab_id -> group maps (sig_tab_group / sig_tab_name) are
+    # rebuilt from scratch every sync off the current tab layout; the durable
+    # title -> group_id mapping lives in sig_name_group. This makes the bridge
+    # robust to tab renumbering and stops a renumbered tab from inheriting a
+    # stale mapping (e.g. "trading" landing on the debate group's old tab_id).
+    sig_tab_group.clear()
+    sig_tab_name.clear()
     dirty = False
-    # build reverse map: title -> [tab_ids] (for reassigning after tab_id changes)
-    _title_to_old_tabs = {}
-    for tid, name in sig_tab_name.items():
-        if tid in sig_tab_group:
-            _title_to_old_tabs.setdefault(name.lower(), []).append(tid)
-
-    for p, h_name in matched:
+    for p, _h in matched + unmatched:
         tab_id = p["tab_id"]
         title = (p.get("tab_title") or f"tab-{tab_id}").strip()[:128] or f"tab-{tab_id}"
-        if not _tab_match(title, SIGNAL_TABS, empty_means_all=True):
+        if not _tab_match(title, SIGNAL_TABS):
             continue
-        active_tabs.add(tab_id)
-        # reassign group if tab_id changed but title matches
-        if tab_id not in sig_tab_group:
-            old_tids = _title_to_old_tabs.get(title.lower(), [])
-            old_tids = [t for t in old_tids if t != tab_id and t in sig_tab_group]
-            if old_tids:
-                # take the first, clean up any duplicates
-                old_tid = old_tids[0]
-                sig_tab_group[tab_id] = sig_tab_group.pop(old_tid)
-                sig_tab_name[tab_id] = sig_tab_name.pop(old_tid, title)
-                sig_tab_last_pid.pop(old_tid, None)
-                active_tabs.discard(old_tid)
-                dirty = True
-                print(f"[signal] reassigned group '{title}' from tab {old_tid} -> {tab_id}")
-                # remove orphaned duplicates
-                for dup_tid in old_tids[1:]:
-                    sig_tab_group.pop(dup_tid, None)
-                    sig_tab_name.pop(dup_tid, None)
-                    sig_tab_last_pid.pop(dup_tid, None)
-                    print(f"[signal] removed orphaned group for '{title}' (tab {dup_tid})")
-                    dirty = True
-        if tab_id not in sig_tab_group:
+        key = title.lower()
+        gid = sig_name_group.get(key)
+        if not gid:
             try:
                 result = await _signal_client.create_group(
                     title, _sig_members_for(title)
                 )
                 gid = result.get("groupId") if isinstance(result, dict) else result
-                if gid:
-                    sig_tab_group[tab_id] = gid
-                    sig_tab_name[tab_id] = title
-                    dirty = True
-                    print(f"[signal] created group '{title}' -> {gid}")
-                else:
+                if not gid:
                     print(f"[signal] create group returned no group id: {result}")
-            except Exception as e:
-                print(f"[signal] create group error: {e}")
-
-    for p, _ in unmatched:
-        tab_id = p["tab_id"]
-        title = (p.get("tab_title") or f"tab-{tab_id}").strip()[:128] or f"tab-{tab_id}"
-        if not _tab_match(title, SIGNAL_TABS, empty_means_all=True):
-            continue
-        active_tabs.add(tab_id)
-        # reassign group if tab_id changed but title matches
-        if tab_id not in sig_tab_group:
-            old_tids = _title_to_old_tabs.get(title.lower(), [])
-            old_tids = [t for t in old_tids if t != tab_id and t in sig_tab_group]
-            if old_tids:
-                old_tid = old_tids[0]
-                sig_tab_group[tab_id] = sig_tab_group.pop(old_tid)
-                sig_tab_name[tab_id] = sig_tab_name.pop(old_tid, title)
-                sig_tab_last_pid.pop(old_tid, None)
-                active_tabs.discard(old_tid)
+                    continue
+                sig_name_group[key] = gid
                 dirty = True
-                print(f"[signal] reassigned group '{title}' from tab {old_tid} -> {tab_id}")
-                for dup_tid in old_tids[1:]:
-                    sig_tab_group.pop(dup_tid, None)
-                    sig_tab_name.pop(dup_tid, None)
-                    sig_tab_last_pid.pop(dup_tid, None)
-                    print(f"[signal] removed orphaned group for '{title}' (tab {dup_tid})")
-                    dirty = True
-        if tab_id not in sig_tab_group:
-            try:
-                result = await _signal_client.create_group(
-                    title, _sig_members_for(title)
-                )
-                gid = result.get("groupId") if isinstance(result, dict) else result
-                if gid:
-                    sig_tab_group[tab_id] = gid
-                    sig_tab_name[tab_id] = title
-                    dirty = True
-                    print(f"[signal] created group '{title}' -> {gid}")
-                else:
-                    print(f"[signal] create group returned no group id: {result}")
+                print(f"[signal] created group '{title}' -> {gid}")
             except Exception as e:
                 print(f"[signal] create group error: {e}")
-
-    # rename groups whose tab title changed
-    for p, _ in matched + [(p, None) for p, _ in unmatched]:
-        tab_id = p["tab_id"]
-        if tab_id not in sig_tab_group:
-            continue
-        title = (p.get("tab_title") or f"tab-{tab_id}").strip()[:128] or f"tab-{tab_id}"
-        if sig_tab_name.get(tab_id) != title and not re.match(r"^tab-\d+$", title):
-            try:
-                await _signal_client.rename_group(sig_tab_group[tab_id], title)
-                print(f"[signal] renamed group {tab_id} -> '{title}'")
-            except Exception:
-                pass
-            sig_tab_name[tab_id] = title
-
-    # track greeted groups (no greeting message sent)
-    for tab_id in active_tabs:
-        gid = sig_tab_group.get(tab_id)
-        if gid:
-            _sig_greeted.add(gid)
-
-    # note: we don't auto-leave groups for missing tabs — discover() can
-    # return partial results and we'd lose groups permanently. Use /refresh
-    # to explicitly recreate a group.
+                continue
+        sig_tab_group[tab_id] = gid
+        sig_tab_name[tab_id] = title
+        _sig_greeted.add(gid)
 
     if dirty:
-        _rebuild()
         _persist()
+    _rebuild()
 
 
 def _read_new_sync(pid):
@@ -1797,7 +1720,9 @@ async def _signal_handle_command(text, group_id, tab_id):
             new_gid = result.get("groupId") if isinstance(result, dict) else result
             if not new_gid:
                 raise RuntimeError(f"refresh create_group returned no group id: {result}")
+            sig_name_group[name.strip().lower()] = new_gid
             sig_tab_group[tab_id] = new_gid
+            sig_tab_name[tab_id] = name
             _rebuild()
             _persist()
             await _signal_client.send_message(new_gid, "refreshed")
@@ -1986,15 +1911,23 @@ async def startup(app: Application):
         tab_topic[int(k)] = v
     for k, v in saved.get("collab", {}).items():
         collab_tabs[int(k)] = v
+    _sig_names = saved.get("signal_group_names", {})  # legacy: tab_id -> title
     for k, v in saved.get("signal_groups", {}).items():
         gid = _normalize_signal_group_id(v)
-        if gid:
-            sig_tab_group[int(k)] = gid
-    for k, v in saved.get("signal_group_names", {}).items():
-        sig_tab_name[int(k)] = v
+        if not gid:
+            continue
+        # new format keys by title; legacy format keys by tab_id (numeric),
+        # in which case recover the title from the old signal_group_names map.
+        if str(k).lstrip("-").isdigit():
+            key = str(_sig_names.get(str(k), "")).strip().lower()
+        else:
+            key = str(k).strip().lower()
+        if key and not re.match(r"^tab-\d+$", key):
+            sig_name_group.setdefault(key, gid)
     _rebuild()
-    if sig_tab_group:
-        print(f"[signal] loaded {len(sig_tab_group)} group(s) from state")
+    if sig_name_group:
+        print(f"[signal] loaded {len(sig_name_group)} group(s) from state: "
+              f"{sorted(sig_name_group)}")
 
     # start signal
     if SIGNAL_ENABLED:
