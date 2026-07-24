@@ -962,7 +962,7 @@ def _signal_db_archive_outgoing(group_id, text, result):
 def _signal_db_pending(group_id):
     with _signal_db_connect() as db:
         return db.execute("""
-            SELECT id, formatted_text
+            SELECT id, formatted_text, is_mention
             FROM signal_messages
             WHERE group_id = ?
               AND accepted = 1
@@ -1370,6 +1370,7 @@ async def sync_signal_groups(matched, unmatched):
     if dirty:
         _persist()
     _rebuild()
+    await _flush_ready_signal_history()
 
 
 def _read_new_sync(pid):
@@ -1964,6 +1965,20 @@ async def _flush_signal_history(group_id, tab_id, reply_pid=None):
     if routed:
         _signal_db_mark_delivered([row["id"] for row in pending])
     return message_count, routed
+
+
+async def _flush_ready_signal_history():
+    """Replay archived input that arrived before its group mapping was ready."""
+    for group_id, tab_id in sig_group_tab.items():
+        pending = _signal_db_pending(group_id)
+        if not pending:
+            continue
+        if (
+            group_id in clod_off_groups
+            and not any(row["is_mention"] for row in pending)
+        ):
+            continue
+        await _flush_signal_history(group_id, tab_id)
 
 
 async def _signal_handle_command(text, group_id, tab_id):
