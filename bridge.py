@@ -80,6 +80,9 @@ SIGNAL_SOCKET = os.environ.get("WEZ_SIG_SOCKET", "")
 SIGNAL_ACCOUNT = os.environ.get("WEZ_SIG_ACCOUNT", "")
 SIGNAL_OWNER = os.environ.get("WEZ_SIG_OWNER", "")
 SIGNAL_ENABLED = bool(SIGNAL_SOCKET and SIGNAL_ACCOUNT and SIGNAL_OWNER)
+SIGNAL_DB = Path(
+    os.environ.get("WEZ_SIG_DB", str(STATE.with_name("signal.db")))
+).expanduser()
 SIGNAL_TABS = [t.strip().lower() for t in os.environ.get("WEZ_SIG_TABS", "").split(",") if t.strip()]
 SIGNAL_ALLOWED = {s.strip() for s in os.environ.get("WEZ_SIG_ALLOWED", "").split(",") if s.strip()}
 SIGNAL_MEMBERS = [s.strip() for s in os.environ.get("WEZ_SIG_MEMBERS", "").split(",") if s.strip()]
@@ -539,6 +542,17 @@ def _now_ts():
     return datetime.now(ZoneInfo(MSG_TZ)).strftime("%H:%M")
 
 
+def _ts_from_millis(timestamp):
+    """Format an epoch-millisecond Signal timestamp in the configured timezone."""
+    if not MSG_TIMESTAMPS or not timestamp:
+        return ""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime.fromtimestamp(
+        int(timestamp) / 1000, ZoneInfo(MSG_TZ)
+    ).strftime("%H:%M")
+
+
 def _md_tables_to_slack(text):
     """Convert markdown tables to monospace code blocks for Slack."""
     lines = text.split("\n")
@@ -639,11 +653,16 @@ class SignalClient:
         return self._call_writer is not None
 
     async def send_message(self, group_id, text):
-        return await self._call("send", {
+        result = await self._call("send", {
             "groupId": group_id,
             "message": text,
             "account": SIGNAL_ACCOUNT,
         })
+        try:
+            _signal_db_archive_outgoing(group_id, text, result)
+        except Exception as e:
+            print(f"[signal] outgoing archive error: {e}")
+        return result
 
     async def create_group(self, name, members):
         return await self._call("updateGroup", {
@@ -744,6 +763,258 @@ def _save(data):
     STATE.write_text(json.dumps(data))
 
 
+def _signal_db_connect():
+    SIGNAL_DB.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(SIGNAL_DB)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def _signal_db_init():
+    with _signal_db_connect() as db:
+        db.execute("PRAGMA journal_mode=WAL")
+        schema = db.execute("""
+            SELECT sql FROM sqlite_master
+            WHERE type = 'table' AND name = 'signal_messages'
+        """).fetchone()
+        if schema and "UNIQUE (group_id, envelope_timestamp)" in schema["sql"]:
+            columns = {
+                row["name"] for row in db.execute(
+                    "PRAGMA table_info(signal_messages)"
+                ).fetchall()
+            }
+            direction = "direction" if "direction" in columns else "'incoming'"
+            db.execute("ALTER TABLE signal_messages RENAME TO signal_messages_old")
+            db.execute("""
+                CREATE TABLE signal_messages (
+                    id INTEGER PRIMARY KEY,
+                    group_id TEXT NOT NULL,
+                    envelope_timestamp INTEGER,
+                    received_at INTEGER NOT NULL,
+                    sender_id TEXT NOT NULL,
+                    sender_number TEXT NOT NULL,
+                    sender_name TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    formatted_text TEXT NOT NULL,
+                    data_json TEXT NOT NULL,
+                    direction TEXT NOT NULL DEFAULT 'incoming',
+                    accepted INTEGER NOT NULL,
+                    is_command INTEGER NOT NULL,
+                    is_mention INTEGER NOT NULL,
+                    delivered_at INTEGER,
+                    UNIQUE (group_id, sender_id, envelope_timestamp)
+                )
+            """)
+            db.execute(f"""
+                INSERT INTO signal_messages (
+                    id, group_id, envelope_timestamp, received_at,
+                    sender_id, sender_number, sender_name,
+                    text, formatted_text, data_json, direction,
+                    accepted, is_command, is_mention, delivered_at
+                )
+                SELECT
+                    id, group_id, envelope_timestamp, received_at,
+                    sender_id, sender_number, sender_name,
+                    text, formatted_text, data_json, {direction},
+                    accepted, is_command, is_mention, delivered_at
+                FROM signal_messages_old
+            """)
+            db.execute("DROP TABLE signal_messages_old")
+        else:
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS signal_messages (
+                    id INTEGER PRIMARY KEY,
+                    group_id TEXT NOT NULL,
+                    envelope_timestamp INTEGER,
+                    received_at INTEGER NOT NULL,
+                    sender_id TEXT NOT NULL,
+                    sender_number TEXT NOT NULL,
+                    sender_name TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    formatted_text TEXT NOT NULL,
+                    data_json TEXT NOT NULL,
+                    direction TEXT NOT NULL DEFAULT 'incoming',
+                    accepted INTEGER NOT NULL,
+                    is_command INTEGER NOT NULL,
+                    is_mention INTEGER NOT NULL,
+                    delivered_at INTEGER,
+                    UNIQUE (group_id, sender_id, envelope_timestamp)
+                )
+            """)
+        columns = {
+            row["name"] for row in db.execute(
+                "PRAGMA table_info(signal_messages)"
+            ).fetchall()
+        }
+        if "direction" not in columns:
+            db.execute("""
+                ALTER TABLE signal_messages
+                ADD COLUMN direction TEXT NOT NULL DEFAULT 'incoming'
+            """)
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS signal_messages_pending
+            ON signal_messages (group_id, delivered_at, id)
+        """)
+        db.execute("""
+            CREATE VIEW IF NOT EXISTS signal_history AS
+            SELECT
+                id,
+                datetime(received_at / 1000, 'unixepoch', 'localtime') AS received,
+                group_id,
+                direction,
+                sender_name,
+                text,
+                accepted,
+                is_command,
+                is_mention,
+                delivered_at IS NULL AS pending
+            FROM signal_messages
+            ORDER BY COALESCE(envelope_timestamp, received_at), id
+        """)
+
+
+def _signal_db_archive(
+    *,
+    group_id,
+    envelope_timestamp,
+    sender_id,
+    sender_number,
+    sender_name,
+    text,
+    formatted_text,
+    data,
+    accepted,
+    is_command,
+    is_mention,
+):
+    """Archive one received message. Return (row_id, inserted, should_process)."""
+    received_at = int(time.time() * 1000)
+    timestamp = int(envelope_timestamp) if envelope_timestamp else None
+    values = (
+        group_id,
+        timestamp,
+        received_at,
+        sender_id or "",
+        sender_number or "",
+        sender_name or "",
+        text or "",
+        formatted_text or "",
+        json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+        int(bool(accepted)),
+        int(bool(is_command)),
+        int(bool(is_mention)),
+    )
+    with _signal_db_connect() as db:
+        cur = db.execute("""
+            INSERT OR IGNORE INTO signal_messages (
+                group_id, envelope_timestamp, received_at,
+                sender_id, sender_number, sender_name,
+                text, formatted_text, data_json,
+                direction, accepted, is_command, is_mention
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'incoming', ?, ?, ?)
+        """, values)
+        if cur.rowcount:
+            return (
+                cur.lastrowid,
+                True,
+                bool(accepted and not is_command and formatted_text),
+            )
+        row = db.execute("""
+            SELECT id, accepted, is_command, formatted_text, delivered_at
+            FROM signal_messages
+            WHERE group_id = ? AND sender_id = ? AND envelope_timestamp = ?
+        """, (group_id, sender_id or "", timestamp)).fetchone()
+    if not row:
+        return None, False, False
+    should_process = (
+        row["accepted"]
+        and not row["is_command"]
+        and bool(row["formatted_text"])
+        and row["delivered_at"] is None
+    )
+    return row["id"], False, should_process
+
+
+def _signal_db_archive_outgoing(group_id, text, result):
+    timestamp = result.get("timestamp") if isinstance(result, dict) else None
+    sent_at = int(timestamp or time.time() * 1000)
+    normalized = _normalize_signal_group_id(group_id)
+    with _signal_db_connect() as db:
+        db.execute("""
+            INSERT OR IGNORE INTO signal_messages (
+                group_id, envelope_timestamp, received_at,
+                sender_id, sender_number, sender_name,
+                text, formatted_text, data_json, direction,
+                accepted, is_command, is_mention, delivered_at
+            ) VALUES (?, ?, ?, ?, ?, 'Clod', ?, ?, '{}', 'outgoing', 1, 0, 0, ?)
+        """, (
+            normalized,
+            int(timestamp) if timestamp else None,
+            sent_at,
+            SIGNAL_ACCOUNT,
+            SIGNAL_ACCOUNT,
+            text or "",
+            text or "",
+            sent_at,
+        ))
+
+
+def _signal_db_pending(group_id):
+    with _signal_db_connect() as db:
+        return db.execute("""
+            SELECT id, formatted_text
+            FROM signal_messages
+            WHERE group_id = ?
+              AND accepted = 1
+              AND direction = 'incoming'
+              AND is_command = 0
+              AND formatted_text != ''
+              AND delivered_at IS NULL
+            ORDER BY COALESCE(envelope_timestamp, received_at), id
+        """, (group_id,)).fetchall()
+
+
+def _signal_db_mark_delivered(message_ids):
+    if not message_ids:
+        return
+    placeholders = ",".join("?" for _ in message_ids)
+    with _signal_db_connect() as db:
+        db.execute(
+            f"UPDATE signal_messages SET delivered_at = ? "
+            f"WHERE id IN ({placeholders}) AND delivered_at IS NULL",
+            (int(time.time() * 1000), *message_ids),
+        )
+
+
+def _signal_db_move_pending(old_group_id, new_group_id):
+    with _signal_db_connect() as db:
+        db.execute("""
+            UPDATE signal_messages
+            SET group_id = ?
+            WHERE group_id = ? AND delivered_at IS NULL
+        """, (new_group_id, old_group_id))
+
+
+def _signal_db_migrate_legacy_history(saved_history):
+    """Move the former JSON mute backlog into the durable message archive."""
+    base = int(time.time() * 1000)
+    with _signal_db_connect() as db:
+        for group_id, messages in saved_history.items():
+            normalized = _normalize_signal_group_id(group_id)
+            if not normalized or not isinstance(messages, list):
+                continue
+            for offset, message in enumerate(messages):
+                formatted = str(message)
+                db.execute("""
+                    INSERT INTO signal_messages (
+                        group_id, received_at,
+                        sender_id, sender_number, sender_name,
+                        text, formatted_text, data_json,
+                        accepted, is_command, is_mention
+                    ) VALUES (?, ?, '', '', '', ?, ?, '{}', 1, 0, 0)
+                """, (normalized, base + offset, formatted, formatted))
+
+
 # --- bridge state ----------------------------------------------------------
 
 tab_topic = {}  # tab_id -> topic_id
@@ -773,7 +1044,7 @@ sig_msg_pane = {}     # signal_timestamp -> pane_id
 sig_tab_last_pid = {} # tab_id -> pane_id
 _signal_client = None
 _signal_cmd_queue = []  # [(text, group_id, tab_id), ...]
-_signal_input_queue = []  # [(text, tab_id), ...]
+_signal_input_queue = []  # [(data, tab_id, group_id, is_mention), ...]
 
 # slack observer state
 _slack_msg_buffer = {}     # channel_id -> [(ts, user_id_or_None, text), ...]
@@ -799,7 +1070,10 @@ def _persist():
     data = {
         "topics": {str(k): v for k, v in tab_topic.items()},
         "collab": {str(k): v for k, v in collab_tabs.items()},
+        "clod_off_groups": sorted(clod_off_groups),
     }
+    if _legacy_clod_off_tabs:
+        data["clod_off"] = sorted(str(k) for k in _legacy_clod_off_tabs)
     if sig_name_group:
         # keyed by tab title (stable), not tab_id (renumbers on wezterm restart)
         data["signal_groups"] = dict(sig_name_group)
@@ -1083,6 +1357,16 @@ async def sync_signal_groups(matched, unmatched):
         sig_tab_name[tab_id] = title
         _sig_greeted.add(gid)
 
+    # Migrate the old tab-id-based mute state while the original mux layout is
+    # still available. New state is keyed by Signal group ID and survives tab
+    # renumbering across terminal restarts.
+    for tab_id in list(_legacy_clod_off_tabs):
+        gid = _normalize_signal_group_id(sig_tab_group.get(tab_id))
+        if gid:
+            clod_off_groups.add(gid)
+            _legacy_clod_off_tabs.discard(tab_id)
+            dirty = True
+
     if dirty:
         _persist()
     _rebuild()
@@ -1306,6 +1590,8 @@ async def check_output():
 
 collab_tabs = {}  # tab_id -> rounds_remaining (0 = infinite)
 collab_signoffs = {}  # tab_id -> set of pane_ids that signed off
+clod_off_groups = set()  # stable Signal group_ids muted via /clodoff
+_legacy_clod_off_tabs = set()  # pre-migration tab_ids loaded from old state
 debate_msg_pane = {}  # msg_id -> pane_id (reply routing for debate chat)
 debate_crosspost = False  # auto-forward between harnesses in debate tabs (toggle with /crosspost)
 tab_last_source = {}  # tab_id -> "tg"|"sig"|"debate"|"slack" (last input channel)
@@ -1646,6 +1932,40 @@ async def on_clear(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 # --- signal handlers -------------------------------------------------------
 
 
+def _format_signal_input(text, data, sender, envelope_timestamp=None):
+    quote = data.get("quote", {})
+    short_ts = _ts_from_millis(envelope_timestamp) or _now_ts()
+    ts = f" [{short_ts}]" if short_ts else ""
+    quote_text = quote.get("text", "") if quote else ""
+    reply_ctx = f" (replying to: {quote_text[:100]})" if quote_text else ""
+    return f"{sender}{ts} says{reply_ctx}: {text}"
+
+
+async def _flush_signal_history(group_id, tab_id, reply_pid=None):
+    """Route all undelivered archived messages. Returns (message_count, routed)."""
+    pending = _signal_db_pending(group_id)
+    message_count = len(pending)
+    if not pending:
+        return 0, True
+
+    messages = [row["formatted_text"] for row in pending]
+    if len(messages) > 1:
+        payload = "\n\n".join([
+            "Signal chat history since the last delivery:",
+            *messages,
+        ])
+    else:
+        payload = messages[0]
+
+    pid = _resolve_pid(tab_id, reply_pid)
+    if tab_id is not None:
+        tab_last_source[tab_id] = "sig"
+    routed = await _route_to_pane(pid, tab_id, payload, "sig")
+    if routed:
+        _signal_db_mark_delivered([row["id"] for row in pending])
+    return message_count, routed
+
+
 async def _signal_handle_command(text, group_id, tab_id):
     cmd = text.strip().split()[0].lower()
     if cmd == "/list":
@@ -1705,6 +2025,27 @@ async def _signal_handle_command(text, group_id, tab_id):
         state = "on" if debate_crosspost else "off"
         await _signal_client.send_message(group_id, f"crosspost {state}")
 
+    elif cmd == "/clodoff":
+        clod_off_groups.add(_normalize_signal_group_id(group_id))
+        _persist()
+        await _signal_client.send_message(
+            group_id,
+            "clod off — buffering messages; @clod or /clodon will deliver them",
+        )
+
+    elif cmd == "/clodon":
+        normalized_group_id = _normalize_signal_group_id(group_id)
+        clod_off_groups.discard(normalized_group_id)
+        _persist()
+        count, routed = await _flush_signal_history(normalized_group_id, tab_id)
+        if count and routed:
+            status = f"clod on — delivered {count} buffered message(s)"
+        elif count:
+            status = f"clod on — {count} buffered message(s) waiting for an agent pane"
+        else:
+            status = "clod on — listening again"
+        await _signal_client.send_message(group_id, status)
+
     elif cmd == "/invite":
         args = text.strip().split()[1:]
         if not args:
@@ -1759,6 +2100,13 @@ async def _signal_handle_command(text, group_id, tab_id):
             new_gid = result.get("groupId") if isinstance(result, dict) else result
             if not new_gid:
                 raise RuntimeError(f"refresh create_group returned no group id: {result}")
+            old_gid_normalized = _normalize_signal_group_id(old_gid)
+            new_gid_normalized = _normalize_signal_group_id(new_gid)
+            was_muted = old_gid_normalized in clod_off_groups
+            if was_muted:
+                clod_off_groups.discard(old_gid_normalized)
+                clod_off_groups.add(new_gid_normalized)
+            _signal_db_move_pending(old_gid_normalized, new_gid_normalized)
             sig_name_group[name.strip().lower()] = new_gid
             sig_tab_group[tab_id] = new_gid
             sig_tab_name[tab_id] = name
@@ -1794,20 +2142,24 @@ async def _on_signal_message(notification):
     # wrapped: {"params": {"subscription": N, "result": {"envelope": {...}}}}
     envelope = params.get("envelope") or params.get("result", {}).get("envelope", {})
 
-    # dedup by envelope timestamp (signal-cli may deliver same msg twice)
+    source = (envelope.get("sourceNumber")
+              or envelope.get("sourceUuid")
+              or envelope.get("source") or "")
+
+    # dedup by sender + envelope timestamp (signal-cli may deliver duplicates)
     env_ts = envelope.get("timestamp")
     if env_ts:
-        if env_ts in _sig_seen_ts:
+        seen_key = (source, env_ts)
+        if seen_key in _sig_seen_ts:
             return
-        _sig_seen_ts.add(env_ts)
+        _sig_seen_ts.add(seen_key)
         # keep set bounded
         if len(_sig_seen_ts) > 200:
             _sig_seen_ts.clear()
 
-    source = (envelope.get("sourceNumber")
-              or envelope.get("sourceUuid")
-              or envelope.get("source") or "")
     data = envelope.get("dataMessage", {})
+    if not data:
+        return
     msg_text = data.get("message") or ""
     text = msg_text
     atts = data.get("attachments") or []
@@ -1826,18 +2178,42 @@ async def _on_signal_message(notification):
     group_id = _normalize_signal_group_id(group_info.get("groupId", ""))
 
     source_name = envelope.get("sourceName") or source[:12]
-    if not text or not group_id:
-        return
     source_number = envelope.get("sourceNumber", "")
     all_members = set(SIGNAL_MEMBERS)
     for m in SIGNAL_TAB_MEMBERS.values():
         all_members.update(m)
     if not source_number:
         print(f"[signal] no phone number for {source_name} ({source})")
-    if (source != SIGNAL_OWNER
-            and source not in SIGNAL_ALLOWED
-            and source_number not in all_members):
+    accepted = not (
+        source != SIGNAL_OWNER
+        and source not in SIGNAL_ALLOWED
+        and source_number not in all_members
+    )
+    is_command = msg_text.strip().startswith("/")
+    is_mention = _is_clod_mention(text, data)
+    formatted = (
+        _format_signal_input(text, data, source_name, env_ts) if text else ""
+    )
+    conversation_id = group_id or f"direct:{source or 'unknown'}"
+    _row_id, inserted, should_process = _signal_db_archive(
+        group_id=conversation_id,
+        envelope_timestamp=env_ts,
+        sender_id=source,
+        sender_number=source_number,
+        sender_name=source_name,
+        text=text,
+        formatted_text=formatted,
+        data=data,
+        accepted=accepted,
+        is_command=is_command,
+        is_mention=is_mention,
+    )
+
+    if not accepted:
         print(f"[signal] ignoring message from {source_name} ({source})")
+        return
+    if not group_id:
+        print(f"[signal] archived direct message from {source_name}")
         return
 
     tab_id = sig_group_tab.get(group_id)
@@ -1845,10 +2221,26 @@ async def _on_signal_message(notification):
         print(f"[signal] unknown group from {source_name}, id={group_id[:20]}...")
 
     # queue for processing in poll_loop (avoid _call deadlock)
-    if msg_text.strip().startswith("/"):
+    if is_command and inserted:
         _signal_cmd_queue.append((msg_text, group_id, tab_id))
-    elif tab_id is not None:
-        _signal_input_queue.append((text, data, tab_id, source_name))
+    elif should_process and tab_id is not None:
+        _signal_input_queue.append((data, tab_id, group_id, is_mention))
+
+
+def _is_clod_mention(text, data):
+    """True if the message directly @-mentions Clod, so it wakes me even when muted.
+    Matches a literal '@clod' in the text, or a Signal @-mention (rendered as the
+    ￼ placeholder) whose target resolves to this bridge's own account."""
+    if re.search(r"(?<!\w)@clod\b", text or "", re.IGNORECASE):
+        return True
+    for men in (data.get("mentions") or []):
+        if SIGNAL_ACCOUNT and SIGNAL_ACCOUNT in (
+            str(men.get("number") or ""),
+            str(men.get("uuid") or ""),
+            str(men.get("name") or ""),
+        ):
+            return True
+    return False
 
 
 async def _process_signal_queues():
@@ -1860,20 +2252,18 @@ async def _process_signal_queues():
 
     # input routing
     while _signal_input_queue:
-        text, data, tab_id, sender = _signal_input_queue.pop(0)
+        data, tab_id, group_id, is_mention = _signal_input_queue.pop(0)
+        is_muted = group_id in clod_off_groups
+        if is_muted and not is_mention:
+            continue
+
         quote = data.get("quote", {})
         reply_pid = None
         if quote:
             quote_ts = quote.get("id")
             if quote_ts:
                 reply_pid = sig_msg_pane.get(quote_ts)
-        pid = _resolve_pid(tab_id, reply_pid)
-        tab_last_source[tab_id] = "sig"
-        ts = f" [{_now_ts()}]" if MSG_TIMESTAMPS else ""
-        quote_text = quote.get("text", "") if quote else ""
-        reply_ctx = f" (replying to: {quote_text[:100]})" if quote_text else ""
-        prefixed = f"{sender}{ts} says{reply_ctx}: {text}"
-        await _route_to_pane(pid, tab_id, prefixed, "sig")
+        await _flush_signal_history(group_id, tab_id, reply_pid=reply_pid)
 
 
 async def _signal_receive_task():
@@ -1933,6 +2323,7 @@ async def poll_loop():
 async def startup(app: Application):
     global _primary_bot
     _init_harnesses()
+    _signal_db_init()
     _primary_bot = harnesses["claude"].bot
 
     # fetch bot display names
@@ -1950,6 +2341,15 @@ async def startup(app: Application):
         tab_topic[int(k)] = v
     for k, v in saved.get("collab", {}).items():
         collab_tabs[int(k)] = v
+    for gid in saved.get("clod_off_groups", []):
+        normalized = _normalize_signal_group_id(gid)
+        if normalized:
+            clod_off_groups.add(normalized)
+    legacy_history = saved.get("clod_history", {})
+    if legacy_history:
+        _signal_db_migrate_legacy_history(legacy_history)
+    for k in saved.get("clod_off", []):
+        _legacy_clod_off_tabs.add(int(k))
     _sig_names = saved.get("signal_group_names", {})  # legacy: tab_id -> title
     for k, v in saved.get("signal_groups", {}).items():
         gid = _normalize_signal_group_id(v)
@@ -1967,6 +2367,9 @@ async def startup(app: Application):
     if sig_name_group:
         print(f"[signal] loaded {len(sig_name_group)} group(s) from state: "
               f"{sorted(sig_name_group)}")
+    if legacy_history:
+        _persist()
+        print("[signal] migrated JSON mute backlog to Signal database")
 
     # start signal
     if SIGNAL_ENABLED:
