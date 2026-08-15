@@ -303,7 +303,11 @@ def _codex_find_session(cwd):
             try:
                 with open(f) as fh:
                     meta = json.loads(fh.readline())
-                _codex_cache[ps] = meta.get("payload", {}).get("cwd", "")
+                payload = meta.get("payload", {})
+                source = payload.get("source")
+                if isinstance(source, dict) and source.get("subagent"):
+                    continue
+                _codex_cache[ps] = payload.get("cwd", "")
             except (json.JSONDecodeError, OSError):
                 pass
         _codex_cache_t = now

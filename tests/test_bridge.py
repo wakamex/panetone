@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -382,6 +383,34 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(batch["baseline"])
         self.assertEqual(batch["messages"], ["first reply"])
         self.assertEqual(batch["cursor"]["offset"], path.stat().st_size)
+
+    def test_codex_session_discovery_ignores_newer_subagent(self):
+        sessions = Path(self.tmp.name) / "sessions"
+        sessions.mkdir()
+        parent = sessions / "rollout-parent.jsonl"
+        child = sessions / "rollout-child.jsonl"
+        cwd = "/code/application"
+        parent.write_text(json.dumps({
+            "type": "session_meta",
+            "payload": {"cwd": cwd, "source": "cli"},
+        }) + "\n")
+        child.write_text(json.dumps({
+            "type": "session_meta",
+            "payload": {
+                "cwd": cwd,
+                "source": {"subagent": {"thread_spawn": {"depth": 1}}},
+            },
+        }) + "\n")
+        now = time.time()
+        os.utime(parent, (now - 1, now - 1))
+        os.utime(child, (now, now))
+
+        with patch.object(bridge, "CODEX_DIR", sessions):
+            bridge._codex_cache = {}
+            bridge._codex_cache_t = 0.0
+            found = bridge._codex_find_session(cwd)
+
+        self.assertEqual(found, parent)
 
     def test_initial_bootstrap_skips_existing_reply(self):
         path = Path(self.tmp.name) / "existing-session.jsonl"
