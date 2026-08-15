@@ -34,15 +34,17 @@ import html
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
-import sys
 import time
 import traceback
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
 from telegram import Bot, Update
+from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -68,6 +70,9 @@ OWNER = int(os.environ.get("WEZ_TG_OWNER", "0"))
 POLL = float(os.environ.get("WEZ_TG_POLL", "2"))
 STATE = Path(
     os.environ.get("WEZ_TG_STATE", "~/.config/wez-tg/state.json")
+).expanduser()
+PENDING_STATE = Path(
+    os.environ.get("WEZ_TG_PENDING", str(STATE.with_name("pending_sends.json")))
 ).expanduser()
 OPENCODE_TOKEN = os.environ.get("WEZ_TG_TOKEN_OPENCODE", "")
 GEMINI_TOKEN = os.environ.get("WEZ_TG_TOKEN_GEMINI", "")
@@ -118,8 +123,6 @@ MSG_TZ = os.environ.get("WEZ_MSG_TZ", "America/New_York")
 MSG_TIMESTAMPS = os.environ.get("WEZ_MSG_TIMESTAMPS", "1") != "0"
 
 # --- wakterm cli -----------------------------------------------------------
-
-import shutil
 
 def _get_terminal_env(*names):
     for name in names:
@@ -337,50 +340,58 @@ def _opencode_find_session(cwd):
     return None
 
 
-# opencode state: session_id -> last seen part rowid
-_oc_cursors = {}  # session_id -> max_rowid
-
-
-def _opencode_seek_end(session_info):
-    """Set cursor to max rowid so we skip existing messages."""
+def _opencode_tail_cursor(session_info):
+    """Return a stable cursor at the current end of an OpenCode session."""
     db_path, session_id = session_info
+    con = sqlite3.connect(str(db_path), timeout=2)
     try:
-        con = sqlite3.connect(str(db_path), timeout=2)
         row = con.execute(
-            "SELECT MAX(rowid) FROM part WHERE session_id = ?",
+            "SELECT rowid, id FROM part WHERE session_id = ? "
+            "ORDER BY rowid DESC LIMIT 1",
             (session_id,),
         ).fetchone()
+    finally:
         con.close()
-        if row and row[0]:
-            _oc_cursors[session_id] = row[0]
-    except (sqlite3.Error, OSError):
-        pass
+    return {
+        "kind": "opencode",
+        "db": str(Path(db_path).resolve()),
+        "session_id": session_id,
+        "rowid": int(row[0]) if row else 0,
+        "part_id": row[1] if row else None,
+    }
 
 
-def _opencode_read_new(session_info):
-    """Read new assistant text parts from opencode DB. Returns list of strings."""
+def _opencode_read_new(session_info, cursor):
+    """Pure OpenCode reader returning messages and the next durable cursor."""
     db_path, session_id = session_info
-    cursor = _oc_cursors.get(session_id, 0)
+    rowid = int(cursor.get("rowid", 0))
     messages = []
     try:
         con = sqlite3.connect(str(db_path), timeout=2)
-        # ensure we see latest WAL writes
-        con.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        if rowid and cursor.get("part_id"):
+            found = con.execute(
+                "SELECT id FROM part WHERE session_id = ? AND rowid = ?",
+                (session_id, rowid),
+            ).fetchone()
+            if not found or found[0] != cursor["part_id"]:
+                print(f"[opencode] cursor reset for rebuilt session {session_id}")
+                rowid = 0
         rows = con.execute(
-            "SELECT p.rowid, p.data, m.data FROM part p "
+            "SELECT p.rowid, p.id, p.data, m.data FROM part p "
             "JOIN message m ON p.message_id = m.id "
             "WHERE p.session_id = ? AND p.rowid > ? "
             "ORDER BY p.rowid",
-            (session_id, cursor),
+            (session_id, rowid),
         ).fetchall()
         con.close()
     except (sqlite3.Error, OSError) as e:
-        print(f"[opencode] read error: {e}")
-        return []
+        raise RuntimeError(f"opencode read error: {e}") from e
 
-    max_rowid = cursor
-    for rowid, pdata_str, mdata_str in rows:
-        max_rowid = max(max_rowid, rowid)
+    max_rowid = rowid
+    last_part_id = cursor.get("part_id") if rowid else None
+    for part_rowid, part_id, pdata_str, mdata_str in rows:
+        max_rowid = max(max_rowid, part_rowid)
+        last_part_id = part_id
         try:
             pdata = json.loads(pdata_str)
             mdata = json.loads(mdata_str)
@@ -391,14 +402,9 @@ def _opencode_read_new(session_info):
         formatted = _opencode_format(pdata)
         if formatted:
             messages.append(formatted)
-    if max_rowid > cursor:
-        _oc_cursors[session_id] = max_rowid
-        pass
-    return messages
-
-
-# gemini state: session_path_str -> message count already seen
-_gemini_cursors = {}
+    next_cursor = dict(cursor)
+    next_cursor.update(rowid=max_rowid, part_id=last_part_id)
+    return messages, next_cursor
 
 
 def _gemini_find_session(cwd):
@@ -411,35 +417,49 @@ def _gemini_find_session(cwd):
     return max(files, key=lambda f: f.stat().st_mtime) if files else None
 
 
-def _gemini_seek_end(session):
-    """Set cursor to current message count so we skip existing messages."""
-    try:
-        data = json.loads(session.read_text())
-        _gemini_cursors[str(session)] = len(data.get("messages", []))
-    except (json.JSONDecodeError, OSError):
-        pass
-
-
-def _gemini_read_new(session):
-    """Read new gemini-type messages. Returns list of strings."""
-    key = str(session)
-    cursor = _gemini_cursors.get(key, 0)
-    try:
-        data = json.loads(session.read_text())
-    except (json.JSONDecodeError, OSError):
-        return []
+def _gemini_tail_cursor(session):
+    """Return a stable cursor at the current end of a Gemini session."""
+    data = json.loads(session.read_text())
     messages = data.get("messages", [])
-    if len(messages) <= cursor:
-        return []
-    new_msgs = messages[cursor:]
-    _gemini_cursors[key] = len(messages)
+    return {
+        "kind": "gemini",
+        "path": str(Path(session).resolve()),
+        "index": len(messages),
+        "last_id": messages[-1].get("id") if messages else None,
+    }
+
+
+def _gemini_read_new(session, cursor):
+    """Pure Gemini reader returning messages and the next durable cursor."""
+    data = json.loads(session.read_text())
+    messages = data.get("messages", [])
+    index = int(cursor.get("index", 0))
+    last_id = cursor.get("last_id")
+    if index:
+        cursor_matches = (
+            index <= len(messages)
+            and messages[index - 1].get("id") == last_id
+        )
+        if not cursor_matches:
+            positions = [i for i, msg in enumerate(messages) if msg.get("id") == last_id]
+            if positions:
+                index = positions[-1] + 1
+            else:
+                print(f"[gemini] cursor reset for rewritten session {session}")
+                index = 0
+    new_msgs = messages[index:]
     results = []
     for msg in new_msgs:
         if msg.get("type") == "gemini":
             text = (msg.get("content") or "").strip()
             if text:
                 results.append(text)
-    return results
+    next_cursor = dict(cursor)
+    next_cursor.update(
+        index=len(messages),
+        last_id=messages[-1].get("id") if messages else None,
+    )
+    return results, next_cursor
 
 
 # --- harness: message formatters ------------------------------------------
@@ -758,9 +778,45 @@ def _load():
     return {}
 
 
+def _write_json(path, data, *, mode=None):
+    """Atomically replace a JSON file so a crash cannot leave partial state."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(tmp, flags, mode if mode is not None else 0o666)
+    try:
+        if mode is not None:
+            # An existing temp file may have broader permissions. Tighten it
+            # before writing any private message content.
+            os.fchmod(fd, mode)
+        with os.fdopen(fd, "w") as f:
+            fd = -1
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    try:
+        dir_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+
+
 def _save(data):
-    STATE.parent.mkdir(parents=True, exist_ok=True)
-    STATE.write_text(json.dumps(data))
+    _write_json(STATE, data)
 
 
 def _signal_db_connect():
@@ -1017,15 +1073,22 @@ def _signal_db_migrate_legacy_history(saved_history):
 
 # --- bridge state ----------------------------------------------------------
 
-tab_topic = {}  # tab_id -> topic_id
-tab_topic_name = {}  # tab_id -> last known topic name
-topic_tab = {}  # topic_id -> tab_id
+# Telegram's durable key is the tab title. wakterm tab IDs are reused after a
+# mux restart, so the tab-ID maps are rebuilt from the current layout.
+tg_name_topic = {}  # title_lower -> Telegram topic_id (persisted)
+tab_topic = {}  # tab_id -> topic_id (ephemeral)
+tab_topic_name = {}  # tab_id -> current title (ephemeral)
+topic_tab = {}  # topic_id -> tab_id (ephemeral)
+_tg_verified_names = set()  # title_lower mappings probed during this process
+_tg_stale_topics = set()  # topic IDs rejected by Telegram during delivery
+_tg_topic_lock = asyncio.Lock()
+_tg_retry_after_until = 0.0
 
 # per pane
 pane_harness = {}  # pane_id -> harness name
 pane_tab = {}  # pane_id -> tab_id
 pane_cwds = {}  # pane_id -> cwd
-file_pos = {}  # pane_id -> (path_str, offset)
+_source_cursors = {}  # stable source key -> durable cursor record
 
 # reply routing
 msg_pane = {}  # telegram_msg_id -> pane_id
@@ -1054,6 +1117,7 @@ _slack_direct_tab = {}     # tab_id -> channel_id (for direct channel output)
 _slack_direct_queue = []   # [(text, user_id, channel_id), ...] direct channel messages
 _slack_web_client = None   # AsyncWebClient, set in startup
 _slack_bot_user_id = None  # our own bot user id, to skip self-echo
+last_source_name = {}  # stable title_lower -> last output channel
 
 
 def _rebuild():
@@ -1068,7 +1132,7 @@ def _rebuild():
 
 def _persist():
     data = {
-        "topics": {str(k): v for k, v in tab_topic.items()},
+        "telegram_topics": dict(sorted(tg_name_topic.items())),
         "collab": {str(k): v for k, v in collab_tabs.items()},
         "clod_off_groups": sorted(clod_off_groups),
     }
@@ -1077,28 +1141,86 @@ def _persist():
     if sig_name_group:
         # keyed by tab title (stable), not tab_id (renumbers on wezterm restart)
         data["signal_groups"] = dict(sig_name_group)
+    if last_source_name:
+        data["last_sources"] = dict(sorted(last_source_name.items()))
     _save(data)
 
 
-_seeked = set()  # pids that have been seeked
+def _source_key(h, session):
+    if h.name == "opencode":
+        db_path, session_id = session
+        return f"opencode:{Path(db_path).resolve()}:{session_id}"
+    path = Path(session).resolve()
+    kind = "gemini" if h.name == "gemini" else "jsonl"
+    return f"{kind}:{h.name}:{path}"
 
 
-def _seek_to_end(pid):
-    """Position at end of session so we don't replay."""
+def _jsonl_tail_cursor(h, session):
+    path = Path(session).resolve()
+    with path.open("rb") as f:
+        st = os.fstat(f.fileno())
+        offset = st.st_size
+        if offset:
+            f.seek(offset - 1)
+            if f.read(1) != b"\n":
+                start = max(0, offset - 65536)
+                f.seek(start)
+                tail = f.read(offset - start)
+                newline = tail.rfind(b"\n")
+                offset = start + newline + 1 if newline >= 0 else 0
+    return {
+        "kind": "jsonl",
+        "harness": h.name,
+        "path": str(path),
+        "offset": offset,
+        "dev": st.st_dev,
+        "ino": st.st_ino,
+    }
+
+
+def _tail_cursor(h, session):
+    if h.name == "opencode":
+        return _opencode_tail_cursor(session)
+    if h.name == "gemini":
+        return _gemini_tail_cursor(session)
+    return _jsonl_tail_cursor(h, session)
+
+
+def _start_cursor(h, session):
+    """Return a cursor at the beginning of a newly observed source."""
+    if h.name == "opencode":
+        db_path, session_id = session
+        return {
+            "kind": "opencode",
+            "db": str(Path(db_path).resolve()),
+            "session_id": session_id,
+            "rowid": 0,
+            "part_id": None,
+        }
+    if h.name == "gemini":
+        return {
+            "kind": "gemini",
+            "path": str(Path(session).resolve()),
+            "index": 0,
+            "last_id": None,
+        }
+    cursor = _jsonl_tail_cursor(h, session)
+    cursor["offset"] = 0
+    return cursor
+
+
+def _seek_to_end(pid, cursors=None):
+    """Set this source's durable cursor to its current tail."""
     cwd = pane_cwds.get(pid)
     h = harnesses.get(pane_harness.get(pid, ""))
     if not cwd or not h:
-        return
+        return False
     session = h.find_session(cwd)
     if not session:
-        return
-    if h.read_new:
-        if h.name == "opencode":
-            _opencode_seek_end(session)
-        elif h.name == "gemini":
-            _gemini_seek_end(session)
-    else:
-        file_pos[pid] = (str(session), session.stat().st_size)
+        return False
+    cursor_map = _source_cursors if cursors is None else cursors
+    cursor_map[_source_key(h, session)] = _tail_cursor(h, session)
+    return True
 
 
 # --- pane discovery --------------------------------------------------------
@@ -1194,76 +1316,151 @@ async def discover():
 _primary_bot = None  # set in startup, used for topic management
 
 
+def _telegram_topic_key(title):
+    return str(title or "").strip().casefold()
+
+
+def _telegram_topic_missing(error):
+    return (
+        isinstance(error, BadRequest)
+        and "message thread not found" in str(error).lower().replace("_", " ")
+    )
+
+
+def _telegram_topic_unchanged(error):
+    return (
+        isinstance(error, BadRequest)
+        and "topic not modified" in str(error).lower().replace("_", " ")
+    )
+
+
+async def _ensure_telegram_topic(title, preferred_topic=None):
+    async with _tg_topic_lock:
+        return await _ensure_telegram_topic_unlocked(title, preferred_topic)
+
+
+async def _ensure_telegram_topic_unlocked(title, preferred_topic=None):
+    """Return a verified topic ID for a stable title, creating if missing."""
+    title = str(title or "").strip()[:128]
+    key = _telegram_topic_key(title)
+    if not key:
+        return None, False
+
+    topic_id = tg_name_topic.get(key) or preferred_topic
+    if (
+        topic_id
+        and key in _tg_verified_names
+        and topic_id not in _tg_stale_topics
+    ):
+        return topic_id, False
+
+    changed = False
+    if topic_id in _tg_stale_topics:
+        topic_id = None
+    if topic_id and topic_id not in _tg_stale_topics:
+        try:
+            await _primary_bot.edit_forum_topic(CHAT, topic_id, name=title)
+            print(f"[tg] verified topic '{title}' -> {topic_id}")
+        except Exception as e:
+            if _telegram_topic_unchanged(e):
+                pass
+            elif _telegram_topic_missing(e):
+                _tg_stale_topics.add(topic_id)
+                topic_id = None
+            else:
+                print(f"[tg] verify topic '{title}' failed: {e}")
+                return None, False
+
+    if not topic_id:
+        try:
+            topic = await _primary_bot.create_forum_topic(CHAT, title)
+            topic_id = topic.message_thread_id
+            if not topic_id:
+                raise RuntimeError("create_forum_topic returned no thread ID")
+            print(f"[tg] created topic '{title}' -> {topic_id}")
+            changed = True
+        except Exception as e:
+            print(f"[tg] create topic '{title}' failed: {e}")
+            return None, False
+
+    previous = tg_name_topic.get(key)
+    if previous != topic_id:
+        tg_name_topic[key] = topic_id
+        changed = True
+    _tg_verified_names.add(key)
+    _tg_stale_topics.discard(topic_id)
+    if previous and previous != topic_id:
+        _tg_stale_topics.discard(previous)
+    if changed:
+        # Persist the new route before another await or any backlog delivery.
+        _persist()
+    if _retarget_pending_telegram(key, topic_id):
+        changed = True
+    return topic_id, changed
+
+
 async def sync_topics(matched, unmatched):
     active_pids = set()
-    active_tabs = set()
     dirty = False
+    tabs = {}
 
-    # track harness-matched panes (have session files, output works)
-    for p, h_name in matched:
+    # Track all panes first, then resolve one stable title mapping per tab.
+    for p, h_name in matched + unmatched:
         pid = p["pane_id"]
         tab_id = p["tab_id"]
         cwd = _parse_cwd(p.get("cwd", ""))
-        title = (p.get("tab_title") or f"tab-{tab_id}").strip()[:128] or f"tab-{tab_id}"
+        title = str(p.get("tab_title") or "").strip()[:128]
 
         active_pids.add(pid)
-        active_tabs.add(tab_id)
-        pane_harness[pid] = h_name
         pane_tab[pid] = tab_id
         pane_cwds[pid] = cwd
-
-        if tab_id not in tab_topic:
-            t = await _primary_bot.create_forum_topic(CHAT, title)
-            tab_topic[tab_id] = t.message_thread_id
-            tab_topic_name[tab_id] = title
-            dirty = True
-
-        if pid not in _seeked:
-            _seek_to_end(pid)
-            _seeked.add(pid)
-
-    # also create topics + track panes that don't have sessions yet (input only)
-    for p, _ in unmatched:
-        pid = p["pane_id"]
-        tab_id = p["tab_id"]
-        cwd = _parse_cwd(p.get("cwd", ""))
-        title = (p.get("tab_title") or f"tab-{tab_id}").strip()[:128] or f"tab-{tab_id}"
-
-        active_pids.add(pid)
-        active_tabs.add(tab_id)
-        pane_tab[pid] = tab_id
-        pane_cwds[pid] = cwd
-
-        if tab_id not in tab_topic:
-            t = await _primary_bot.create_forum_topic(CHAT, title)
-            tab_topic[tab_id] = t.message_thread_id
-            tab_topic_name[tab_id] = title
-            dirty = True
-
-    # rename topics whose tab title changed
-    for p, _ in matched + unmatched:
-        tab_id = p["tab_id"]
-        if tab_id not in tab_topic:
+        if h_name:
+            pane_harness[pid] = h_name
+        if not title:
             continue
-        title = (p.get("tab_title") or f"tab-{tab_id}").strip()[:128] or f"tab-{tab_id}"
-        if tab_topic_name.get(tab_id) != title:
-            try:
-                await _primary_bot.edit_forum_topic(CHAT, tab_topic[tab_id], name=title)
-                print(f"[tg] renamed topic {tab_id} -> '{title}'")
-            except Exception:
-                pass  # Topic_not_modified or other non-fatal error
-            tab_topic_name[tab_id] = title
+        tabs.setdefault(tab_id, title)
 
+    new_tab_topic = {}
+    new_tab_topic_name = {}
+    claimed_names = {}
+    pending_routes = _pending_telegram_routes()
+    for tab_id, title in tabs.items():
+        key = _telegram_topic_key(title)
+        if key in claimed_names and claimed_names[key] != tab_id:
+            print(f"[tg] duplicate tab title '{title}', skipping tab {tab_id}")
+            continue
+        claimed_names[key] = tab_id
+        preferred = pending_routes.pop(key, None)
+        topic_id, topic_changed = await _ensure_telegram_topic(title, preferred)
+        if not topic_id:
+            continue
+        new_tab_topic[tab_id] = topic_id
+        new_tab_topic_name[tab_id] = title
+        dirty = dirty or topic_changed
+
+    # Pending output can outlive its terminal pane. Its durable route title is
+    # enough to restore that topic and deliver the backlog.
+    for route, preferred in pending_routes.items():
+        _topic_id, topic_changed = await _ensure_telegram_topic(route, preferred)
+        dirty = dirty or topic_changed
+
+    tab_topic.clear()
+    tab_topic.update(new_tab_topic)
+    tab_topic_name.clear()
+    tab_topic_name.update(new_tab_topic_name)
+    tab_last_source.clear()
+    tab_last_source.update({
+        tab_id: last_source_name[_telegram_topic_key(title)]
+        for tab_id, title in new_tab_topic_name.items()
+        if _telegram_topic_key(title) in last_source_name
+    })
     for pid in [p for p in list(pane_tab) if p not in active_pids]:
         pane_harness.pop(pid, None)
         pane_tab.pop(pid, None)
         pane_cwds.pop(pid, None)
-        file_pos.pop(pid, None)
 
-    # keep topics for tabs that disappeared (mux restart, etc.)
-
+    _rebuild()
     if dirty:
-        _rebuild()
         _persist()
 
 
@@ -1373,78 +1570,255 @@ async def sync_signal_groups(matched, unmatched):
     await _flush_ready_signal_history()
 
 
-def _read_new_sync(pid):
-    h = harnesses.get(pane_harness.get(pid, ""))
-    cwd = pane_cwds.get(pid)
-    if not h or not cwd:
-        return []
+def _read_jsonl_new(h, session, cursor):
+    path = Path(session).resolve()
+    with path.open("rb") as f:
+        st = os.fstat(f.fileno())
+        offset = int(cursor.get("offset", 0))
+        if (
+            cursor.get("dev") != st.st_dev
+            or cursor.get("ino") != st.st_ino
+            or offset > st.st_size
+        ):
+            print(f"[{h.name}] source reset detected, replaying {path}")
+            offset = 0
+        f.seek(offset)
+        data = f.read()
 
-    session = h.find_session(cwd)
-    if not session:
-        return []
-
-    # first time seeing a session for this pane? seek to end
-    if pid not in _seeked:
-        _seek_to_end(pid)
-        _seeked.add(pid)
-
-    # opencode (and other DB-based harnesses) handle their own reading
-    if h.read_new:
-        msgs = h.read_new(session)
-        if msgs:
-            tab = tab_topic_name.get(pane_tab.get(pid, -1), "?")
-            print(f"[{tab}/{h.name}] db read: {len(msgs)} messages")
-        return msgs
-
-    session_str = str(session)
-    prev_path, prev_pos = file_pos.get(pid, (None, 0))
-
-    if prev_path != session_str:
-        file_pos[pid] = (session_str, session.stat().st_size)
-        return []
-
-    cur_size = session.stat().st_size
-    if cur_size <= prev_pos:
-        return []
-
-    with open(session, "r") as f:
-        f.seek(prev_pos)
-        new_data = f.read()
-
-    file_pos[pid] = (session_str, cur_size)
-
+    newline = data.rfind(b"\n")
+    if newline < 0:
+        return [], dict(cursor, offset=offset, dev=st.st_dev, ino=st.st_ino), 0
+    complete = data[:newline + 1]
     messages = []
-    lines = [l for l in new_data.strip().split("\n") if l.strip()]
-    for line in lines:
+    record_count = 0
+    for raw_line in complete.splitlines():
+        if not raw_line.strip():
+            continue
+        record_count += 1
         try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
+            record = json.loads(raw_line.decode("utf-8"))
+        except json.JSONDecodeError as e:
+            print(f"[{h.name}] skipping invalid complete JSONL record: {e}")
             continue
         formatted = h.format_record(record)
         if formatted:
             messages.append(formatted)
-    if lines:
+    next_cursor = dict(cursor)
+    next_cursor.update(
+        kind="jsonl",
+        harness=h.name,
+        path=str(path),
+        offset=offset + len(complete),
+        dev=st.st_dev,
+        ino=st.st_ino,
+    )
+    return messages, next_cursor, record_count
+
+
+def _peek_new_sync(pid, cursor_snapshot):
+    """Read without mutating durable state; return a batch for one source."""
+    h = harnesses.get(pane_harness.get(pid, ""))
+    cwd = pane_cwds.get(pid)
+    if not h or not cwd:
+        return None
+
+    session = h.find_session(cwd)
+    if not session:
+        return None
+
+    source_key = _source_key(h, session)
+    cursor = cursor_snapshot.get(source_key)
+    if cursor is None:
+        cursor = _start_cursor(h, session)
+
+    if h.name == "opencode":
+        messages, next_cursor = _opencode_read_new(session, cursor)
+        records = max(0, int(next_cursor.get("rowid", 0)) - int(cursor.get("rowid", 0)))
+    elif h.name == "gemini":
+        messages, next_cursor = _gemini_read_new(session, cursor)
+        records = max(0, int(next_cursor.get("index", 0)) - int(cursor.get("index", 0)))
+    else:
+        messages, next_cursor, records = _read_jsonl_new(h, session, cursor)
+
+    if records:
         tab = tab_topic_name.get(pane_tab.get(pid, -1), "?")
-        print(f"[{tab}/{h.name}] read {len(lines)} records, {len(messages)} messages")
-    return messages
+        print(f"[{tab}/{h.name}] read {records} records, {len(messages)} messages")
+    return {
+        "pid": pid,
+        "source_key": source_key,
+        "cursor": next_cursor,
+        "messages": messages,
+        "records": records,
+        "baseline": source_key not in cursor_snapshot,
+    }
 
 
-# failed sends awaiting retry: (kind, target, chunk, pid, h_name).
-# The session-file cursor advances at read time, so a chunk whose send
-# fails would otherwise be lost forever — queue it and retry each tick.
-# In-memory only: a hot-reload (execv) drops anything still queued.
+# Failed sends awaiting retry:
+# (kind, target, chunk, pid, h_name, stable_route_name, item_id).
+# The outbox and stable source cursors share one atomic checkpoint. A cursor
+# advances only when every output chunk derived before it is in the outbox.
 _pending_sends = []
-_MAX_PENDING = 500
 
 
-async def _deliver(kind, target, chunk, pid, h_name):
+def _pending_item(raw):
+    """Decode one canonical durable queue item."""
+    if not isinstance(raw, dict):
+        raise TypeError("invalid pending-send item")
+    item_id = raw.get("id")
+    kind = raw.get("kind")
+    target = raw.get("target")
+    chunk = raw.get("chunk")
+    pid = raw.get("pane_id")
+    h_name = raw.get("harness")
+    route = raw.get("route_title", "")
+    if (
+        not item_id
+        or not kind
+        or target is None
+        or not isinstance(chunk, str)
+        or pid is None
+        or not h_name
+    ):
+        raise ValueError("incomplete pending-send item")
+    return (
+        str(kind), target, chunk, int(pid), str(h_name),
+        _telegram_topic_key(route), str(item_id),
+    )
+
+
+def _pending_json(items=None, cursors=None):
+    items = _pending_sends if items is None else items
+    cursors = _source_cursors if cursors is None else cursors
+    return {
+        "schema": "panetone.delivery-state.v2",
+        "saved_at": int(time.time() * 1000),
+        "cursors": cursors,
+        "items": [
+            {
+                "id": item_id,
+                "kind": kind,
+                "target": target,
+                "chunk": chunk,
+                "pane_id": pid,
+                "harness": h_name,
+                "route_title": route,
+            }
+            for kind, target, chunk, pid, h_name, route, item_id in items
+        ],
+    }
+
+
+def _replace_delivery_state(items, cursors=None):
+    """Atomically replace disk state before publishing it in memory."""
+    next_items = list(items)
+    next_cursors = dict(_source_cursors if cursors is None else cursors)
+    _write_json(
+        PENDING_STATE,
+        _pending_json(next_items, next_cursors),
+        mode=0o600,
+    )
+    _pending_sends[:] = next_items
+    _source_cursors.clear()
+    _source_cursors.update(next_cursors)
+
+
+def _commit_delivery(new_items, cursor_updates):
+    next_cursors = dict(_source_cursors)
+    next_cursors.update(cursor_updates)
+    _replace_delivery_state([*_pending_sends, *new_items], next_cursors)
+
+
+def _load_pending():
+    if not PENDING_STATE.exists():
+        return False
+    try:
+        data = json.loads(PENDING_STATE.read_text())
+        if not isinstance(data, dict) or data.get("schema") != "panetone.delivery-state.v2":
+            raise ValueError("unsupported delivery-state schema")
+        raw_items = data.get("items", [])
+        if not isinstance(raw_items, list):
+            raise TypeError("invalid pending-send list")
+        items = [_pending_item(item) for item in raw_items]
+        cursors = data.get("cursors", {})
+        if not isinstance(cursors, dict) or not all(
+            isinstance(key, str) and isinstance(value, dict)
+            for key, value in cursors.items()
+        ):
+            raise ValueError("invalid source cursor map")
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+        raise RuntimeError(f"cannot load durable send queue {PENDING_STATE}: {e}") from e
+    _pending_sends[:] = items
+    _source_cursors.clear()
+    _source_cursors.update(cursors)
+    if items:
+        routes = sorted({item[5] or str(item[1]) for item in items})
+        print(f"[retry] loaded {len(items)} durable chunk(s) for {routes}")
+    return True
+
+
+def _pending_destination(item):
+    kind, target, _chunk, _pid, _h_name, route, _item_id = item
+    return (kind, route or target)
+
+
+def _retarget_pending_telegram(route_key, topic_id):
+    route_key = _telegram_topic_key(route_key)
+    changed = False
+    updated = []
+    for kind, target, chunk, pid, h_name, route, item_id in _pending_sends:
+        if kind == "tg" and _telegram_topic_key(route) == route_key:
+            if target != topic_id or route != route_key:
+                changed = True
+            target, route = topic_id, route_key
+        updated.append((kind, target, chunk, pid, h_name, route, item_id))
+    if changed:
+        _replace_delivery_state(updated)
+        print(f"[retry] retargeted '{route_key}' backlog -> topic {topic_id}")
+    return changed
+
+
+def _pending_telegram_routes():
+    routes = {}
+    for kind, target, _chunk, _pid, _h_name, route, _item_id in _pending_sends:
+        if kind == "tg" and route:
+            routes.setdefault(route, target)
+    return routes
+
+
+async def _recreate_telegram_topic(tab_id, topic_id, name):
+    """Serialize an explicit /refresh replacement with topic discovery."""
+    async with _tg_topic_lock:
+        await _primary_bot.delete_forum_topic(CHAT, topic_id)
+        topic = await _primary_bot.create_forum_topic(CHAT, name)
+        new_topic_id = topic.message_thread_id
+        tab_topic[tab_id] = new_topic_id
+        tab_topic_name[tab_id] = name
+        key = _telegram_topic_key(name)
+        tg_name_topic[key] = new_topic_id
+        _tg_verified_names.add(key)
+        _tg_stale_topics.discard(topic_id)
+        _retarget_pending_telegram(key, new_topic_id)
+        _rebuild()
+        _persist()
+        return new_topic_id
+
+
+async def _deliver(kind, target, chunk, pid, h_name, route_name="", _item_id=None):
     """Send one chunk to a channel. Returns True on success."""
+    global _tg_retry_after_until
     h = harnesses.get(h_name)
     bot = h.bot if h else _primary_bot
     try:
         if kind == "tg":
             sent = await bot.send_message(CHAT, chunk, message_thread_id=target)
-            msg_pane[sent.message_id] = pid
+            tab_id = pane_tab.get(pid)
+            pane_route = _telegram_topic_key(tab_topic_name.get(tab_id, ""))
+            if (
+                tab_id is not None
+                and pane_route == _telegram_topic_key(route_name)
+                and pane_harness.get(pid) == h_name
+            ):
+                msg_pane[sent.message_id] = pid
         elif kind == "sig":
             result = await _signal_client.send_message(target, chunk)
             ts = result.get("timestamp") if isinstance(result, dict) else None
@@ -1457,134 +1831,259 @@ async def _deliver(kind, target, chunk, pid, h_name):
             await _slack_web_client.chat_postMessage(channel=target, text=chunk)
         return True
     except Exception as e:
+        if kind == "tg" and isinstance(e, RetryAfter):
+            delay = e.retry_after
+            if hasattr(delay, "total_seconds"):
+                delay = delay.total_seconds()
+            _tg_retry_after_until = max(
+                _tg_retry_after_until,
+                time.monotonic() + float(delay) + 1.0,
+            )
+            print(f"[tg] flood control, pausing delivery for {delay}s")
+            return False
+        if kind == "tg" and _telegram_topic_missing(e):
+            _tg_stale_topics.add(target)
         print(f"send err [{kind}/{h_name}/{pid}]: {e}")
         return False
 
 
-async def _send_or_queue(kind, target, chunk, pid, h_name):
-    """Deliver a chunk, or queue it for retry; keeps per-destination order."""
-    pending_here = any(k == kind and t == target
-                       for k, t, _, _, _ in _pending_sends)
-    if pending_here or not await _deliver(kind, target, chunk, pid, h_name):
-        _pending_sends.append((kind, target, chunk, pid, h_name))
-        if len(_pending_sends) > _MAX_PENDING:
-            dropped = len(_pending_sends) - _MAX_PENDING
-            del _pending_sends[:dropped]
-            print(f"[retry] queue full, dropped {dropped} oldest chunk(s)")
+async def _attempt_pending(item):
+    """Deliver the current form of one item, then durably dequeue it."""
+    async def attempt_current():
+        current = next(
+            (pending for pending in _pending_sends if pending[6] == item[6]),
+            None,
+        )
+        if current is None:
+            return True
+        if not await _deliver(*current):
+            return False
+        _replace_delivery_state(
+            [pending for pending in _pending_sends if pending[6] != current[6]]
+        )
+        return True
+
+    if item[0] == "tg":
+        # /refresh uses this same lock, so it cannot delete or retarget a topic
+        # between a successful send and the durable dequeue.
+        async with _tg_topic_lock:
+            if time.monotonic() < _tg_retry_after_until:
+                return False
+            return await attempt_current()
+    return await attempt_current()
 
 
 async def _flush_pending():
-    """Retry queued sends; a destination that fails again stays blocked
-    this pass so its chunks keep their order."""
+    """Retry one queued chunk per destination and durably record progress."""
     if not _pending_sends:
         return
-    remaining, blocked = [], set()
+    attempted = set()
+    candidates = []
     for item in _pending_sends:
-        dest = (item[0], item[1])
-        if dest in blocked or not await _deliver(*item):
-            blocked.add(dest)
-            remaining.append(item)
-    _pending_sends[:] = remaining
-    if remaining:
-        print(f"[retry] {len(remaining)} chunk(s) still pending")
+        dest = _pending_destination(item)
+        if dest in attempted:
+            continue
+        attempted.add(dest)
+        candidates.append(item)
+
+    delivered = 0
+    telegram_attempted = False
+    for item in candidates:
+        if item[0] == "tg":
+            if telegram_attempted:
+                continue
+            telegram_attempted = True
+        if await _attempt_pending(item):
+            delivered += 1
+    if _pending_sends:
+        print(f"[retry] {len(_pending_sends)} chunk(s) still pending")
+    elif delivered:
+        print("[retry] durable queue drained")
+
+
+def _new_pending_item(kind, target, chunk, pid, h_name, route_name=""):
+    return (
+        kind, target, chunk, pid, h_name,
+        _telegram_topic_key(route_name), uuid.uuid4().hex,
+    )
+
+
+def _tab_route_title(tab_id):
+    return tab_topic_name.get(tab_id) or sig_tab_name.get(tab_id, "")
+
+
+def _set_tab_last_source(tab_id, source):
+    if tab_id is None:
+        return
+    tab_last_source[tab_id] = source
+    key = _telegram_topic_key(_tab_route_title(tab_id))
+    if key and last_source_name.get(key) != source:
+        last_source_name[key] = source
+        _persist()
+
+
+def _pane_main_route(pid):
+    tab_id = pane_tab.get(pid)
+    title = _tab_route_title(tab_id)
+    gid = sig_tab_group.get(tab_id) if SIGNAL_ENABLED else None
+    source = tab_last_source.get(tab_id) or last_source_name.get(
+        _telegram_topic_key(title)
+    )
+    if source is None:
+        source = "sig" if gid else "tg"
+    if source == "tg":
+        tid = tab_topic.get(tab_id)
+        return ("tg", tid, title) if tid else None
+    if source == "sig":
+        return ("sig", gid, "") if gid else None
+    if source == "debate" and DEBATE_ENABLED and _tab_match(title, DEBATE_TABS):
+        return ("debate", DEBATE_CHAT, "")
+    if source == "slack" and SLACK_ENABLED and tab_id in _slack_direct_tab:
+        return ("slack", _slack_direct_tab[tab_id], "")
+    return None
+
+
+def _pane_output_ready(pid):
+    if _pane_main_route(pid):
+        return True
+    tab_id = pane_tab.get(pid)
+    return bool(
+        SLACK_ENABLED
+        and _slack_reply_channel
+        and _tab_match(tab_topic_name.get(tab_id, ""), SLACK_TABS)
+    )
 
 
 async def check_output():
     global _slack_reply_channel
-    await _flush_pending()
-    pids = list(pane_harness.keys())
+    pids = [pid for pid in pane_harness if _pane_output_ready(pid)]
+    cursor_snapshot = {
+        key: dict(value) for key, value in _source_cursors.items()
+    }
     results = await asyncio.gather(
-        *(asyncio.to_thread(_read_new_sync, pid) for pid in pids)
+        *(asyncio.to_thread(_peek_new_sync, pid, cursor_snapshot) for pid in pids),
+        return_exceptions=True,
     )
-    for pid, messages in zip(pids, results):
+    for pid, result in zip(pids, results):
+        if isinstance(result, Exception):
+            print(f"[cursor] read error for pane {pid}: {result}")
+
+    new_items = []
+    cursor_updates = {}
+    collab_batches = []
+    slack_reply = _slack_reply_channel
+    for result in results:
+        if not result or isinstance(result, Exception):
+            continue
+        pid = result["pid"]
+        messages = result["messages"]
         h = harnesses.get(pane_harness.get(pid, ""))
-        if not h or not messages:
+        if not h:
             continue
         tab_id = pane_tab.get(pid)
+        main_route = _pane_main_route(pid)
+        slack_observer = bool(
+            SLACK_ENABLED
+            and slack_reply
+            and _tab_match(tab_topic_name.get(tab_id, ""), SLACK_TABS)
+        )
+        # A route may disappear while the worker thread reads. In that case,
+        # leave the cursor untouched so the batch is retried after routing is
+        # restored.
+        if messages and not main_route and not slack_observer:
+            continue
+        source_key = result["source_key"]
+        if cursor_snapshot.get(source_key) != result["cursor"]:
+            cursor_updates[source_key] = result["cursor"]
         if tab_id is not None:
             tab_last_pid[tab_id] = pid
             sig_tab_last_pid[tab_id] = pid
-        tid = tab_topic.get(tab_id)
-        gid = sig_tab_group.get(tab_id) if SIGNAL_ENABLED else None
-        source = tab_last_source.get(tab_id)
-        if source is None:
-            source = "sig" if gid else "tg"
         for msg in messages:
-            # telegram topic (default output channel)
-            if tid and source == "tg":
-                for chunk in _chunkify(msg):
-                    await _send_or_queue("tg", tid, chunk, pid, h.name)
-            # signal (queue even while the client is down/reconnecting)
-            if gid and source == "sig":
+            if main_route:
+                kind, target, route_name = main_route
+                outgoing = msg
+                if kind == "sig":
+                    outgoing = f"{h.display_name}: {msg}"
+                elif kind == "slack":
+                    outgoing = _md_tables_to_slack(msg)
+                for chunk in _chunkify(outgoing):
+                    new_items.append(_new_pending_item(
+                        kind, target, chunk, pid, h.name, route_name,
+                    ))
+            if main_route and main_route[0] == "sig":
                 tab = tab_topic_name.get(tab_id, "?")
                 print(f"[check_output] sending to signal: {tab}/{h.name} msg={msg[:60]}")
-                for chunk in _chunkify(f"{h.display_name}: {msg}"):
-                    await _send_or_queue("sig", gid, chunk, pid, h.name)
-            # debate chat (each bot posts as itself, no prefix)
-            if DEBATE_ENABLED and source == "debate" and _tab_match(tab_topic_name.get(tab_id, ""), DEBATE_TABS):
-                for chunk in _chunkify(msg):
-                    await _send_or_queue("debate", DEBATE_CHAT, chunk, pid, h.name)
             # slack observer (reply to !obs, then clear)
-            if SLACK_ENABLED and _slack_reply_channel and _tab_match(tab_topic_name.get(tab_id, ""), SLACK_TABS):
+            if slack_observer and slack_reply:
                 slack_msg = _md_tables_to_slack(msg)
                 for chunk in _chunkify(slack_msg):
-                    await _send_or_queue("slack", _slack_reply_channel, chunk, pid, h.name)
-                _slack_reply_channel = None
-            # slack direct channel
-            if SLACK_ENABLED and source == "slack" and tab_id in _slack_direct_tab:
-                slack_msg = _md_tables_to_slack(msg)
-                ch = _slack_direct_tab[tab_id]
-                for chunk in _chunkify(slack_msg):
-                    await _send_or_queue("slack", ch, chunk, pid, h.name)
+                    new_items.append(_new_pending_item(
+                        "slack", slack_reply, chunk, pid, h.name,
+                    ))
+                slack_reply = None
+                slack_observer = False
+            collab_batches.append((pid, h, tab_id, msg))
 
-            # collab: forward to other harness panes in this tab
-            # (auto-enabled for debate tabs)
-            tab_id = pane_tab.get(pid)
-            is_debate = debate_crosspost and _tab_match(tab_topic_name.get(tab_id, ""), DEBATE_TABS) if DEBATE_ENABLED else False
-            if tab_id is not None and (tab_id in collab_tabs or is_debate):
-                # check for /signoff
-                if "/signoff" in msg.lower():
-                    signoffs = collab_signoffs.setdefault(tab_id, set())
-                    signoffs.add(pid)
-                    # check if all harness panes in this tab signed off
-                    tab_panes = {p for p, t in pane_tab.items()
-                                 if t == tab_id and p in pane_harness}
-                    if tab_panes and signoffs >= tab_panes:
-                        del collab_tabs[tab_id]
-                        collab_signoffs.pop(tab_id, None)
-                        _persist()
-                        try:
-                            await _primary_bot.send_message(
-                                CHAT, "all agents signed off, collab done",
-                                message_thread_id=tid,
-                            )
-                        except Exception:
-                            pass
-                        continue
-                else:
-                    # non-signoff message resets that pane's signoff
-                    signoffs = collab_signoffs.get(tab_id)
-                    if signoffs:
-                        signoffs.discard(pid)
+    if new_items or cursor_updates:
+        _commit_delivery(new_items, cursor_updates)
+        if _slack_reply_channel and slack_reply is None:
+            _slack_reply_channel = None
+    await _flush_pending()
 
-                ts = f" [{_now_ts()}]" if MSG_TIMESTAMPS else ""
-                prefixed = f"{h.display_name}{ts} says: {msg}"
-                for target_pid in _other_panes(tab_id, pid):
-                    await send_and_verify(target_pid, prefixed)
-                # decrement rounds if limited
-                rounds = collab_tabs.get(tab_id)
-                if rounds and rounds > 0:
-                    collab_tabs[tab_id] = rounds - 1
-                    if rounds - 1 <= 0:
-                        del collab_tabs[tab_id]
-                        collab_signoffs.pop(tab_id, None)
-                        _persist()
-                        try:
-                            await _primary_bot.send_message(
-                                CHAT, "collab done", message_thread_id=tid
-                            )
-                        except Exception:
-                            pass
+    for pid, h, tab_id, msg in collab_batches:
+        # collab: forward to other harness panes in this tab
+        # (auto-enabled for debate tabs)
+        is_debate = (
+            DEBATE_ENABLED
+            and debate_crosspost
+            and _tab_match(tab_topic_name.get(tab_id, ""), DEBATE_TABS)
+        )
+        if tab_id is None or (tab_id not in collab_tabs and not is_debate):
+            continue
+        tid = tab_topic.get(tab_id)
+        if "/signoff" in msg.lower():
+            signoffs = collab_signoffs.setdefault(tab_id, set())
+            signoffs.add(pid)
+            tab_panes = {
+                pane_pid for pane_pid, pane_tab_id in pane_tab.items()
+                if pane_tab_id == tab_id and pane_pid in pane_harness
+            }
+            if tab_panes and signoffs >= tab_panes:
+                del collab_tabs[tab_id]
+                collab_signoffs.pop(tab_id, None)
+                _persist()
+                if tid:
+                    try:
+                        await _primary_bot.send_message(
+                            CHAT, "all agents signed off, collab done",
+                            message_thread_id=tid,
+                        )
+                    except Exception:
+                        pass
+                continue
+        else:
+            signoffs = collab_signoffs.get(tab_id)
+            if signoffs:
+                signoffs.discard(pid)
+
+        ts = f" [{_now_ts()}]" if MSG_TIMESTAMPS else ""
+        prefixed = f"{h.display_name}{ts} says: {msg}"
+        for target_pid in _other_panes(tab_id, pid):
+            await send_and_verify(target_pid, prefixed)
+        rounds = collab_tabs.get(tab_id)
+        if rounds and rounds > 0:
+            collab_tabs[tab_id] = rounds - 1
+            if rounds - 1 <= 0:
+                del collab_tabs[tab_id]
+                collab_signoffs.pop(tab_id, None)
+                _persist()
+                if tid:
+                    try:
+                        await _primary_bot.send_message(
+                            CHAT, "collab done", message_thread_id=tid
+                        )
+                    except Exception:
+                        pass
 
 
 # --- collab mode -----------------------------------------------------------
@@ -1671,7 +2170,7 @@ async def _handle_debate_message(m, sender="?"):
     pid = _resolve_pid(tab_id, reply_pid)
     ts = f" [{_now_ts()}]" if MSG_TIMESTAMPS else ""
     prefixed = f"{sender}{ts} says: {text}"
-    tab_last_source[tab_id] = "debate"
+    _set_tab_last_source(tab_id, "debate")
     await _route_to_pane(pid, tab_id, prefixed, "debate")
 
 
@@ -1804,7 +2303,7 @@ async def _process_slack_direct():
         ts = f" [{_now_ts()}]" if MSG_TIMESTAMPS else ""
         prefixed = f"{name}{ts} says: {text}"
         pid = _resolve_pid(tab_id)
-        tab_last_source[tab_id] = "slack"
+        _set_tab_last_source(tab_id, "slack")
         _slack_direct_tab[tab_id] = channel
         await _route_to_pane(pid, tab_id, prefixed, "slack-direct")
 
@@ -1831,7 +2330,7 @@ async def on_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     tab_id = topic_tab.get(m.message_thread_id) if reply_pid is None else pane_tab.get(reply_pid)
     pid = _resolve_pid(tab_id, reply_pid) if tab_id is not None else reply_pid
     if tab_id is not None:
-        tab_last_source[tab_id] = "tg"
+        _set_tab_last_source(tab_id, "tg")
     await _route_to_pane(pid, tab_id, m.text, "tg")
 
 
@@ -1911,20 +2410,18 @@ async def on_clear(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
             name = p.get("tab_title", name)[:128]
             break
     try:
-        await _primary_bot.delete_forum_topic(CHAT, tid)
-        t = await _primary_bot.create_forum_topic(CHAT, name)
-        tab_topic[tab_id] = t.message_thread_id
-        _rebuild()
-        _persist()
+        await _recreate_telegram_topic(tab_id, tid, name)
         # clear tracked messages and signoffs for this topic
         for mid in [k for k, v in msg_pane.items()
                     if pane_tab.get(v) == tab_id]:
             msg_pane.pop(mid, None)
         collab_signoffs.pop(tab_id, None)
         # re-seek so we don't replay old output
+        next_cursors = dict(_source_cursors)
         for pid, tab in pane_tab.items():
             if tab == tab_id:
-                _seek_to_end(pid)
+                _seek_to_end(pid, next_cursors)
+        _replace_delivery_state(_pending_sends, next_cursors)
         print(f"[clear] recreated topic for tab {tab_id}")
     except Exception as e:
         print(f"clear: {e}")
@@ -1960,7 +2457,7 @@ async def _flush_signal_history(group_id, tab_id, reply_pid=None):
 
     pid = _resolve_pid(tab_id, reply_pid)
     if tab_id is not None:
-        tab_last_source[tab_id] = "sig"
+        _set_tab_last_source(tab_id, "sig")
     routed = await _route_to_pane(pid, tab_id, payload, "sig")
     if routed:
         _signal_db_mark_delivered([row["id"] for row in pending])
@@ -2134,9 +2631,11 @@ async def _signal_handle_command(text, group_id, tab_id):
                        if pane_tab.get(v) == tab_id]:
                 sig_msg_pane.pop(ts, None)
             collab_signoffs.pop(tab_id, None)
+            next_cursors = dict(_source_cursors)
             for pid, tab in pane_tab.items():
                 if tab == tab_id:
-                    _seek_to_end(pid)
+                    _seek_to_end(pid, next_cursors)
+            _replace_delivery_state(_pending_sends, next_cursors)
             print(f"[signal] refreshed group for tab {tab_id} -> {new_gid}")
             # leave old group (best-effort — fails if bot is last admin)
             try:
@@ -2350,10 +2849,14 @@ async def startup(app: Application):
             pass
 
     saved = _load()
-    # migrate flat format (old) to nested format
-    topics = saved.get("topics", saved) if "topics" in saved else saved
-    for k, v in topics.items():
-        tab_topic[int(k)] = v
+    for title, topic_id in saved.get("telegram_topics", {}).items():
+        key = _telegram_topic_key(title)
+        if key and topic_id:
+            tg_name_topic[key] = int(topic_id)
+    for title, source in saved.get("last_sources", {}).items():
+        key = _telegram_topic_key(title)
+        if key and source in {"tg", "sig", "debate", "slack"}:
+            last_source_name[key] = source
     for k, v in saved.get("collab", {}).items():
         collab_tabs[int(k)] = v
     for gid in saved.get("clod_off_groups", []):
@@ -2378,7 +2881,10 @@ async def startup(app: Application):
             key = str(k).strip().lower()
         if key and not re.match(r"^tab-\d+$", key):
             sig_name_group.setdefault(key, gid)
+    resumed_delivery_state = _load_pending()
     _rebuild()
+    if tg_name_topic:
+        print(f"[tg] loaded {len(tg_name_topic)} title-keyed topic(s)")
     if sig_name_group:
         print(f"[signal] loaded {len(sig_name_group)} group(s) from state: "
               f"{sorted(sig_name_group)}")
@@ -2417,16 +2923,15 @@ async def startup(app: Application):
         asyncio.create_task(_slack_receive_task())
 
     matched, unmatched = await discover()
-    for p, h_name in matched:
-        pid = p["pane_id"]
-        pane_harness[pid] = h_name
-        pane_tab[pid] = p["tab_id"]
-        pane_cwds[pid] = _parse_cwd(p.get("cwd", ""))
-        _seek_to_end(pid)
-        _seeked.add(pid)
-    for p, _ in unmatched:
-        pane_tab[p["pane_id"]] = p["tab_id"]
-        pane_cwds[p["pane_id"]] = _parse_cwd(p.get("cwd", ""))
+    # Resolve routes before reading sources. Durable cursors resume exactly;
+    # a genuinely new session starts at record zero so its first reply cannot
+    # be skipped if it was completed between discovery polls.
+    await sync_topics(matched, unmatched)
+    if not resumed_delivery_state:
+        initial_cursors = {}
+        for p, _h_name in matched:
+            _seek_to_end(p["pane_id"], initial_cursors)
+        _replace_delivery_state([], initial_cursors)
 
     # print tab summary
     tabs = {}
