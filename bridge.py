@@ -1190,29 +1190,6 @@ def _tail_cursor(h, session):
     return _jsonl_tail_cursor(h, session)
 
 
-def _start_cursor(h, session):
-    """Return a cursor at the beginning of a newly observed source."""
-    if h.name == "opencode":
-        db_path, session_id = session
-        return {
-            "kind": "opencode",
-            "db": str(Path(db_path).resolve()),
-            "session_id": session_id,
-            "rowid": 0,
-            "part_id": None,
-        }
-    if h.name == "gemini":
-        return {
-            "kind": "gemini",
-            "path": str(Path(session).resolve()),
-            "index": 0,
-            "last_id": None,
-        }
-    cursor = _jsonl_tail_cursor(h, session)
-    cursor["offset"] = 0
-    return cursor
-
-
 def _seek_to_end(pid, cursors=None):
     """Set this source's durable cursor to its current tail."""
     cwd = pane_cwds.get(pid)
@@ -1633,7 +1610,7 @@ def _peek_new_sync(pid, cursor_snapshot):
     source_key = _source_key(h, session)
     cursor = cursor_snapshot.get(source_key)
     if cursor is None:
-        cursor = _start_cursor(h, session)
+        cursor = _tail_cursor(h, session)
 
     if h.name == "opencode":
         messages, next_cursor = _opencode_read_new(session, cursor)

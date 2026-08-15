@@ -356,7 +356,7 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(messages, ["two"])
         self.assertEqual(final_cursor["offset"], path.stat().st_size)
 
-    def test_new_session_replays_first_completed_reply(self):
+    def test_unknown_session_baselines_at_current_tail(self):
         path = Path(self.tmp.name) / "new-session.jsonl"
         record = {
             "type": "response_item",
@@ -374,15 +374,21 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
         )
         bridge.pane_harness[9] = "codex"
         bridge.pane_cwds[9] = self.tmp.name
-        try:
-            batch = bridge._peek_new_sync(9, {})
-        finally:
-            bridge.pane_harness.pop(9, None)
-            bridge.pane_cwds.pop(9, None)
+        batch = bridge._peek_new_sync(9, {})
 
         self.assertTrue(batch["baseline"])
-        self.assertEqual(batch["messages"], ["first reply"])
+        self.assertEqual(batch["messages"], [])
         self.assertEqual(batch["cursor"]["offset"], path.stat().st_size)
+
+        record["payload"]["content"][0]["text"] = "next reply"
+        with path.open("a") as session:
+            session.write(json.dumps(record) + "\n")
+        resumed = bridge._peek_new_sync(
+            9, {batch["source_key"]: batch["cursor"]}
+        )
+
+        self.assertFalse(resumed["baseline"])
+        self.assertEqual(resumed["messages"], ["next reply"])
 
     def test_codex_session_discovery_ignores_newer_subagent(self):
         sessions = Path(self.tmp.name) / "sessions"
@@ -411,33 +417,6 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
             found = bridge._codex_find_session(cwd)
 
         self.assertEqual(found, parent)
-
-    def test_initial_bootstrap_skips_existing_reply(self):
-        path = Path(self.tmp.name) / "existing-session.jsonl"
-        record = {
-            "type": "response_item",
-            "payload": {
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": "old reply"}],
-            },
-        }
-        path.write_text(json.dumps(record) + "\n")
-        bridge.harnesses["codex"] = SimpleNamespace(
-            name="codex",
-            find_session=lambda _cwd: path,
-            format_record=bridge._codex_format,
-        )
-        bridge.pane_harness[9] = "codex"
-        bridge.pane_cwds[9] = self.tmp.name
-        cursors = {}
-
-        self.assertTrue(bridge._seek_to_end(9, cursors))
-        batch = bridge._peek_new_sync(9, cursors)
-
-        self.assertEqual(batch["messages"], [])
-        self.assertEqual(batch["cursor"]["offset"], path.stat().st_size)
-
 
 if __name__ == "__main__":
     unittest.main()
