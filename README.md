@@ -43,18 +43,23 @@ from the committed `bridge.py.lock`; refresh it deliberately with
 
 Production does not watch source files or reload itself. Develop in a separate
 Git worktree, run the test suite there, stop the service, promote the tested
-commit into `/code/msger`, and start the service once. The production unit is
-tracked at `deploy/panetone.service` and installed under `/etc/systemd/system/`.
-It uses the system-labeled `/usr/local/bin/uv` executable and runs as `mihai`.
-Promote it with:
+commit into `/code/msger`, and start the service once. The current deployment
+is an enabled user service with lingering enabled. It runs the locked script
+through `~/.local/bin/uv` and shares the user service manager with Wakterm, so
+their startup ordering is explicit and neither service requires an interactive
+login.
+
+An optional root-owned unit is tracked at `deploy/panetone.service`. It uses the
+system-labeled `/usr/local/bin/uv` executable and runs as `mihai`. Promote both
+Panetone and its Wakterm dependency into a compatible system-service deployment
+before using this alternative. The rollback-safe Panetone installer is:
 
 ```sh
 sudo /bin/bash /code/msger/deploy/install-system-service.sh
 ```
 
 The installer checks the committed lock before stopping the current service and
-restores the temporary user service automatically if system-service promotion
-fails.
+restores the user service automatically if system-service promotion fails.
 
 Panetone probes Wakterm durable-return support once during startup. When the
 installed Wakterm lacks that capability, ordinary one-way sends remain enabled
@@ -115,8 +120,9 @@ registered by the running bridge. Panetone posts an audit message in the target
 Telegram topic, switches that target's output route to Telegram, submits the
 message through `wakterm cli agent send`, and prints a structured JSON receipt.
 
-Ordinary sends remain one-way. Add `--return-final` for durable asynchronous
-delegation:
+Ordinary sends remain one-way. When the running Panetone bridge reports that
+Wakterm supports durable agent requests, add `--return-final` for durable
+asynchronous delegation to a Codex target:
 
 ```sh
 panetone send --return-final --from ufopedia --to zola \
@@ -129,6 +135,23 @@ its exact target session and provider turn. When that turn reaches a terminal
 state, Panetone resumes from Wakterm's durable event stream and sends one
 correlated callback to the source agent and source Telegram topic. Neither the
 calling agent nor Panetone parses harness session files for this correlation.
+The current Wakterm implementation provides this exact turn correlation for
+Codex targets. Other target harnesses require equivalent observer support
+before they can use return mode.
+
+If the installed Wakterm lacks this capability, Panetone returns
+`return_final_unavailable` before route refresh, Telegram, or prompt delivery.
+One-way sends remain available. For an explicit report-back without monitored
+callbacks, tell the target to send its summary when it decides the work is
+complete:
+
+```sh
+panetone send --from ufopedia --to zola \
+  'Complete the review. When done, run: panetone send --from zola --to ufopedia "<final summary>"'
+```
+
+This fallback is a second ordinary send under the target agent's semantic
+control. It does not change the original request into a synchronous exchange.
 
 Every request has a UUID idempotency key. The CLI generates one by default and
 returns it in the response. Use `--id UUID` when retrying after a lost response.

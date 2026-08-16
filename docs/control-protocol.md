@@ -1,9 +1,10 @@
 # Panetone control protocol
 
 The local control interface lets a client ask the running Panetone bridge to
-send a cross-agent message, optionally with an asynchronous final response. The bridge remains authoritative for live
-routes, Telegram topics, bot identities, reply routing, and Wakterm delivery.
-The CLI does not read or copy any of that state.
+send a cross-agent message, optionally with an asynchronous final response.
+The bridge remains authoritative for live routes, Telegram topics, bot
+identities, reply routing, and Wakterm delivery. The CLI does not read or copy
+any of that state.
 
 ## Transport and permissions
 
@@ -24,8 +25,7 @@ Telegram state.
 At startup, Panetone refuses to replace a symlink, regular file, or active
 socket. It removes a socket only after a connection probe establishes that the
 recorded inode is stale. Shutdown removes only the inode created by that server
-instance. This also makes recovery safe after hot reload or an unclean service
-restart.
+instance. This also makes recovery safe after an unclean service restart.
 
 ## Framing and request
 
@@ -106,6 +106,15 @@ message. The CLI exits while the delegated turn is still running. For one-way
 delivery, the older `submitted` and observer acknowledgement receipt is
 unchanged.
 
+Return mode is capability-dependent. Panetone probes for Wakterm durable agent
+request support at startup and enables the return watcher only when that probe
+succeeds. Installing a compatible Wakterm takes effect after a deliberate
+Panetone restart. The current Wakterm implementation supports correlated return
+requests for Codex targets. Other harnesses require equivalent observer
+support. The startup probe detects the command-level capability, not support for
+a particular target harness. If Wakterm rejects a target during submission, the
+normal audit-linked Wakterm failure and indeterminate-delivery policy applies.
+
 ## Delivery order and failures
 
 Panetone performs these steps:
@@ -151,6 +160,25 @@ Errors use this shape:
 }
 ```
 
+If `return_final` is true but the running bridge did not negotiate durable
+agent request support, the request fails with:
+
+```json
+{
+  "schema": "panetone.control.v1",
+  "id": "fe57dc90-994e-4e73-b09c-fac483d9f05b",
+  "ok": false,
+  "error": {
+    "code": "return_final_unavailable",
+    "message": "Wakterm does not support durable return requests; no delivery was attempted"
+  }
+}
+```
+
+This capability failure occurs before live route refresh, Telegram audit, or
+Wakterm prompt submission. It is a determinate failure and ordinary one-way
+sends remain available.
+
 ## Durable idempotency journal
 
 The journal defaults to `control-journal.sqlite3` beside Panetone's existing
@@ -190,3 +218,8 @@ observer session, submitted prompt hash, provider turn ID, and armed output
 cursor. A stale session, reused pane, intervening prompt, extra user input, or
 skipped provider turn produces an asynchronous `indeterminate` callback instead
 of returning an unrelated final message.
+
+When return mode is unavailable, the source can include a plain-language
+instruction asking the target to run a second ordinary `panetone send` with its
+final summary. That explicit report-back is initiated by the target and is not
+correlated automatically with the original request.
