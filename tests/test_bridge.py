@@ -692,5 +692,29 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row["agent_state"], "delivered")
             self.assertEqual(row["telegram_state"], "delivered")
 
+    async def test_shutdown_cancels_owned_background_tasks(self):
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def worker():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        task = bridge._start_background_task(worker(), "test-worker")
+        await started.wait()
+        old_server = bridge._control_server
+        bridge._control_server = None
+        try:
+            await bridge.shutdown(None)
+        finally:
+            bridge._control_server = old_server
+
+        self.assertTrue(task.cancelled())
+        self.assertTrue(cancelled.is_set())
+        self.assertFalse(bridge._background_tasks)
+
 if __name__ == "__main__":
     unittest.main()
