@@ -34,10 +34,23 @@ WEZ_TG_OWNER=your-telegram-user-id         # optional
 4. Run:
 
 ```
-uv run bridge.py
+uv --no-config run --locked --script bridge.py
 ```
 
-Requires [uv](https://docs.astral.sh/uv/) — dependencies are installed automatically via inline script metadata.
+Requires [uv](https://docs.astral.sh/uv/). Runtime dependencies are resolved
+from the committed `bridge.py.lock`; refresh it deliberately with
+`uv --no-config lock --script bridge.py`.
+
+Production does not watch source files or reload itself. Develop in a separate
+Git worktree, run the test suite there, stop the service, promote the tested
+commit into `/code/msger`, and start the service once. The production unit is
+tracked at `deploy/panetone.service` and installed under `/etc/systemd/system/`.
+It uses the system-labeled `/usr/local/bin/uv` executable and runs as `mihai`.
+
+Panetone probes Wakterm durable-return support once during startup. When the
+installed Wakterm lacks that capability, ordinary one-way sends remain enabled
+but `--return-final` fails before Telegram or prompt delivery. A compatible
+Wakterm installation takes effect after a deliberate Panetone restart.
 
 ## Signal Setup (optional)
 

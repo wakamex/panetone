@@ -1,0 +1,26 @@
+[Unit]
+Description=Panetone bridge (Wakterm to messaging services)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=mihai
+Group=mihai
+WorkingDirectory=/code/msger
+Environment=HOME=/home/mihai
+Environment=PYTHONUNBUFFERED=1
+Environment=WAKTERM_BIN=/home/mihai/.local/bin/wakterm
+Environment=WAKTERM_UNIX_SOCKET=/run/user/1000/wakterm/sock
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+UMask=0077
+ExecStart=/usr/local/bin/uv --no-config run --locked --script /code/msger/bridge.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
