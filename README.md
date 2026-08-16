@@ -46,6 +46,15 @@ Git worktree, run the test suite there, stop the service, promote the tested
 commit into `/code/msger`, and start the service once. The production unit is
 tracked at `deploy/panetone.service` and installed under `/etc/systemd/system/`.
 It uses the system-labeled `/usr/local/bin/uv` executable and runs as `mihai`.
+Promote it with:
+
+```sh
+sudo /bin/bash /code/msger/deploy/install-system-service.sh
+```
+
+The installer checks the committed lock before stopping the current service and
+restores the temporary user service automatically if system-service promotion
+fails.
 
 Panetone probes Wakterm durable-return support once during startup. When the
 installed Wakterm lacks that capability, ordinary one-way sends remain enabled

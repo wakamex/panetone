@@ -60,6 +60,14 @@ class DeploymentContractTests(unittest.TestCase):
             )
         )
 
+    def test_system_installer_has_failure_rollback(self):
+        installer = (ROOT / "deploy" / "install-system-service.sh").read_text()
+
+        self.assertIn("lock --check --script", installer)
+        self.assertIn("restore_user_service", installer)
+        self.assertIn("systemctl disable --now panetone.service", installer)
+        self.assertIn("systemctl is-active --quiet panetone.service", installer)
+
 
 if __name__ == "__main__":
     unittest.main()
