@@ -27,6 +27,10 @@ Env (Slack observer — all three required to enable):
   WEZ_SLACK_APP_TOKEN    - Slack app-level token for Socket Mode (xapp-...)
   WEZ_SLACK_CHANNELS     - comma-separated Slack channel IDs to observe
   WEZ_SLACK_TABS         - comma-separated tab name patterns to observe
+
+Env (local control interface):
+  PANETONE_CONTROL_SOCKET  - Panetone-owned UNIX socket path
+  PANETONE_CONTROL_JOURNAL - durable request/idempotency journal path
 """
 
 import asyncio
@@ -53,6 +57,14 @@ from telegram.ext import (
     filters,
 )
 
+from panetone_control import (
+    ControlJournal,
+    ControlServer,
+    DurableDispatcher,
+    RequestFailure,
+    default_socket_path,
+)
+
 # --- config ----------------------------------------------------------------
 
 _env_file = Path(__file__).resolve().parent / ".env"
@@ -73,6 +85,15 @@ STATE = Path(
 ).expanduser()
 PENDING_STATE = Path(
     os.environ.get("WEZ_TG_PENDING", str(STATE.with_name("pending_sends.json")))
+).expanduser()
+CONTROL_SOCKET = Path(
+    os.environ.get("PANETONE_CONTROL_SOCKET", str(default_socket_path()))
+).expanduser()
+CONTROL_JOURNAL = Path(
+    os.environ.get(
+        "PANETONE_CONTROL_JOURNAL",
+        str(STATE.with_name("control-journal.sqlite3")),
+    )
 ).expanduser()
 OPENCODE_TOKEN = os.environ.get("WEZ_TG_TOKEN_OPENCODE", "")
 GEMINI_TOKEN = os.environ.get("WEZ_TG_TOKEN_GEMINI", "")
@@ -194,6 +215,49 @@ def _send_enter_sync(pid):
         subprocess.run(pane, input=b"\x0d", capture_output=True, timeout=5)
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
+
+
+def _agent_send_sync(pid, text, *, return_final=False, request_id=None, timeout_ms=0):
+    """Send through Wakterm's agent interface and return its JSON receipt."""
+    command = [WAKTERM_BIN, "cli", "agent", "send", str(pid)]
+    if return_final:
+        command.append("--return-final")
+        if request_id:
+            command.extend(["--request-id", request_id])
+        if timeout_ms:
+            command.extend(["--final-timeout-ms", str(timeout_ms)])
+    try:
+        result = subprocess.run(
+            command,
+            input=text,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("Wakterm agent send timed out") from error
+    except FileNotFoundError as error:
+        raise RuntimeError(f"Wakterm binary not found: {WAKTERM_BIN}") from error
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown Wakterm error"
+        raise RuntimeError(f"Wakterm agent send failed (rc={result.returncode}): {detail}")
+    try:
+        receipt = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Wakterm agent send returned invalid JSON") from error
+    if not isinstance(receipt, dict):
+        raise RuntimeError("Wakterm returned a non-object receipt")
+    if return_final:
+        if receipt.get("request_id") != request_id or not receipt.get("reply_pending"):
+            raise RuntimeError("Wakterm did not durably register the return request")
+    elif not receipt.get("submitted"):
+        raise RuntimeError("Wakterm did not report a submitted prompt")
+    return receipt
+
+
+async def agent_send(pid, text, **kwargs):
+    return await asyncio.to_thread(_agent_send_sync, pid, text, **kwargs)
 
 
 async def send_text(pid, text):
@@ -1295,6 +1359,8 @@ async def discover():
 # --- core loop -------------------------------------------------------------
 
 _primary_bot = None  # set in startup, used for topic management
+_route_sync_lock = asyncio.Lock()
+_control_server = None
 
 
 def _telegram_topic_key(title):
@@ -1443,6 +1509,14 @@ async def sync_topics(matched, unmatched):
     _rebuild()
     if dirty:
         _persist()
+
+
+async def _refresh_telegram_routes():
+    """Refresh live panes and Telegram mappings without overlapping a poll sync."""
+    async with _route_sync_lock:
+        matched, unmatched = await discover()
+        await sync_topics(matched, unmatched)
+        return matched, unmatched
 
 
 def _tab_match(title, patterns, empty_means_all=False):
@@ -2779,8 +2853,476 @@ async def _signal_receive_task():
             await asyncio.sleep(5)
 
 
+# --- local control interface ----------------------------------------------
+
+
+def _control_route(name):
+    key = _telegram_topic_key(name)
+    matches = [
+        (tab_id, title)
+        for tab_id, title in tab_topic_name.items()
+        if _telegram_topic_key(title) == key
+    ]
+    if not matches:
+        raise RequestFailure(
+            "route_not_found", f"no live Panetone route matches {name!r}"
+        )
+    if len(matches) != 1:
+        raise RequestFailure(
+            "route_ambiguous", f"more than one live Panetone route matches {name!r}"
+        )
+    tab_id, title = matches[0]
+    pid = _resolve_pid(tab_id)
+    h_name = pane_harness.get(pid)
+    topic_id = tab_topic.get(tab_id)
+    if pid is None or not h_name:
+        raise RequestFailure(
+            "route_unavailable", f"route {title!r} has no live agent pane"
+        )
+    if not topic_id:
+        raise RequestFailure(
+            "route_unavailable", f"route {title!r} has no live Telegram topic"
+        )
+    return {
+        "title": title,
+        "tab_id": tab_id,
+        "pane_id": pid,
+        "harness": h_name,
+        "topic_id": topic_id,
+    }
+
+
+def _utf16_chunks(text, limit=3900):
+    """Split text below Telegram's UTF-16 message limit."""
+    chunk = []
+    units = 0
+    for char in text:
+        char_units = 2 if ord(char) > 0xFFFF else 1
+        if chunk and units + char_units > limit:
+            yield "".join(chunk)
+            chunk = []
+            units = 0
+        chunk.append(char)
+        units += char_units
+    if chunk:
+        yield "".join(chunk)
+
+
+async def _control_failure_annotation(
+    bot, topic_id, first_message_id, first_text, request_id, reason, target_pid
+):
+    marker = (
+        "DELIVERY FAILED\n"
+        f"Request: {request_id}\n"
+        f"{reason}\n"
+        "Panetone did not retry the target prompt."
+    )
+    try:
+        sent = await bot.send_message(
+            CHAT,
+            marker,
+            message_thread_id=topic_id,
+            reply_to_message_id=first_message_id,
+        )
+        msg_pane[sent.message_id] = target_pid
+        return {"kind": "reply", "message_id": sent.message_id}
+    except Exception as reply_error:
+        replacement = next(_utf16_chunks(f"{marker}\n\n{first_text}"))
+        try:
+            await bot.edit_message_text(
+                replacement,
+                chat_id=CHAT,
+                message_id=first_message_id,
+            )
+            return {"kind": "edited", "message_id": first_message_id}
+        except Exception as edit_error:
+            return {
+                "kind": "failed",
+                "reply_error": str(reply_error),
+                "edit_error": str(edit_error),
+            }
+
+
+async def _control_success_annotation(
+    bot, topic_id, first_message_id, first_text, request_id, target_pid
+):
+    submitted_text = first_text.replace("[pending]", "[submitted]", 1)
+    try:
+        await bot.edit_message_text(
+            submitted_text,
+            chat_id=CHAT,
+            message_id=first_message_id,
+        )
+        return {"kind": "edited", "message_id": first_message_id}
+    except Exception as edit_error:
+        marker = f"DELIVERY SUBMITTED\nRequest: {request_id}"
+        try:
+            sent = await bot.send_message(
+                CHAT,
+                marker,
+                message_thread_id=topic_id,
+                reply_to_message_id=first_message_id,
+            )
+            msg_pane[sent.message_id] = target_pid
+            return {"kind": "reply", "message_id": sent.message_id}
+        except Exception as reply_error:
+            return {
+                "kind": "failed",
+                "edit_error": str(edit_error),
+                "reply_error": str(reply_error),
+            }
+
+
+async def _handle_control_send(request, transition, journal=None):
+    params = request["params"]
+    request_id = request["id"]
+    await _refresh_telegram_routes()
+    source = _control_route(params["from"])
+    target = _control_route(params["to"])
+    return_final = params.get("return_final", False)
+    source_harness = harnesses.get(source["harness"])
+    bot = source_harness.bot if source_harness else _primary_bot
+    if not bot:
+        raise RequestFailure(
+            "telegram_unavailable", "no Telegram bot is available for the source route"
+        )
+
+    audit_text = (
+        f"{source['title']} \u2192 {target['title']}:\n"
+        f"Request: {request_id} [pending]\n"
+        f"{params['message']}"
+    )
+    audit_ids = []
+    first_text = ""
+    for index, chunk in enumerate(_utf16_chunks(audit_text)):
+        if index == 0:
+            first_text = chunk
+        try:
+            kwargs = {}
+            if audit_ids:
+                kwargs["reply_to_message_id"] = audit_ids[0]
+            sent = await bot.send_message(
+                CHAT,
+                chunk,
+                message_thread_id=target["topic_id"],
+                **kwargs,
+            )
+        except Exception as error:
+            annotation = None
+            if audit_ids:
+                annotation = await _control_failure_annotation(
+                    bot,
+                    target["topic_id"],
+                    audit_ids[0],
+                    first_text,
+                    request_id,
+                    "The Telegram audit message was incomplete, so the target prompt was not sent.",
+                    target["pane_id"],
+                )
+            raise RequestFailure(
+                "telegram_audit_failed",
+                "Telegram audit delivery failed; the target prompt was not sent",
+                details={
+                    "error": str(error),
+                    "message_ids": audit_ids,
+                    "failure_annotation": annotation,
+                },
+            ) from error
+        audit_ids.append(sent.message_id)
+        msg_pane[sent.message_id] = target["pane_id"]
+        try:
+            await transition(
+                "audit_posted",
+                {
+                    "source": source["title"],
+                    "target": target["title"],
+                    "topic_id": target["topic_id"],
+                    "message_ids": audit_ids,
+                },
+            )
+        except Exception as error:
+            annotation = await _control_failure_annotation(
+                bot,
+                target["topic_id"],
+                audit_ids[0],
+                first_text,
+                request_id,
+                "Panetone could not durably record the audit, so the target prompt was not sent.",
+                target["pane_id"],
+            )
+            raise RequestFailure(
+                "journal_update_failed",
+                "the audit succeeded but its durable state could not be recorded",
+                details={"failure_annotation": annotation, "error": str(error)},
+                indeterminate=True,
+            ) from error
+
+    try:
+        if return_final:
+            if journal is None:
+                raise RuntimeError("durable return journal is unavailable")
+            await asyncio.to_thread(
+                journal.register_return_route, request_id, source, target
+            )
+        _set_tab_last_source(target["tab_id"], "tg")
+        await transition(
+            "delivering",
+            {
+                "source": source["title"],
+                "target": target["title"],
+                "target_pane_id": target["pane_id"],
+                "topic_id": target["topic_id"],
+                "message_ids": audit_ids,
+            },
+        )
+    except Exception as error:
+        annotation = await _control_failure_annotation(
+            bot,
+            target["topic_id"],
+            audit_ids[0],
+            first_text,
+            request_id,
+            "Panetone could not prepare durable delivery state, so the target prompt was not sent.",
+            target["pane_id"],
+        )
+        raise RequestFailure(
+            "delivery_state_failed",
+            "the audit succeeded but delivery state could not be prepared",
+            details={"failure_annotation": annotation, "error": str(error)},
+            indeterminate=True,
+        ) from error
+
+    try:
+        if return_final:
+            wakterm_receipt = await agent_send(
+                target["pane_id"],
+                params["message"],
+                return_final=True,
+                request_id=request_id,
+                timeout_ms=params.get("timeout_ms", 0),
+            )
+        else:
+            wakterm_receipt = await agent_send(target["pane_id"], params["message"])
+    except Exception as error:
+        annotation = await _control_failure_annotation(
+            bot,
+            target["topic_id"],
+            audit_ids[0],
+            first_text,
+            request_id,
+            "Wakterm delivery failed or became indeterminate.",
+            target["pane_id"],
+        )
+        if return_final and journal is not None:
+            terminal = {
+                "request_id": request_id,
+                "state": "delivery_failed",
+                "final_message": None,
+                "detail": str(error),
+                "terminal_event_sequence": None,
+            }
+            await asyncio.to_thread(
+                journal.record_return_result, request_id, terminal
+            )
+            await _deliver_return(request_id, journal)
+        raise RequestFailure(
+            "wakterm_delivery_indeterminate",
+            "the audit succeeded but Wakterm delivery failed or became indeterminate",
+            details={
+                "error": str(error),
+                "telegram": {
+                    "chat_id": CHAT,
+                    "topic_id": target["topic_id"],
+                    "message_ids": audit_ids,
+                    "failure_annotation": annotation,
+                },
+            },
+            indeterminate=True,
+        ) from error
+
+    status_annotation = await _control_success_annotation(
+        bot,
+        target["topic_id"],
+        audit_ids[0],
+        first_text,
+        request_id,
+        target["pane_id"],
+    )
+    print(
+        f"[control>{source['title']}/{target['title']}] "
+        f"request {request_id} submitted via Wakterm to pane {target['pane_id']}"
+    )
+    return {
+        "source": source,
+        "target": target,
+        "telegram": {
+            "chat_id": CHAT,
+            "topic_id": target["topic_id"],
+            "message_ids": audit_ids,
+            "status_annotation": status_annotation,
+        },
+        "wakterm": wakterm_receipt,
+        "reply_mode": "return_final" if return_final else "one_way",
+        "reply_pending": return_final,
+    }
+
+
+def _return_callback_text(result, source, target):
+    request_id = result["request_id"]
+    state = result.get("state", "indeterminate")
+    message = result.get("final_message")
+    header = (
+        f"Panetone return for request {request_id}\n"
+        f"From: {target['title']}\n"
+        f"Status: {state}"
+    )
+    if message:
+        return f"{header}\n\n{message}"
+    detail = result.get("detail") or "No final assistant message was available."
+    return f"{header}\n\n{detail}"
+
+
+async def _deliver_return(request_id, journal):
+    async with _return_delivery_lock:
+        row = await asyncio.to_thread(journal.get_return, request_id)
+        if not row or not row["result_json"]:
+            return
+        result = json.loads(row["result_json"])
+        source = json.loads(row["source_json"])
+        target = json.loads(row["target_json"])
+        callback = _return_callback_text(result, source, target)
+
+        if row["agent_state"] == "pending":
+            await asyncio.to_thread(
+                journal.set_return_destination,
+                request_id,
+                "agent",
+                "delivering",
+            )
+            try:
+                await _refresh_telegram_routes()
+                live_source = _control_route(source["title"])
+                await agent_send(live_source["pane_id"], callback)
+            except Exception as error:
+                await asyncio.to_thread(
+                    journal.set_return_destination,
+                    request_id,
+                    "agent",
+                    "indeterminate",
+                    str(error),
+                )
+                print(f"[control>{source['title']}] agent callback indeterminate: {error}")
+            else:
+                await asyncio.to_thread(
+                    journal.set_return_destination,
+                    request_id,
+                    "agent",
+                    "delivered",
+                )
+
+        row = await asyncio.to_thread(journal.get_return, request_id)
+        if row["telegram_state"] == "pending":
+            await asyncio.to_thread(
+                journal.set_return_destination,
+                request_id,
+                "telegram",
+                "delivering",
+            )
+            try:
+                source_harness = harnesses.get(source["harness"])
+                bot = source_harness.bot if source_harness else _primary_bot
+                if not bot:
+                    raise RuntimeError("no Telegram bot is available for the source route")
+                first_message_id = None
+                for chunk in _utf16_chunks(callback):
+                    kwargs = {}
+                    if first_message_id:
+                        kwargs["reply_to_message_id"] = first_message_id
+                    sent = await bot.send_message(
+                        CHAT,
+                        chunk,
+                        message_thread_id=source["topic_id"],
+                        **kwargs,
+                    )
+                    first_message_id = first_message_id or sent.message_id
+                    msg_pane[sent.message_id] = source["pane_id"]
+            except Exception as error:
+                await asyncio.to_thread(
+                    journal.set_return_destination,
+                    request_id,
+                    "telegram",
+                    "indeterminate",
+                    str(error),
+                )
+                print(f"[control>{source['title']}] Telegram callback indeterminate: {error}")
+            else:
+                await asyncio.to_thread(
+                    journal.set_return_destination,
+                    request_id,
+                    "telegram",
+                    "delivered",
+                )
+
+
+async def _handle_wakterm_return_event(result, journal):
+    sequence = result.get("terminal_event_sequence")
+    request_id = result.get("request_id")
+    if not isinstance(sequence, int) or not isinstance(request_id, str):
+        raise RuntimeError("Wakterm returned an invalid terminal request event")
+    route = await asyncio.to_thread(journal.get_return, request_id)
+    if route:
+        await asyncio.to_thread(journal.record_return_result, request_id, result)
+        await _deliver_return(request_id, journal)
+    await asyncio.to_thread(journal.set_event_cursor, sequence)
+
+
+async def _wakterm_return_watch_loop(journal):
+    while True:
+        cursor = await asyncio.to_thread(journal.event_cursor)
+        process = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                WAKTERM_BIN,
+                "cli",
+                "agent",
+                "request",
+                "watch",
+                "--after",
+                str(cursor),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            while line := await process.stdout.readline():
+                result = json.loads(line)
+                await _handle_wakterm_return_event(result, journal)
+            stderr = (await process.stderr.read()).decode(errors="replace").strip()
+            await process.wait()
+            if stderr:
+                print(f"[control] Wakterm return stream closed: {stderr}")
+        except asyncio.CancelledError:
+            if process is not None and process.returncode is None:
+                process.terminate()
+                await process.wait()
+            raise
+        except Exception as error:
+            print(f"[control] Wakterm return stream error: {error}")
+        await asyncio.sleep(2)
+
+
+async def _pending_return_delivery_loop(journal):
+    while True:
+        try:
+            rows = await asyncio.to_thread(journal.pending_returns)
+            for row in rows:
+                await _deliver_return(row["request_id"], journal)
+        except Exception as error:
+            print(f"[control] pending return delivery error: {error}")
+        await asyncio.sleep(5)
+
+
 # --- lifecycle -------------------------------------------------------------
 
+_return_delivery_lock = None
 _script_path = Path(__file__).resolve()
 _script_mtime = _script_path.stat().st_mtime
 
@@ -2801,8 +3343,7 @@ async def poll_loop():
                 _uv = shutil.which("uv") or str(Path.home() / ".local/bin/uv")
                 os.execv(_uv, [_uv, "run", str(_script_path)])
 
-            matched, unmatched = await discover()
-            await sync_topics(matched, unmatched)
+            matched, unmatched = await _refresh_telegram_routes()
             if SIGNAL_ENABLED:
                 await sync_signal_groups(matched, unmatched)
                 await _process_signal_queues()
@@ -2816,7 +3357,7 @@ async def poll_loop():
 
 
 async def startup(app: Application):
-    global _primary_bot
+    global _primary_bot, _control_server, _return_delivery_lock
     _init_harnesses()
     _signal_db_init()
     _primary_bot = harnesses["claude"].bot
@@ -2903,11 +3444,10 @@ async def startup(app: Application):
             print(f"[slack] auth_test failed: {e}")
         asyncio.create_task(_slack_receive_task())
 
-    matched, unmatched = await discover()
+    matched, unmatched = await _refresh_telegram_routes()
     # Resolve routes before reading sources. Durable cursors resume exactly;
     # a genuinely new session starts at record zero so its first reply cannot
     # be skipped if it was completed between discovery polls.
-    await sync_topics(matched, unmatched)
     if not resumed_delivery_state:
         initial_cursors = {}
         for p, _h_name in matched:
@@ -2926,12 +3466,39 @@ async def startup(app: Application):
         parts = " ".join(f"{h}:{p['pane_id']}" for p, h in panes)
         print(f"  {title}: {parts}")
 
+    journal = ControlJournal(CONTROL_JOURNAL)
+    await asyncio.to_thread(journal.initialize)
+    _return_delivery_lock = asyncio.Lock()
+    dispatcher = DurableDispatcher(
+        journal, lambda request, transition: _handle_control_send(
+            request, transition, journal
+        )
+    )
+    _control_server = ControlServer(CONTROL_SOCKET, dispatcher)
+    await _control_server.start()
+    print(f"[control] listening on {CONTROL_SOCKET}")
+
+    asyncio.create_task(_wakterm_return_watch_loop(journal))
+    asyncio.create_task(_pending_return_delivery_loop(journal))
     asyncio.create_task(poll_loop())
+
+
+async def shutdown(_app: Application):
+    global _control_server
+    if _control_server:
+        await _control_server.close()
+        _control_server = None
 
 
 def main():
     _init_harnesses()
-    app = Application.builder().token(CLAUDE_TOKEN).post_init(startup).build()
+    app = (
+        Application.builder()
+        .token(CLAUDE_TOKEN)
+        .post_init(startup)
+        .post_shutdown(shutdown)
+        .build()
+    )
     app.add_handler(CommandHandler("list", on_list))
     app.add_handler(CommandHandler("collab", on_collab))
     app.add_handler(CommandHandler("refresh", on_clear))

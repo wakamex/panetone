@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Local client for Panetone's control socket."""
+
+import argparse
+import json
+import os
+import socket
+import sys
+import uuid
+from pathlib import Path
+
+SCHEMA = "panetone.control.v1"
+MAX_RESPONSE_BYTES = 256 * 1024
+
+
+def default_socket_path():
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return Path(runtime_dir) / "panetone" / "control.sock"
+
+
+def local_error(request_id, code, message):
+    return {
+        "schema": SCHEMA,
+        "id": request_id,
+        "ok": False,
+        "error": {"code": code, "message": message},
+    }
+
+
+def send_request(path, request, timeout=15):
+    encoded = (
+        json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
+    )
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(timeout)
+        client.connect(str(path))
+        client.sendall(encoded)
+        chunks = []
+        length = 0
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            length += len(chunk)
+            if length > MAX_RESPONSE_BYTES:
+                raise RuntimeError("control response exceeds 256 KiB")
+            if b"\n" in chunk:
+                break
+    data = b"".join(chunks)
+    if not data.endswith(b"\n"):
+        raise RuntimeError("control response was incomplete")
+    return json.loads(data)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="panetone")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    send = subparsers.add_parser("send", help="send a cross-agent message")
+    send.add_argument("--id", help="request UUID to use as the idempotency key")
+    send.add_argument("--from", dest="source", required=True, help="source route title")
+    send.add_argument("--to", dest="target", required=True, help="target route title")
+    send.add_argument(
+        "--return-final",
+        action="store_true",
+        help="asynchronously route the target turn's final response back to the source",
+    )
+    send.add_argument(
+        "--timeout-ms",
+        type=int,
+        default=0,
+        help="asynchronous final-response deadline in milliseconds",
+    )
+    send.add_argument("message", help="message to send")
+    args = parser.parse_args(argv)
+
+    if args.timeout_ms < 0:
+        parser.error("--timeout-ms must be non-negative")
+    if args.timeout_ms and not args.return_final:
+        parser.error("--timeout-ms requires --return-final")
+
+    try:
+        request_id = str(uuid.UUID(args.id)) if args.id else str(uuid.uuid4())
+    except ValueError:
+        parser.error("--id must be a UUID")
+    request = {
+        "schema": SCHEMA,
+        "id": request_id,
+        "method": "send",
+        "params": {
+            "from": args.source,
+            "to": args.target,
+            "message": args.message,
+            "return_final": args.return_final,
+            "timeout_ms": args.timeout_ms,
+        },
+    }
+    path = Path(os.environ.get("PANETONE_CONTROL_SOCKET", default_socket_path()))
+    try:
+        response = send_request(path, request)
+    except (OSError, RuntimeError, json.JSONDecodeError) as error:
+        response = local_error(
+            request_id,
+            "control_unavailable",
+            f"{error}; retry only with the same request id because delivery may be uncertain",
+        )
+    json.dump(response, sys.stdout, ensure_ascii=False, indent=2)
+    sys.stdout.write("\n")
+    return 0 if response.get("ok") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

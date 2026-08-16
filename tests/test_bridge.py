@@ -4,6 +4,7 @@
 # dependencies = ["python-telegram-bot>=22.0", "slack-sdk>=3.0", "aiohttp"]
 # ///
 
+import asyncio
 import json
 import os
 import sys
@@ -68,6 +69,26 @@ class FakeSendBot:
         return SimpleNamespace(message_id=77, message_thread_id=message_thread_id)
 
 
+class FakeControlBot:
+    def __init__(self, order, fail_on=None):
+        self.order = order
+        self.fail_on = fail_on
+        self.sent = []
+        self.edited = []
+
+    async def send_message(self, chat_id, text, message_thread_id, **kwargs):
+        number = len(self.sent) + 1
+        self.order.append(("telegram", text))
+        if self.fail_on == number:
+            raise RuntimeError("telegram offline")
+        message = SimpleNamespace(message_id=100 + number)
+        self.sent.append((chat_id, text, message_thread_id, kwargs))
+        return message
+
+    async def edit_message_text(self, text, chat_id, message_id):
+        self.edited.append((text, chat_id, message_id))
+
+
 class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -86,6 +107,8 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
         bridge.pane_harness.clear()
         bridge.pane_tab.clear()
         bridge.pane_cwds.clear()
+        bridge.tab_last_pid.clear()
+        bridge.msg_pane.clear()
         bridge.tab_last_source.clear()
         bridge.last_source_name.clear()
         bridge._tg_verified_names.clear()
@@ -109,6 +132,8 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
         bridge.pane_harness.clear()
         bridge.pane_tab.clear()
         bridge.pane_cwds.clear()
+        bridge.tab_last_pid.clear()
+        bridge.msg_pane.clear()
         bridge.tab_last_source.clear()
         bridge.last_source_name.clear()
         bridge._tg_verified_names.clear()
@@ -122,6 +147,20 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
         bridge.tab_topic[1] = 42
         bridge.tab_topic_name[1] = "route"
         bridge.tab_last_source[1] = "tg"
+        bridge.harnesses["codex"] = SimpleNamespace(
+            name="codex",
+            display_name="Codex",
+            bot=bot,
+            find_session=lambda _cwd: None,
+        )
+
+    def _configure_control(self, bot):
+        bridge.pane_harness.update({11: "codex", 22: "codex"})
+        bridge.pane_tab.update({11: 1, 22: 2})
+        bridge.pane_cwds.update({11: "/code/source", 22: "/code/target"})
+        bridge.tab_topic.update({1: 41, 2: 42})
+        bridge.tab_topic_name.update({1: "Source", 2: "Target"})
+        bridge._rebuild()
         bridge.harnesses["codex"] = SimpleNamespace(
             name="codex",
             display_name="Codex",
@@ -417,6 +456,196 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
             found = bridge._codex_find_session(cwd)
 
         self.assertEqual(found, parent)
+
+    async def test_control_send_audits_before_async_wakterm_delivery(self):
+        order = []
+        bot = FakeControlBot(order)
+        self._configure_control(bot)
+        transitions = []
+
+        async def transition(state, progress=None):
+            transitions.append((state, progress))
+
+        async def agent_send(pid, text):
+            order.append(("wakterm", text))
+            return {
+                "agent_id": "target-agent",
+                "agent_name": "target",
+                "pane_id": pid,
+                "submitted": True,
+                "acknowledgement": {"acknowledged": True},
+            }
+
+        request = {
+            "id": "00000000-0000-4000-8000-000000000001",
+            "params": {"from": "source", "to": "TARGET", "message": "do work"},
+        }
+        with (
+            patch.object(bridge, "_refresh_telegram_routes", AsyncMock()),
+            patch.object(bridge, "agent_send", AsyncMock(side_effect=agent_send)),
+        ):
+            result = await bridge._handle_control_send(request, transition)
+
+        self.assertEqual([kind for kind, _ in order], ["telegram", "wakterm"])
+        self.assertEqual(
+            bot.sent[0][1],
+            "Source → Target:\n"
+            "Request: 00000000-0000-4000-8000-000000000001 [pending]\n"
+            "do work",
+        )
+        self.assertEqual([state for state, _ in transitions], ["audit_posted", "delivering"])
+        self.assertEqual(bridge.tab_last_source[2], "tg")
+        self.assertEqual(result["reply_mode"], "one_way")
+        self.assertTrue(result["wakterm"]["submitted"])
+        self.assertIn("[submitted]", bot.edited[0][0])
+
+    async def test_control_send_marks_visible_failure_when_wakterm_fails(self):
+        order = []
+        bot = FakeControlBot(order)
+        self._configure_control(bot)
+
+        async def transition(_state, _progress=None):
+            return None
+
+        request = {
+            "id": "00000000-0000-4000-8000-000000000002",
+            "params": {"from": "Source", "to": "Target", "message": "do work"},
+        }
+        with (
+            patch.object(bridge, "_refresh_telegram_routes", AsyncMock()),
+            patch.object(
+                bridge,
+                "agent_send",
+                AsyncMock(side_effect=RuntimeError("mux disconnected")),
+            ),
+            self.assertRaises(bridge.RequestFailure) as raised,
+        ):
+            await bridge._handle_control_send(request, transition)
+
+        self.assertTrue(raised.exception.indeterminate)
+        self.assertEqual(raised.exception.code, "wakterm_delivery_indeterminate")
+        self.assertEqual(len(bot.sent), 2)
+        self.assertIn("DELIVERY FAILED", bot.sent[1][1])
+        self.assertEqual(bot.sent[1][3]["reply_to_message_id"], 101)
+
+    async def test_control_send_does_not_invoke_wakterm_when_audit_fails(self):
+        order = []
+        bot = FakeControlBot(order, fail_on=1)
+        self._configure_control(bot)
+        send = AsyncMock()
+
+        async def transition(_state, _progress=None):
+            return None
+
+        request = {
+            "id": "00000000-0000-4000-8000-000000000003",
+            "params": {"from": "Source", "to": "Target", "message": "do work"},
+        }
+        with (
+            patch.object(bridge, "_refresh_telegram_routes", AsyncMock()),
+            patch.object(bridge, "agent_send", send),
+            self.assertRaises(bridge.RequestFailure) as raised,
+        ):
+            await bridge._handle_control_send(request, transition)
+
+        self.assertFalse(raised.exception.indeterminate)
+        self.assertEqual(raised.exception.code, "telegram_audit_failed")
+        send.assert_not_awaited()
+
+    async def test_return_final_registers_route_before_wakterm_submission(self):
+        order = []
+        bot = FakeControlBot(order)
+        self._configure_control(bot)
+        journal = SimpleNamespace()
+
+        def register_return_route(request_id, source, target):
+            order.append(("registered", request_id))
+            self.assertEqual(source["title"], "Source")
+            self.assertEqual(target["title"], "Target")
+
+        journal.register_return_route = register_return_route
+
+        async def transition(_state, _progress=None):
+            return None
+
+        async def agent_send(pid, text, **kwargs):
+            order.append(("wakterm", text))
+            self.assertEqual(pid, 22)
+            self.assertTrue(kwargs["return_final"])
+            self.assertEqual(
+                kwargs["request_id"], "00000000-0000-4000-8000-000000000004"
+            )
+            return {
+                "request_id": kwargs["request_id"],
+                "reply_pending": True,
+            }
+
+        request = {
+            "id": "00000000-0000-4000-8000-000000000004",
+            "params": {
+                "from": "Source",
+                "to": "Target",
+                "message": "do work",
+                "return_final": True,
+                "timeout_ms": 5000,
+            },
+        }
+        with (
+            patch.object(bridge, "_refresh_telegram_routes", AsyncMock()),
+            patch.object(bridge, "agent_send", AsyncMock(side_effect=agent_send)),
+        ):
+            result = await bridge._handle_control_send(request, transition, journal)
+
+        kinds = [kind for kind, _value in order]
+        self.assertLess(kinds.index("registered"), kinds.index("wakterm"))
+        self.assertEqual(result["reply_mode"], "return_final")
+        self.assertTrue(result["reply_pending"])
+
+    async def test_terminal_return_event_delivers_each_destination_once(self):
+        order = []
+        bot = FakeControlBot(order)
+        self._configure_control(bot)
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.ControlJournal(Path(tmp) / "journal.sqlite3")
+            journal.initialize()
+            request_id = "00000000-0000-4000-8000-000000000005"
+            journal.register_return_route(
+                request_id,
+                {
+                    "title": "Source",
+                    "pane_id": 11,
+                    "harness": "codex",
+                    "topic_id": 101,
+                },
+                {
+                    "title": "Target",
+                    "pane_id": 22,
+                    "harness": "codex",
+                    "topic_id": 202,
+                },
+            )
+            result = {
+                "request_id": request_id,
+                "state": "completed",
+                "final_message": "full final response",
+                "terminal_event_sequence": 9,
+            }
+            bridge._return_delivery_lock = asyncio.Lock()
+            send = AsyncMock(return_value={"submitted": True})
+            with (
+                patch.object(bridge, "_refresh_telegram_routes", AsyncMock()),
+                patch.object(bridge, "agent_send", send),
+            ):
+                await bridge._handle_wakterm_return_event(result, journal)
+                await bridge._handle_wakterm_return_event(result, journal)
+
+            send.assert_awaited_once()
+            self.assertEqual(len(bot.sent), 1)
+            self.assertIn("full final response", bot.sent[0][1])
+            self.assertEqual(journal.event_cursor(), 9)
+            row = journal.get_return(request_id)
+            self.assertEqual(row["agent_state"], "delivered")
+            self.assertEqual(row["telegram_state"], "delivered")
 
 if __name__ == "__main__":
     unittest.main()

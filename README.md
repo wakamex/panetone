@@ -74,6 +74,53 @@ All commands work in both Telegram topics and Signal groups:
 | `/collab N` | Enable collab for N rounds |
 | `/refresh` | Delete and recreate the current topic/group (clears all messages) |
 
+## Local control interface
+
+Install the local CLI:
+
+```sh
+install -m 0755 ./panetone ~/.local/bin/panetone
+```
+
+Send a message between live Panetone routes:
+
+```sh
+panetone send --from ufopedia --to wakterm "Investigate the observer bug"
+```
+
+`SOURCE` and `TARGET` are exact, case-insensitive Wakterm tab titles currently
+registered by the running bridge. Panetone posts an audit message in the target
+Telegram topic, switches that target's output route to Telegram, submits the
+message through `wakterm cli agent send`, and prints a structured JSON receipt.
+
+Ordinary sends remain one-way. Add `--return-final` for durable asynchronous
+delegation:
+
+```sh
+panetone send --return-final --from ufopedia --to zola \
+  "Finish the migration review"
+```
+
+Panetone registers the source agent and Telegram route before submitting the
+prompt, then exits with `reply_pending: true`. Wakterm correlates the prompt to
+its exact target session and provider turn. When that turn reaches a terminal
+state, Panetone resumes from Wakterm's durable event stream and sends one
+correlated callback to the source agent and source Telegram topic. Neither the
+calling agent nor Panetone parses harness session files for this correlation.
+
+Every request has a UUID idempotency key. The CLI generates one by default and
+returns it in the response. Use `--id UUID` when retrying after a lost response.
+The same ID and content return the stored receipt without redelivery. Different
+content with the same ID returns `idempotency_conflict` during the 30-day
+completed-request retention window. Pending and indeterminate IDs do not expire.
+Panetone never retries a request left uncertain across a process failure.
+
+The Panetone control socket defaults to
+`$XDG_RUNTIME_DIR/panetone/control.sock`. It is separate from the Wakterm mux
+socket. Set `PANETONE_CONTROL_SOCKET` for both the bridge and CLI to override it.
+See [the control protocol](docs/control-protocol.md) for framing, state, failure,
+and permission details.
+
 ## Example
 
 See a [live collab session](https://wakamex.github.io/panetone/example/messages.html) where Claude and Codex built a repo together using Panetone — source at [wakamex/collab](https://github.com/wakamex/collab).
