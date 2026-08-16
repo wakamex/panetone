@@ -96,8 +96,12 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
         self.old_pending_state = bridge.PENDING_STATE
         self.old_primary_bot = bridge._primary_bot
         self.old_codex_harness = bridge.harnesses.get("codex")
+        self.old_return_supported = bridge._wakterm_return_supported
+        self.old_return_reason = bridge._wakterm_return_unavailable_reason
         bridge.STATE = Path(self.tmp.name) / "state.json"
         bridge.PENDING_STATE = Path(self.tmp.name) / "pending.json"
+        bridge._wakterm_return_supported = True
+        bridge._wakterm_return_unavailable_reason = None
         bridge._pending_sends.clear()
         bridge._source_cursors.clear()
         bridge.tg_name_topic.clear()
@@ -119,6 +123,8 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
         bridge.STATE = self.old_state
         bridge.PENDING_STATE = self.old_pending_state
         bridge._primary_bot = self.old_primary_bot
+        bridge._wakterm_return_supported = self.old_return_supported
+        bridge._wakterm_return_unavailable_reason = self.old_return_reason
         if self.old_codex_harness is None:
             bridge.harnesses.pop("codex", None)
         else:
@@ -550,6 +556,45 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(raised.exception.indeterminate)
         self.assertEqual(raised.exception.code, "telegram_audit_failed")
+        send.assert_not_awaited()
+
+    def test_wakterm_return_capability_probe_reports_unsupported_command(self):
+        result = SimpleNamespace(
+            returncode=2,
+            stdout="",
+            stderr="error: unrecognized subcommand 'request'\n\nUsage: wakterm cli agent",
+        )
+        with patch.object(bridge.subprocess, "run", return_value=result):
+            supported, reason = bridge._wakterm_return_capability_sync()
+
+        self.assertFalse(supported)
+        self.assertEqual(reason, "error: unrecognized subcommand 'request'")
+
+    async def test_return_final_fails_before_any_side_effect_when_unsupported(self):
+        bridge._wakterm_return_supported = False
+        bridge._wakterm_return_unavailable_reason = "unsupported command"
+        refresh = AsyncMock()
+        send = AsyncMock()
+        request = {
+            "id": "00000000-0000-4000-8000-000000000006",
+            "params": {
+                "from": "Source",
+                "to": "Target",
+                "message": "do work",
+                "return_final": True,
+            },
+        }
+
+        with (
+            patch.object(bridge, "_refresh_telegram_routes", refresh),
+            patch.object(bridge, "agent_send", send),
+            self.assertRaises(bridge.RequestFailure) as raised,
+        ):
+            await bridge._handle_control_send(request, AsyncMock())
+
+        self.assertEqual(raised.exception.code, "return_final_unavailable")
+        self.assertFalse(raised.exception.indeterminate)
+        refresh.assert_not_awaited()
         send.assert_not_awaited()
 
     async def test_return_final_registers_route_before_wakterm_submission(self):

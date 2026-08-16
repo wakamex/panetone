@@ -256,6 +256,26 @@ def _agent_send_sync(pid, text, *, return_final=False, request_id=None, timeout_
     return receipt
 
 
+def _wakterm_return_capability_sync():
+    """Probe return-request support once without creating a request."""
+    try:
+        result = subprocess.run(
+            [WAKTERM_BIN, "cli", "agent", "request", "watch", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "capability probe timed out"
+    except FileNotFoundError:
+        return False, f"Wakterm binary not found: {WAKTERM_BIN}"
+    if result.returncode == 0:
+        return True, None
+    detail = result.stderr.strip() or result.stdout.strip() or "unsupported command"
+    return False, detail.splitlines()[0]
+
+
 async def agent_send(pid, text, **kwargs):
     return await asyncio.to_thread(_agent_send_sync, pid, text, **kwargs)
 
@@ -2976,10 +2996,16 @@ async def _control_success_annotation(
 async def _handle_control_send(request, transition, journal=None):
     params = request["params"]
     request_id = request["id"]
+    return_final = params.get("return_final", False)
+    if return_final and not _wakterm_return_supported:
+        raise RequestFailure(
+            "return_final_unavailable",
+            "Wakterm does not support durable return requests; no delivery was attempted",
+            details={"reason": _wakterm_return_unavailable_reason},
+        )
     await _refresh_telegram_routes()
     source = _control_route(params["from"])
     target = _control_route(params["to"])
-    return_final = params.get("return_final", False)
     source_harness = harnesses.get(source["harness"])
     bot = source_harness.bot if source_harness else _primary_bot
     if not bot:
@@ -3277,6 +3303,7 @@ async def _handle_wakterm_return_event(result, journal):
 
 
 async def _wakterm_return_watch_loop(journal):
+    retry_delay = 2
     while True:
         cursor = await asyncio.to_thread(journal.event_cursor)
         process = None
@@ -3295,18 +3322,35 @@ async def _wakterm_return_watch_loop(journal):
             while line := await process.stdout.readline():
                 result = json.loads(line)
                 await _handle_wakterm_return_event(result, journal)
+                retry_delay = 2
             stderr = (await process.stderr.read()).decode(errors="replace").strip()
             await process.wait()
-            if stderr:
-                print(f"[control] Wakterm return stream closed: {stderr}")
+            supported, reason = await asyncio.to_thread(
+                _wakterm_return_capability_sync
+            )
+            if not supported:
+                print(
+                    "[control] Wakterm return capability became unavailable; "
+                    f"watcher disabled until restart: {reason}"
+                )
+                return
+            detail = stderr or f"exit status {process.returncode}"
+            print(
+                f"[control] Wakterm return stream closed: {detail}; "
+                f"retrying in {retry_delay}s"
+            )
         except asyncio.CancelledError:
             if process is not None and process.returncode is None:
                 process.terminate()
                 await process.wait()
             raise
         except Exception as error:
-            print(f"[control] Wakterm return stream error: {error}")
-        await asyncio.sleep(2)
+            print(
+                f"[control] Wakterm return stream error: {error}; "
+                f"retrying in {retry_delay}s"
+            )
+        await asyncio.sleep(retry_delay)
+        retry_delay = min(retry_delay * 2, 300)
 
 
 async def _pending_return_delivery_loop(journal):
@@ -3323,26 +3367,27 @@ async def _pending_return_delivery_loop(journal):
 # --- lifecycle -------------------------------------------------------------
 
 _return_delivery_lock = None
-_script_path = Path(__file__).resolve()
-_script_mtime = _script_path.stat().st_mtime
+_wakterm_return_supported = False
+_wakterm_return_unavailable_reason = "capability has not been checked"
+_background_tasks = set()
+
+
+def _start_background_task(coro, name):
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+
+    def finished(done):
+        _background_tasks.discard(done)
+        if not done.cancelled() and (error := done.exception()) is not None:
+            print(f"[task] {done.get_name()} stopped unexpectedly: {error}")
+
+    task.add_done_callback(finished)
+    return task
 
 
 async def poll_loop():
-    global _script_mtime
     while True:
         try:
-            # hot reload: re-exec if bridge.py changed on disk
-            mt = _script_path.stat().st_mtime
-            if mt != _script_mtime:
-                print("bridge.py changed, reloading...")
-                _script_mtime = mt  # update first so a failed execv can't loop
-                _persist()
-                # re-exec through uv (not sys.executable): under `uv run
-                # --script` sys.executable is an ephemeral venv python that
-                # may have been garbage-collected, making execv raise ENOENT.
-                _uv = shutil.which("uv") or str(Path.home() / ".local/bin/uv")
-                os.execv(_uv, [_uv, "run", str(_script_path)])
-
             matched, unmatched = await _refresh_telegram_routes()
             if SIGNAL_ENABLED:
                 await sync_signal_groups(matched, unmatched)
@@ -3358,6 +3403,7 @@ async def poll_loop():
 
 async def startup(app: Application):
     global _primary_bot, _control_server, _return_delivery_lock
+    global _wakterm_return_supported, _wakterm_return_unavailable_reason
     _init_harnesses()
     _signal_db_init()
     _primary_bot = harnesses["claude"].bot
@@ -3431,7 +3477,7 @@ async def startup(app: Application):
             print("[signal] profile set to Debater")
         except Exception as e:
             print(f"[signal] profile set error: {e}")
-        asyncio.create_task(_signal_receive_task())
+        _start_background_task(_signal_receive_task(), "signal-receive")
 
     if SLACK_ENABLED:
         from slack_sdk.web.async_client import AsyncWebClient
@@ -3442,7 +3488,7 @@ async def startup(app: Application):
             _slack_bot_user_id = auth["bot_id"]
         except Exception as e:
             print(f"[slack] auth_test failed: {e}")
-        asyncio.create_task(_slack_receive_task())
+        _start_background_task(_slack_receive_task(), "slack-receive")
 
     matched, unmatched = await _refresh_telegram_routes()
     # Resolve routes before reading sources. Durable cursors resume exactly;
@@ -3478,9 +3524,24 @@ async def startup(app: Application):
     await _control_server.start()
     print(f"[control] listening on {CONTROL_SOCKET}")
 
-    asyncio.create_task(_wakterm_return_watch_loop(journal))
-    asyncio.create_task(_pending_return_delivery_loop(journal))
-    asyncio.create_task(poll_loop())
+    (
+        _wakterm_return_supported,
+        _wakterm_return_unavailable_reason,
+    ) = await asyncio.to_thread(_wakterm_return_capability_sync)
+    if _wakterm_return_supported:
+        print("[control] Wakterm durable return requests enabled")
+        _start_background_task(
+            _wakterm_return_watch_loop(journal), "wakterm-return-watch"
+        )
+    else:
+        print(
+            "[control] Wakterm durable return requests unavailable; "
+            f"--return-final disabled: {_wakterm_return_unavailable_reason}"
+        )
+    _start_background_task(
+        _pending_return_delivery_loop(journal), "pending-return-delivery"
+    )
+    _start_background_task(poll_loop(), "poll")
 
 
 async def shutdown(_app: Application):
@@ -3488,6 +3549,12 @@ async def shutdown(_app: Application):
     if _control_server:
         await _control_server.close()
         _control_server = None
+    tasks = list(_background_tasks)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _background_tasks.clear()
 
 
 def main():
