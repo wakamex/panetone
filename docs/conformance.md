@@ -53,3 +53,26 @@ Route and channel fixtures freeze title resolution, destination selection, text 
 A Wakterm output shadow run replaces every outbound effect with a recording sink and compares ordered user-visible projections. Differences must be classified as equivalent formatting, an intended change, a Python reader defect, a Wakterm Agent API defect, or indeterminate correlation.
 
 Shadow output is discovery evidence. It cannot authorize a production provider cutover. Promotion requires a separate live gate with one active delivery owner, a persisted cutover watermark, no output gap, and no dual delivery.
+
+`tests/run_codex_shadow.py` performs the Codex comparison without submitting a
+prompt or invoking a messaging adapter. Capture both tail baselines while the
+target is idle:
+
+```sh
+uv run --script tests/run_codex_shadow.py baseline wakterm_codex \
+  --cwd /code/wakterm --state /tmp/panetone-codex-shadow.json
+```
+
+After a separately submitted target turn is complete, compare everything since
+that baseline:
+
+```sh
+uv run --script tests/run_codex_shadow.py compare \
+  --state /tmp/panetone-codex-shadow.json
+```
+
+The state file is created with mode `0600` and cannot be overwritten. A source
+replacement, invalid cursor, session change, unknown event kind, or agent change
+returns `indeterminate` with classification `correlation_gap`. Unequal ordered
+message projections return `difference` with classification `unexplained`.
+Only an exact ordered match satisfies the Phase 1 discovery check.
