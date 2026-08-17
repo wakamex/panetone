@@ -2993,6 +2993,18 @@ async def _control_success_annotation(
             }
 
 
+def _control_prompt_envelope(request_id, source, target, message, return_final):
+    reply_mode = "asynchronous final callback" if return_final else "one-way"
+    return (
+        "[Panetone cross-agent message]\n"
+        f"From route: {source['title']} ({source['harness']})\n"
+        f"To route: {target['title']} ({target['harness']})\n"
+        f"Request ID: {request_id}\n"
+        f"Reply mode: {reply_mode}\n\n"
+        f"{message}"
+    )
+
+
 async def _handle_control_send(request, transition, journal=None):
     params = request["params"]
     request_id = request["id"]
@@ -3006,6 +3018,13 @@ async def _handle_control_send(request, transition, journal=None):
     await _refresh_telegram_routes()
     source = _control_route(params["from"])
     target = _control_route(params["to"])
+    delivered_prompt = _control_prompt_envelope(
+        request_id,
+        source,
+        target,
+        params["message"],
+        return_final,
+    )
     source_harness = harnesses.get(source["harness"])
     bot = source_harness.bot if source_harness else _primary_bot
     if not bot:
@@ -3122,13 +3141,13 @@ async def _handle_control_send(request, transition, journal=None):
         if return_final:
             wakterm_receipt = await agent_send(
                 target["pane_id"],
-                params["message"],
+                delivered_prompt,
                 return_final=True,
                 request_id=request_id,
                 timeout_ms=params.get("timeout_ms", 0),
             )
         else:
-            wakterm_receipt = await agent_send(target["pane_id"], params["message"])
+            wakterm_receipt = await agent_send(target["pane_id"], delivered_prompt)
     except Exception as error:
         annotation = await _control_failure_annotation(
             bot,

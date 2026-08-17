@@ -53,6 +53,23 @@ The ID is both the correlation identifier and the idempotency key. Omitting
 route before submitting the same ID to Wakterm. `timeout_ms` is optional and
 applies asynchronously. Zero disables the deadline.
 
+The Telegram audit contains the original message. The prompt submitted to
+Wakterm adds this deterministic envelope:
+
+```text
+[Panetone cross-agent message]
+From route: ufopedia (codex)
+To route: wakterm (codex)
+Request ID: fe57dc90-994e-4e73-b09c-fac483d9f05b
+Reply mode: asynchronous final callback
+
+Investigate the observer bug
+```
+
+The envelope gives the target the resolved logical routes and correlation ID.
+Because local same-UID clients may choose `--from`, it is routing attribution,
+not cryptographic authentication of the calling pane.
+
 ## Successful response
 
 ```json
@@ -126,8 +143,9 @@ Panetone performs these steps:
 4. Persist the Telegram receipt as `audit_posted`.
 5. Switch the target's response route to Telegram.
 6. Persist `delivering` before invoking Wakterm.
-7. For return mode, persist the source return route and run `wakterm cli agent
-   send --return-final --request-id UUID` outside the asyncio event loop.
+7. Add the Panetone source, target, request, and reply-mode envelope. For return
+   mode, persist the source return route and run `wakterm cli agent send
+   --return-final --request-id UUID` outside the asyncio event loop.
 8. Edit the audit to `[submitted]`, or add a linked submitted marker if editing
    fails.
 9. Store the registration response.

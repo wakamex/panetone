@@ -499,6 +499,15 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
             "Request: 00000000-0000-4000-8000-000000000001 [pending]\n"
             "do work",
         )
+        self.assertEqual(
+            order[1][1],
+            "[Panetone cross-agent message]\n"
+            "From route: Source (codex)\n"
+            "To route: Target (codex)\n"
+            "Request ID: 00000000-0000-4000-8000-000000000001\n"
+            "Reply mode: one-way\n\n"
+            "do work",
+        )
         self.assertEqual([state for state, _ in transitions], ["audit_posted", "delivering"])
         self.assertEqual(bridge.tab_last_source[2], "tg")
         self.assertEqual(result["reply_mode"], "one_way")
@@ -616,6 +625,15 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
         async def agent_send(pid, text, **kwargs):
             order.append(("wakterm", text))
             self.assertEqual(pid, 22)
+            self.assertEqual(
+                text,
+                "[Panetone cross-agent message]\n"
+                "From route: Source (codex)\n"
+                "To route: Target (codex)\n"
+                "Request ID: 00000000-0000-4000-8000-000000000004\n"
+                "Reply mode: asynchronous final callback\n\n"
+                "do work",
+            )
             self.assertTrue(kwargs["return_final"])
             self.assertEqual(
                 kwargs["request_id"], "00000000-0000-4000-8000-000000000004"

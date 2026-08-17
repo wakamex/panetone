@@ -119,6 +119,10 @@ panetone send --from ufopedia --to wakterm "Investigate the observer bug"
 registered by the running bridge. Panetone posts an audit message in the target
 Telegram topic, switches that target's output route to Telegram, submits the
 message through `wakterm cli agent send`, and prints a structured JSON receipt.
+The prompt delivered to the target includes a Panetone envelope with the
+resolved source and target routes, harnesses, request ID, and reply mode. This
+lets the target distinguish routed work from direct user input. The source is a
+locally asserted route, not cryptographic authentication of the calling pane.
 
 Ordinary sends remain one-way. When the running Panetone bridge reports that
 Wakterm supports durable agent requests, add `--return-final` for durable
