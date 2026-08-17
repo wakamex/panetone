@@ -142,7 +142,31 @@ The following are not parity failures when backed by their migration or compatib
 - [x] Provider and routing fixtures reproduce current normalized observations.
 - [x] A black-box harness runs the same control cases against a replaceable backend command.
 - [x] Wakterm Agent API fixtures cover capability, catalog, receipt, events, cursor gaps, retention, lifecycle, and classified errors. Panetone consumes Wakterm's file directly in `tests/test_wakterm_agent_api.py`.
-- [ ] Independent protocol review has no unresolved material finding.
+- [x] Independent protocol review has no unresolved material finding. The closure and proportionate deferrals are recorded below.
 - [x] Codex recording-sink shadow comparison has zero unexplained normalized differences. See `docs/phase1-codex-shadow-report.md`.
 
 The shadow comparison is discovery evidence. It cannot be cited as production cutover evidence.
+
+## Independent review closure
+
+The bounded cross-repository review completed on 2026-08-17 with no unresolved
+material finding. The review verified these corrections:
+
+- Wakterm bounds oversized Codex records and makes terminal turns with missing
+  prompt identity explicitly indeterminate.
+- Wakterm observer and SQLite admission work stays off the mux reactor.
+- Panetone persists exact source and target agent incarnations, brackets route
+  refresh with stable catalog snapshots, and uses exact-identity admission for
+  both the initial return request and its callback.
+- A busy callback source remains durably pending with the same request ID and
+  exact text. Indeterminate admission is never retried.
+- Missing or replaced agents receive structured definitive admission results.
+  Pending, failed, and indeterminate callback results are not pruned.
+- Route provenance and lifecycle cases are covered, and Panetone consumes the
+  Wakterm-owned Agent API fixture directly.
+- Live capabilities do not advertise `event_stream.v1`; the Codex shadow is
+  discovery evidence only.
+
+The durable busy-target queue remains an intended Rust target-profile semantic.
+The temporary Python backend reports a definitive no-write target rejection
+instead of partially implementing that queue.
