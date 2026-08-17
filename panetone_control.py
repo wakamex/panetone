@@ -281,8 +281,8 @@ class ControlJournal:
                     SELECT request_id FROM control_request
                     WHERE state IN ('succeeded', 'failed') AND updated_at < ?
                 )
-                  AND agent_state IN ('delivered', 'indeterminate')
-                  AND telegram_state IN ('delivered', 'indeterminate')
+                  AND agent_state = 'delivered'
+                  AND telegram_state = 'delivered'
                 """,
                 (cutoff,),
             )

@@ -237,10 +237,12 @@ to Telegram or Wakterm again. Reusing it with different content returns
 returns `request_indeterminate`; it is not replayed.
 
 Completed `succeeded` and `failed` UUIDs expire 30 days after their last update.
+For return mode, expiry requires both callback destinations to be delivered.
 After expiry, reusing that UUID is a new request and can deliver again. Pruning
 never removes `in_progress`, `audit_posted`, `delivering`, or `indeterminate`
-records. These safety records remain durable even if their retention causes the
-journal to reach its size bound.
+control records, or return rows with a pending, failed, or indeterminate
+destination. These safety records remain durable even if their retention causes
+the journal to reach its size bound.
 
 The CLI does not retry automatically. If the connection is lost, use the UUID
 shown by the CLI with `--id` and the exact same request. A cached result is safe
