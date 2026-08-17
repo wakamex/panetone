@@ -14,14 +14,15 @@ dev/phase5b-wakterm-preflight
 ```
 
 The script requires exact Wakterm commit
-`5486543a664135807e97051bbd90e8573be369cb`. It includes the rebased Agent API
-and provider event series, the notification-backlog disconnect fix, and the
-tab-focus suppression fix. The script builds the debug Wakterm CLI and mux from
-a disposable detached worktree, so a newer or locally dirty main
-checkout cannot change the candidate. It starts a fresh mux with private runtime
-and state roots, verifies the v1 capability, catalog, and event-page contracts,
-and runs Panetone's real CLI adapter test. It saves mode-`0600` JSON evidence
-below `.dev/evidence/`, then removes the worktree and disposable mux state.
+`cd0a9225c5a9f60fccde69796f8f0c52fa47ba4b`. It includes the rebased Agent API
+and provider event series, notification and focus fixes, the signal wakeup for
+bounded graceful shutdown, and the reviewed system-service procedure. The
+script builds the debug Wakterm CLI and mux from a disposable detached
+worktree, so a newer or locally dirty main checkout cannot change the
+candidate. It starts a fresh mux with private runtime and state roots, verifies
+the v1 capability, catalog, and event-page contracts, and runs Panetone's real
+CLI adapter test. It saves mode-`0600` JSON evidence below `.dev/evidence/`,
+then removes the worktree and disposable mux state.
 Third-party build artifacts are reused from the ignored private
 `.dev/wakterm-target/` cache, but mux state and observer cursors are never
 reused.
@@ -51,10 +52,12 @@ pane is not a restored Codex, Claude, Gemini, or OpenCode session.
 
 The target Rust Panetone unit instead requires a system Wakterm service, a
 system-labelled `/usr/local/bin/wakterm`, and `/run/wakterm/sock`. The
-development launcher cannot satisfy that gate. Wakterm's `install.sh --system`
-installs binaries but does not by itself create the required system unit or
-restore agents. Do not combine an improvised manager migration with the
-Panetone cutover.
+development launcher cannot satisfy that gate. Candidate `cd0a9225c` provides
+`install-system-service.sh`, its system unit and single-socket configuration,
+and `docs/system-service-maintenance.md`. They passed isolated fake-root apply
+and rollback, but have not touched the real system manager. The procedure does
+not restore agent harnesses. Keep the reviewed Wakterm maintenance separate
+from the later Panetone cutover.
 
 ## Production deployment readiness
 
@@ -62,11 +65,10 @@ Before authorizing a Wakterm production restart:
 
 1. Save the passing preflight evidence and verify its Wakterm commit, binary
    hashes, capability set, Panetone commit, and `production_effects: false`.
-2. Choose and review the Wakterm-owned system-service installation procedure.
-   It must install exact release binaries, use `/run/wakterm/sock`, run as
-   `mihai`, preserve restrictive state permissions, and provide binary and unit
-   rollback. If that procedure does not exist, production deployment is
-   blocked.
+2. Review the Wakterm-owned `install-system-service.sh` and
+   `docs/system-service-maintenance.md` from the exact candidate. Confirm their
+   release binaries, `/run/wakterm/sock`, `mihai` ownership, restrictive state
+   permissions, and binary and unit rollback match the saved evidence.
 3. Inventory every live agent route from the production pane list and Agent API
    catalog. For each agent, record the route, harness, working directory,
    provider session identity, and an already tested exact resume command. Do

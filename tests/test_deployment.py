@@ -80,7 +80,7 @@ class DeploymentContractTests(unittest.TestCase):
     def test_wakterm_preflight_is_pinned_and_production_isolated(self):
         script = (ROOT / "dev" / "phase5b-wakterm-preflight").read_text()
 
-        self.assertIn("5486543a664135807e97051bbd90e8573be369cb", script)
+        self.assertIn("cd0a9225c5a9f60fccde69796f8f0c52fa47ba4b", script)
         self.assertIn("worktree add --detach", script)
         self.assertIn("PANETONE_WAKTERM_SOURCE", script)
         self.assertIn("CARGO_TARGET_DIR", script)
