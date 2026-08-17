@@ -794,7 +794,6 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
                 "to": "Target",
                 "message": "do work",
                 "return_final": True,
-                "timeout_ms": 5000,
             },
         }
         with (

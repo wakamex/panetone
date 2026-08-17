@@ -56,6 +56,14 @@ impl ConformanceService {
 
     async fn send(&self, request: ControlRequest, params: SendParams) -> ControlResponse {
         let id = request.id;
+        if params.timeout_ms != 0 {
+            return error_response(
+                id,
+                "invalid_params",
+                "asynchronous final callbacks do not expire; params.timeout_ms must be zero",
+                None,
+            );
+        }
         let command = params.into_command(id);
         let claim = self
             .store

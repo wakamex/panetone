@@ -81,6 +81,11 @@ queued with the same Wakterm request ID and exact bytes until admission is
 safe. An uncertain admission becomes indeterminate and is never silently
 retried.
 
+Return-final registration has no workflow deadline. Panetone always requests a
+zero Wakterm final timeout, so a long target turn remains durably pending.
+Per-operation adapter deadlines remain bounded and classify acknowledgement
+loss, but they never expire a successfully registered callback.
+
 General assistant output, migrated pending output, and callback mirrors use the
 same durable outbox. Remote channel delivery is at least once across the narrow
 acknowledgement-to-checkpoint crash window. Prompt and callback admission are

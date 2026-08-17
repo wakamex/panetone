@@ -42,8 +42,7 @@ newline-terminated JSON response. Requests are limited to 256 KiB.
     "from": "ufopedia",
     "to": "wakterm",
     "message": "Investigate the observer bug",
-    "return_final": true,
-    "timeout_ms": 3600000
+    "return_final": true
   }
 }
 ```
@@ -54,8 +53,16 @@ The ID is both the correlation identifier and the idempotency key. Omitting
 Wakterm Agent API catalog entry, then durably registers the source agent ID,
 process incarnation, and Telegram route before submitting the same ID to
 Wakterm. The pane ID is only an ephemeral join key. Agent ID plus incarnation
-ID identify later callback admission. `timeout_ms` is optional and applies
-asynchronously. Zero disables the deadline.
+ID identify later callback admission.
+
+Asynchronous final callbacks have no elapsed-time deadline. They remain pending
+through arbitrarily long target turns until Wakterm reports a correlated
+terminal result or a concrete lifecycle or observer failure makes the result
+indeterminate. Panetone always submits a zero Wakterm final timeout. For
+compatibility, control v1 accepts an omitted `timeout_ms` or the value zero, but
+rejects a nonzero value with `invalid_params`. Bounded network and subprocess
+deadlines still apply to each individual acknowledgement operation. They do not
+expire the durable callback workflow.
 
 The Telegram audit contains the original message. The prompt submitted to
 Wakterm adds this deterministic envelope:

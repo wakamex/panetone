@@ -134,8 +134,6 @@ struct SendArgs {
     id: Option<Uuid>,
     #[arg(long)]
     return_final: bool,
-    #[arg(long, default_value_t = 0)]
-    timeout_ms: u64,
     #[arg(long, env = "PANETONE_CONTROL_SOCKET")]
     socket: PathBuf,
     message: String,
@@ -697,7 +695,7 @@ async fn run_send(args: SendArgs) -> Result<()> {
         target: args.target,
         message: args.message,
         return_final: args.return_final,
-        timeout_ms: args.timeout_ms,
+        timeout_ms: 0,
     };
     let response = request(
         &args.socket,

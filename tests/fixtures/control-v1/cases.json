@@ -218,7 +218,7 @@
           "to": "target",
           "message": "callback",
           "return_final": true,
-          "timeout_ms": 60000
+          "timeout_ms": 0
         }
       },
       "expected": {
@@ -231,6 +231,31 @@
         }
       },
       "expected_effects": 1
+    },
+    {
+      "name": "return_deadline_is_rejected",
+      "request": {
+        "schema": "panetone.control.v1",
+        "id": "77777777-7777-4777-8777-777777777777",
+        "method": "send",
+        "params": {
+          "from": "source",
+          "to": "target",
+          "message": "do not expire this callback",
+          "return_final": true,
+          "timeout_ms": 60000
+        }
+      },
+      "expected": {
+        "schema": "panetone.control.v1",
+        "id": "77777777-7777-4777-8777-777777777777",
+        "ok": false,
+        "error": {
+          "code": "invalid_params",
+          "message": "asynchronous final callbacks do not expire; params.timeout_ms must be zero"
+        }
+      },
+      "expected_effects": 0
     },
     {
       "name": "busy_target_admission",

@@ -65,19 +65,8 @@ def main(argv=None):
         action="store_true",
         help="asynchronously route the target turn's final response back to the source",
     )
-    send.add_argument(
-        "--timeout-ms",
-        type=int,
-        default=0,
-        help="asynchronous final-response deadline in milliseconds",
-    )
     send.add_argument("message", help="message to send")
     args = parser.parse_args(argv)
-
-    if args.timeout_ms < 0:
-        parser.error("--timeout-ms must be non-negative")
-    if args.timeout_ms and not args.return_final:
-        parser.error("--timeout-ms requires --return-final")
 
     try:
         request_id = str(uuid.UUID(args.id)) if args.id else str(uuid.uuid4())
@@ -92,7 +81,6 @@ def main(argv=None):
             "to": args.target,
             "message": args.message,
             "return_final": args.return_final,
-            "timeout_ms": args.timeout_ms,
         },
     }
     path = Path(os.environ.get("PANETONE_CONTROL_SOCKET", default_socket_path()))

@@ -137,9 +137,11 @@ def parse_request(data):
         raise ProtocolError(
             "invalid_params", "params.timeout_ms must be a non-negative integer", request_id
         )
-    if timeout_ms and not return_final:
+    if timeout_ms:
         raise ProtocolError(
-            "invalid_params", "params.timeout_ms requires return_final", request_id
+            "invalid_params",
+            "asynchronous final callbacks do not expire; params.timeout_ms must be zero",
+            request_id,
         )
 
     normalized_params = {"from": source, "to": target, "message": message}

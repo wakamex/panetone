@@ -425,7 +425,10 @@ class ControlServerTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_cli_receives_structured_acknowledgement(self):
+        observed = {}
+
         async def handler(request, _transition):
+            observed.update(request["params"])
             return {"echo": request["params"]["message"], "reply_mode": "one_way"}
 
         await self._start(handler)
@@ -454,6 +457,7 @@ class ControlServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response["ok"])
         self.assertEqual(response["result"]["echo"], "hello")
         self.assertEqual(response["result"]["reply_mode"], "one_way")
+        self.assertNotIn("timeout_ms", observed)
 
     def test_protocol_normalizes_uuid_and_preserves_one_way_params(self):
         request = make_request()
@@ -473,6 +477,16 @@ class ControlServerTests(unittest.IsolatedAsyncioTestCase):
             ):
                 parse_request(json.dumps(request).encode())
             self.assertEqual(raised.exception.code, "invalid_params")
+
+    def test_protocol_rejects_async_callback_deadlines(self):
+        request = make_request()
+        request["params"].update({"return_final": True, "timeout_ms": 60_000})
+
+        with self.assertRaises(ProtocolError) as raised:
+            parse_request(json.dumps(request).encode())
+
+        self.assertEqual(raised.exception.code, "invalid_params")
+        self.assertIn("do not expire", str(raised.exception))
 
 
 if __name__ == "__main__":

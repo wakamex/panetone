@@ -431,6 +431,14 @@ impl ProductionService {
 
     async fn handle_send(&self, request: ControlRequest, params: SendParams) -> ControlResponse {
         let id = request.id;
+        if params.timeout_ms != 0 {
+            return error_response(
+                id,
+                "invalid_params",
+                "asynchronous final callbacks do not expire; params.timeout_ms must be zero",
+                None,
+            );
+        }
         if params.source.is_empty() || params.target.is_empty() || params.message.is_empty() {
             return error_response(
                 id,
