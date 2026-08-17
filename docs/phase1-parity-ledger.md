@@ -143,6 +143,6 @@ The following are not parity failures when backed by their migration or compatib
 - [x] A black-box harness runs the same control cases against a replaceable backend command.
 - [ ] Wakterm Agent API fixtures cover capability, catalog, receipt, events, cursor gaps, retention, lifecycle, and classified errors.
 - [ ] Independent protocol review has no unresolved material finding.
-- [ ] Codex recording-sink shadow comparison has zero unexplained normalized differences.
+- [x] Codex recording-sink shadow comparison has zero unexplained normalized differences. See `docs/phase1-codex-shadow-report.md`.
 
 The shadow comparison is discovery evidence. It cannot be cited as production cutover evidence.
