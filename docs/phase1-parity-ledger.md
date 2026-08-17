@@ -25,6 +25,7 @@ This ledger freezes observable Python behavior for conformance work. It separate
 | Audit ordering | Write a visible target-topic audit and durably checkpoint its IDs before attempting the Wakterm prompt | Preserve | `tests/test_bridge.py` |
 | Audit failure | Fail closed. If an audit is partial or a later prompt step fails, reply to it or edit it with an unmistakable failure marker | Preserve | `tests/test_bridge.py` |
 | Prompt delivery | Wakterm agent submission is async-safe. Possible acceptance without a receipt is indeterminate and is not retried | Preserve through an authoritative Wakterm receipt | `tests/test_bridge.py` and Agent API fixtures |
+| Busy target | Wakterm currently refuses the request after the audit, and Panetone reports an indeterminate failure | Replace with durable `awaiting_target_idle`, immediate queued acknowledgement, and later at-most-once submission | ADR 0005 and future queue fixtures |
 | Success result | Structured acknowledgement includes resolved source and target, Telegram audit, Wakterm receipt, reply mode, and pending flag | Preserve control v1 fields | Control fixtures |
 | One-way result | Default send does not route the target's response back to the source | Preserve | Protocol documentation |
 | Explicit report-back | Target may run a second one-way send to the original source when it decides work is complete | Preserve as a documented workflow, not a special protocol | Protocol documentation |

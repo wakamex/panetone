@@ -28,6 +28,8 @@ Delivery policies are:
 
 Every durable destination has its own status, attempts, last error, timestamp, and external receipt where available. One destination cannot overwrite another destination's diagnostic.
 
+A definitively busy target is not a failed or indeterminate prompt. It enters the durable `awaiting_target_idle` state described in ADR 0005. Panetone submits it only after authoritative idle admission and route revalidation.
+
 ## Consequences
 
 The existing Python hash distinguishes omitted defaults from explicit defaults. The conformance suite records both current behavior and the intended normalized behavior. Production compatibility must be handled deliberately before changing hashes for journal entries that already exist.
