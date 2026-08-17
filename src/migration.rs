@@ -381,6 +381,11 @@ fn import_routes(
             let topic = topic.as_i64().ok_or_else(|| {
                 MigrationError::Malformed(format!("telegram topic for {title:?} is not an integer"))
             })?;
+            if topic <= 0 {
+                return Err(MigrationError::Malformed(format!(
+                    "telegram topic for {title:?} is not positive"
+                )));
+            }
             add_route_channel(
                 &mut builders,
                 title,
@@ -390,6 +395,17 @@ fn import_routes(
     }
 
     let legacy_names = optional_object(state, "signal_group_names")?;
+    if let Some(names) = legacy_names {
+        for (tab_id, title) in names {
+            if tab_id.parse::<i64>().is_err()
+                || title.as_str().is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(MigrationError::Malformed(
+                    "signal_group_names must map numeric tab IDs to titles".into(),
+                ));
+            }
+        }
+    }
     if let Some(groups) = optional_object(state, "signal_groups")? {
         for (key, group) in groups {
             let group = group.as_str().ok_or_else(|| {
@@ -493,9 +509,30 @@ fn import_routes(
         &serde_json::to_string(&muted_routes)?,
     )?;
 
+    let collab = optional_object(state, "collab")?;
+    if let Some(collab) = collab {
+        for (tab_id, rounds) in collab {
+            if tab_id.parse::<i64>().is_err() || rounds.as_u64().is_none() {
+                return Err(MigrationError::Malformed(
+                    "collab must map numeric tab IDs to non-negative rounds".into(),
+                ));
+            }
+        }
+    }
+    let clod_off = optional_array(state, "clod_off")?;
+    if clod_off.is_some_and(|items| {
+        items.iter().any(|item| {
+            item.as_str()
+                .is_none_or(|tab_id| tab_id.parse::<i64>().is_err())
+        })
+    }) {
+        return Err(MigrationError::Malformed(
+            "clod_off must contain numeric tab IDs encoded as strings".into(),
+        ));
+    }
     let unresolved = json!({
-        "collab": state.get("collab").cloned().unwrap_or_else(|| json!({})),
-        "clod_off": state.get("clod_off").cloned().unwrap_or_else(|| json!([])),
+        "collab": collab.cloned().unwrap_or_default(),
+        "clod_off": clod_off.cloned().unwrap_or_default(),
         "signal_group_names": state.get("signal_group_names").cloned().unwrap_or_else(|| json!({})),
     });
     insert_metadata(
@@ -584,14 +621,23 @@ fn import_pending(
     let cursors = pending
         .get("cursors")
         .ok_or_else(|| MigrationError::Malformed("pending cursor map is missing".into()))?;
-    object(cursors, "pending cursors")?;
+    let cursor_map = object(cursors, "pending cursors")?;
+    if cursor_map.values().any(|cursor| !cursor.is_object()) {
+        return Err(MigrationError::Malformed(
+            "pending cursor values must be objects".into(),
+        ));
+    }
     insert_metadata(
         transaction,
         "legacy_provider_cursors_rollback_only",
         &serde_json::to_string(cursors)?,
     )?;
 
-    let saved_at = pending.get("saved_at").and_then(Value::as_i64).unwrap_or(0);
+    let saved_at = pending
+        .get("saved_at")
+        .and_then(Value::as_i64)
+        .filter(|value| *value >= 0)
+        .ok_or_else(|| MigrationError::Malformed("pending saved_at is invalid".into()))?;
     let items = pending
         .get("items")
         .and_then(Value::as_array)
@@ -628,6 +674,10 @@ fn import_pending(
             .get("route_title")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        item.get("pane_id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| MigrationError::Malformed("pending pane_id is invalid".into()))?;
+        required_string(item, "harness", "pending item")?;
         let route_id = resolve_pending_route(kind, &destination, route_title, routes)?;
         if route_id.is_none() && matches!(kind, ChannelKind::Telegram | ChannelKind::Signal) {
             warnings.insert(format!(
@@ -750,6 +800,12 @@ fn import_signal(
         while let Some(row) = rows.next()? {
             let id: i64 = row.get(0)?;
             let group_id: String = row.get(1)?;
+            let group_id = normalize_signal_group_id(Some(&group_id));
+            if group_id.is_empty() {
+                return Err(MigrationError::Malformed(format!(
+                    "Signal row {id} has an empty group ID"
+                )));
+            }
             let timestamp: Option<i64> = row.get(2)?;
             let received_at: i64 = row.get(3)?;
             let sender_id: String = row.get(4)?;
@@ -870,10 +926,32 @@ fn import_signal(
                 transaction.execute(
                     "INSERT INTO signal_messages(
                          legacy_id, group_id, state, record_json, received_at_ms
-                     ) VALUES (?1, ?2, 'archived', ?3, 0)",
+                     ) VALUES (?1, ?2, 'pending', ?3, 0)",
                     params![legacy_id, group_id, serde_json::to_string(&raw)?],
                 )?;
                 counts.messages += 1;
+                let external_id = format!("legacy-json:{group_id}:{index}");
+                let inbox = InboxItem {
+                    id: stable_effect_id("python-signal-inbox", &external_id),
+                    channel: ChannelKind::Signal,
+                    external_id,
+                    destination: group_id.clone(),
+                    sender: None,
+                    body: message.to_owned(),
+                    state: "pending".into(),
+                    created_at_ms: 0,
+                };
+                transaction.execute(
+                    "INSERT INTO inbox(
+                         effect_id, channel, external_id, state, record_json, created_at_ms
+                     ) VALUES (?1, 'signal', ?2, 'pending', ?3, 0)",
+                    params![
+                        inbox.id.to_string(),
+                        inbox.external_id,
+                        serde_json::to_string(&inbox)?,
+                    ],
+                )?;
+                counts.pending_inbox += 1;
             }
         }
     }
@@ -935,11 +1013,20 @@ fn import_control(
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
         let request_id: String = row.get(0)?;
-        Uuid::parse_str(&request_id).map_err(|_| {
+        let parsed_request_id = Uuid::parse_str(&request_id).map_err(|_| {
             MigrationError::Malformed(format!("control request ID {request_id:?} is not a UUID"))
         })?;
+        if parsed_request_id.to_string() != request_id {
+            return Err(MigrationError::Malformed(format!(
+                "control request ID {request_id:?} is not canonical"
+            )));
+        }
         let request_hash: String = row.get(1)?;
-        if request_hash.len() != 64 || !request_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if request_hash.len() != 64
+            || !request_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
             return Err(MigrationError::Malformed(format!(
                 "control request {request_id} has an invalid hash"
             )));
@@ -977,6 +1064,20 @@ fn import_control(
         )?;
         let created_at = seconds_to_millis(row.get::<_, f64>(7)?)?;
         let updated_at = seconds_to_millis(row.get::<_, f64>(8)?)?;
+        if updated_at < created_at {
+            return Err(MigrationError::Malformed(format!(
+                "control request {request_id} was updated before it was created"
+            )));
+        }
+        if matches!(
+            legacy_state.as_str(),
+            "succeeded" | "failed" | "indeterminate"
+        ) && response_json.is_none()
+        {
+            return Err(MigrationError::Malformed(format!(
+                "terminal control request {request_id} has no response"
+            )));
+        }
         let state = if matches!(
             legacy_state.as_str(),
             "in_progress" | "audit_posted" | "delivering"
@@ -1054,8 +1155,13 @@ fn import_control(
         }
         let source_json: String = row.get(1)?;
         let target_json: String = row.get(2)?;
-        serde_json::from_str::<Value>(&source_json)?;
-        serde_json::from_str::<Value>(&target_json)?;
+        if !serde_json::from_str::<Value>(&source_json)?.is_object()
+            || !serde_json::from_str::<Value>(&target_json)?.is_object()
+        {
+            return Err(MigrationError::Malformed(format!(
+                "return delivery {request_id} routes are not objects"
+            )));
+        }
         let legacy_state: String = row.get(3)?;
         if !matches!(legacy_state.as_str(), "pending" | "terminal") {
             return Err(MigrationError::Malformed(format!(
@@ -1067,6 +1173,11 @@ fn import_control(
             &result_json,
             &format!("return delivery {request_id} result"),
         )?;
+        if (legacy_state == "terminal") != result_json.is_some() {
+            return Err(MigrationError::Malformed(format!(
+                "return delivery {request_id} state and result disagree"
+            )));
+        }
         let legacy_agent_state: String = row.get(5)?;
         let legacy_mirror_state: String = row.get(6)?;
         let agent_state = migrated_delivery_state(&legacy_agent_state, &request_id)?;
@@ -1074,6 +1185,11 @@ fn import_control(
         let last_error: Option<String> = row.get(7)?;
         let created_at = seconds_to_millis(row.get::<_, f64>(8)?)?;
         let updated_at = seconds_to_millis(row.get::<_, f64>(9)?)?;
+        if updated_at < created_at {
+            return Err(MigrationError::Malformed(format!(
+                "return delivery {request_id} was updated before it was created"
+            )));
+        }
         let record = json!({
             "request_id": request_id,
             "source_json": source_json,

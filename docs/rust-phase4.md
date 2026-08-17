@@ -67,9 +67,10 @@ boundary explicitly.
 - Pending Telegram, Signal, Slack, and Debate chunks become canonical pending
   outbox work with deterministic effect IDs. A route ID is attached only when
   the title or channel destination identifies exactly one migrated route.
-- Every Signal row remains in the canonical Signal archive. Only accepted,
+- Every Signal row remains in the canonical Signal archive. Accepted,
   undelivered, non-command incoming text becomes pending inbox work. The older
-  JSON mute history remains archived, matching Python's non-mention behavior.
+  JSON mute backlog also becomes pending inbox work with deterministic legacy
+  identities, matching Python's startup migration and queue behavior.
 - Provider paths, file identities, offsets, and parser cursors are retained as
   rollback-only metadata. Migration never creates `wakterm_event_cursor`.
 - Every Python control UUID becomes a permanent tombstone with
