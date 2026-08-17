@@ -27,7 +27,7 @@ class DeploymentContractTests(unittest.TestCase):
             {"aiohttp", "python-telegram-bot", "slack-sdk"},
         )
 
-    def test_system_unit_runs_locked_source_as_mihai(self):
+    def test_system_unit_runs_the_installed_rust_binary_as_mihai(self):
         config = configparser.ConfigParser(interpolation=None, strict=False)
         config.optionxform = str
         config.read(ROOT / "deploy" / "panetone.service")
@@ -40,8 +40,15 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertEqual(service["Restart"], "on-failure")
         self.assertEqual(
             service["ExecStart"],
-            "/usr/local/bin/uv --no-config run --locked --script /code/panetone/bridge.py",
+            "/usr/local/bin/panetone daemon --socket /run/panetone/control.sock "
+            "--database /var/lib/panetone/panetone.sqlite3 "
+            "--wakterm-bin /usr/local/bin/wakterm "
+            "--wakterm-socket /run/wakterm/sock",
         )
+        self.assertEqual(service["EnvironmentFile"], "/etc/panetone/panetone.env")
+        self.assertEqual(service["RuntimeDirectoryMode"], "0700")
+        self.assertEqual(service["StateDirectoryMode"], "0700")
+        self.assertNotIn("/code/", service["ExecStart"])
 
     def test_poll_loop_cannot_reexecute_the_process(self):
         tree = ast.parse((ROOT / "bridge.py").read_text())
@@ -63,10 +70,12 @@ class DeploymentContractTests(unittest.TestCase):
     def test_system_installer_has_failure_rollback(self):
         installer = (ROOT / "deploy" / "install-system-service.sh").read_text()
 
-        self.assertIn("lock --check --script", installer)
-        self.assertIn("restore_user_service", installer)
+        self.assertIn("Without --apply or --start-held", installer)
+        self.assertIn("rollback_install", installer)
+        self.assertIn("wakterm-mux-server.service", installer)
+        self.assertIn("refusing to overwrite durable state", installer)
         self.assertIn("systemctl disable --now panetone.service", installer)
-        self.assertIn("systemctl is-active --quiet panetone.service", installer)
+        self.assertIn('delivery_hold"] is True', installer)
 
 
 if __name__ == "__main__":
