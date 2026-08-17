@@ -275,10 +275,31 @@ async fn run_doctor(args: DoctorArgs) -> Result<()> {
     };
     let store = StoreHandle::open(&args.journal);
     let (store_check, opened) = match store {
-        Ok(store) => (
-            json!({"ok": true, "detail": "schema is compatible"}),
-            Some(store),
-        ),
+        Ok(store) => match store.status().await {
+            Ok(status) => {
+                let degraded = status.failed_workflows > 0
+                    || status.indeterminate_workflows > 0
+                    || status.failed_outbox > 0
+                    || status.indeterminate_outbox > 0
+                    || status.unresolved_returns > 0;
+                (
+                    json!({
+                        "ok": !degraded,
+                        "detail": if degraded {
+                            "schema is compatible, but durable failures require operator attention"
+                        } else {
+                            "schema is compatible and no durable failures are recorded"
+                        },
+                        "status": status
+                    }),
+                    Some(store),
+                )
+            }
+            Err(error) => (
+                json!({"ok": false, "detail": error.to_string()}),
+                Some(store),
+            ),
+        },
         Err(error) => (json!({"ok": false, "detail": error.to_string()}), None),
     };
     let report = json!({

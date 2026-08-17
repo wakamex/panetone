@@ -265,3 +265,118 @@ fi
     drop(service);
     store.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn rejected_audit_is_durable_visible_and_prevents_prompt_submission() {
+    let directory = tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let admission_log = directory.path().join("admission.log");
+    let script = directory.path().join("wakterm-fake");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/bash
+set -euo pipefail
+if [[ "$*" == *"agent catalog"* ]]; then
+  printf '%s\n' '{{"schema":"wakterm.agent-api.v1","agents":[{{"agent_id":"agent-target","incarnation_id":"target-incarnation-1","pane_id":22,"name":"target","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"}}]}}'
+else
+  printf 'unexpected admission\n' >> '{}'
+  exit 9
+fi
+"#,
+            admission_log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let wakterm = WaktermCli::new(
+        &script,
+        directory.path().join("dev-mux.sock"),
+        Duration::from_secs(2),
+    );
+    let target_binding = wakterm.resolve_stable_binding(22, || Ok(())).await.unwrap();
+    let source = route(
+        1,
+        "Source",
+        AgentBinding {
+            agent_id: "agent-source".into(),
+            incarnation_id: "source-incarnation-1".into(),
+            harness: "codex".into(),
+            pane_id: Some(11),
+        },
+        101,
+    );
+    let target = route(2, "Target", target_binding, 202);
+
+    let response = b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: 83\r\n\r\n{\"ok\":false,\"error_code\":429,\"description\":\"retry\",\"parameters\":{\"retry_after\":17}}";
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let telegram_server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request).await.unwrap();
+        stream.write_all(response).await.unwrap();
+    });
+    let channels = RealChannels {
+        telegram: Some(
+            TelegramClient::new(
+                format!("http://{address}"),
+                "fake-token",
+                -1001,
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        ),
+        ..RealChannels::default()
+    };
+    let journal = directory.path().join("state.sqlite3");
+    let store = StoreHandle::open(&journal).unwrap();
+    let service = OfflineService::new_real(store.clone(), wakterm, channels);
+    let command = SendCommand {
+        id: WorkflowId::new(Uuid::from_u128(100)),
+        source: "Source".into(),
+        target: "Target".into(),
+        message: "must remain audit-first".into(),
+        return_final: false,
+        timeout_ms: 0,
+    };
+    assert!(matches!(
+        service.submit(command.clone(), &source, &target, 100).await,
+        Err(ServiceError::AuditFailed(_))
+    ));
+    telegram_server.await.unwrap();
+    assert!(!admission_log.exists());
+    let status = store.status().await.unwrap();
+    assert_eq!(status.failed_workflows, 1);
+    assert_eq!(status.failed_outbox, 1);
+    assert_eq!(
+        store
+            .get_workflow(command.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .workflow
+            .state,
+        WorkflowState::Failed
+    );
+    drop(service);
+    store.shutdown().await.unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_panetone"))
+        .args([
+            "doctor",
+            "--socket",
+            directory.path().join("control.sock").to_str().unwrap(),
+            "--journal",
+            journal.to_str().unwrap(),
+            "--wakterm-fixture",
+            "/code/wakterm/docs/agent-api/v1/golden-fixtures.json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["checks"]["store"]["ok"], false);
+    assert_eq!(report["checks"]["store"]["status"]["failed_workflows"], 1);
+    assert_eq!(report["checks"]["store"]["status"]["failed_outbox"], 1);
+}

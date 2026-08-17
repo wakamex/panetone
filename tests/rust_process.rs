@@ -126,6 +126,8 @@ fn doctor_validates_both_profiles_and_confirms_production_is_disabled() {
     );
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["ok"], true);
+    assert_eq!(report["checks"]["store"]["status"]["failed_workflows"], 0);
+    assert_eq!(report["checks"]["store"]["status"]["failed_outbox"], 0);
     assert_eq!(report["checks"]["wakterm_contract"]["ok"], true);
     assert_eq!(report["checks"]["production_connections"]["ok"], true);
     assert!(

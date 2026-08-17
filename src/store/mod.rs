@@ -94,6 +94,7 @@ pub struct StoreStatus {
     pub schema_version: u64,
     pub workflows: u64,
     pub awaiting_target_idle: u64,
+    pub failed_workflows: u64,
     pub indeterminate_workflows: u64,
     pub pending_returns: u64,
     pub unresolved_returns: u64,
@@ -989,6 +990,10 @@ fn status(connection: &Connection) -> StoreResult<StoreStatus> {
         awaiting_target_idle: count(
             connection,
             "SELECT COUNT(*) FROM workflows WHERE state = 'awaiting_target_idle'",
+        )?,
+        failed_workflows: count(
+            connection,
+            "SELECT COUNT(*) FROM workflows WHERE state = 'failed'",
         )?,
         indeterminate_workflows: count(
             connection,
