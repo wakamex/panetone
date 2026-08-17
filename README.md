@@ -75,6 +75,17 @@ loading and isolates the mux socket, saved session, cache, config, and data belo
 the Panetone development worktree. It runs in the foreground and never manages
 or restarts the production mux. Stop it with Ctrl-C when the test is complete.
 
+Before Phase 5B, run the pinned disposable integration preflight:
+
+```sh
+dev/phase5b-wakterm-preflight
+```
+
+It records private JSON evidence below `.dev/evidence/` and does not touch the
+production mux. See the [Wakterm promotion checklist](docs/wakterm-phase5b-promotion.md)
+before any real mux deployment or restart. Restoring terminal layout alone does
+not restore agent harnesses.
+
 The installed Python bridge negotiates the Wakterm Agent API during startup.
 The Phase 5A Rust candidate also checks capabilities on every Agent API
 operation because each CLI invocation opens a new mux connection. Return mode

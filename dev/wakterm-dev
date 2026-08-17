@@ -3,13 +3,23 @@
 set -euo pipefail
 
 panetone_dev_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-wakterm_source=/code/wakterm
+wakterm_source="${PANETONE_WAKTERM_SOURCE:-/code/wakterm}"
+wakterm_target_root="${CARGO_TARGET_DIR:-$wakterm_source/target}"
 host_runtime_root="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-dev_runtime_root="$host_runtime_root/panetone-wakterm-dev"
-dev_state_root="$panetone_dev_root/.dev/wakterm"
+dev_runtime_root="${PANETONE_WAKTERM_DEV_RUNTIME_ROOT:-$host_runtime_root/panetone-wakterm-dev}"
+dev_state_root="${PANETONE_WAKTERM_DEV_STATE_ROOT:-$panetone_dev_root/.dev/wakterm}"
 dev_socket="$dev_runtime_root/wakterm/sock"
-wakterm_cli="$wakterm_source/target/debug/wakterm"
-wakterm_mux="$wakterm_source/target/debug/wakterm-mux-server"
+wakterm_cli="$wakterm_target_root/debug/wakterm"
+wakterm_mux="$wakterm_target_root/debug/wakterm-mux-server"
+
+if [[ $dev_runtime_root != *panetone-wakterm-dev* ]]; then
+  echo "development runtime path must contain panetone-wakterm-dev" >&2
+  exit 1
+fi
+if [[ $dev_state_root != *panetone-wakterm-dev* && -n ${PANETONE_WAKTERM_DEV_STATE_ROOT:-} ]]; then
+  echo "overridden development state path must contain panetone-wakterm-dev" >&2
+  exit 1
+fi
 
 prepare_environment() {
   mkdir -p \
@@ -103,6 +113,13 @@ Commands:
 The development mux never loads the production Wakterm configuration. It uses
 its own socket, session, cache, config, and data directories. Stop `serve` with
 Ctrl-C. The production mux is not started, stopped, or restarted by this tool.
+
+PANETONE_WAKTERM_SOURCE may select a disposable source worktree.
+CARGO_TARGET_DIR may select a reusable build-artifact cache.
+PANETONE_WAKTERM_DEV_RUNTIME_ROOT and PANETONE_WAKTERM_DEV_STATE_ROOT may point
+at fresh private paths containing "panetone-wakterm-dev". The Phase 5B
+preflight uses these overrides so every run starts with pinned source and
+disposable state.
 EOF
 }
 
@@ -149,6 +166,7 @@ case "$command" in
   paths)
     prepare_environment
     printf 'wakterm_source=%s\n' "$wakterm_source"
+    printf 'wakterm_target_root=%s\n' "$wakterm_target_root"
     printf 'wakterm_cli=%s\n' "$wakterm_cli"
     printf 'wakterm_mux=%s\n' "$wakterm_mux"
     printf 'runtime_root=%s\n' "$dev_runtime_root"

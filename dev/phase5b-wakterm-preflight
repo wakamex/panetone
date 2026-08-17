@@ -1,0 +1,252 @@
+#!/bin/bash
+
+set -euo pipefail
+
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+wakterm_repo=${PANETONE_WAKTERM_REPOSITORY:-/code/wakterm}
+required_commit=01eb38255ff8a18202e2b16163a3d0e1a399d6ad
+evidence=${1:-}
+
+usage() {
+    printf '%s\n' \
+        'Usage: dev/phase5b-wakterm-preflight [EVIDENCE_JSON]' \
+        '' \
+        'Build and verify the pinned Wakterm producer through a disposable mux.' \
+        'The production mux, configuration, state, sockets, and services are untouched.'
+}
+
+if [[ ${1:-} == -h || ${1:-} == --help ]]; then
+    usage
+    exit 0
+fi
+if (($# > 1)); then
+    usage >&2
+    exit 2
+fi
+
+actual_commit=$(git -C "$wakterm_repo" rev-parse "$required_commit^{commit}")
+if [[ $actual_commit != "$required_commit" ]]; then
+    printf 'Wakterm repository does not contain required commit %s\n' "$required_commit" >&2
+    exit 1
+fi
+short_commit=${required_commit:0:8}
+if [[ -z $evidence ]]; then
+    timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+    evidence="$repo/.dev/evidence/wakterm-phase5b-$timestamp-$short_commit.json"
+fi
+if [[ -e $evidence || -L $evidence ]]; then
+    printf 'refusing to overwrite evidence path: %s\n' "$evidence" >&2
+    exit 1
+fi
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/panetone-wakterm-dev-preflight.XXXXXX")
+chmod 0700 "$work"
+runtime_root="$work/panetone-wakterm-dev-runtime"
+state_root="$work/panetone-wakterm-dev-state"
+socket="$runtime_root/wakterm/sock"
+serve_log="$work/serve.log"
+mux_pid=
+worktree_source="$work/wakterm-source"
+worktree_added=0
+evidence_partial=
+
+cleanup() {
+    if [[ -n $mux_pid ]] && kill -0 "$mux_pid" 2>/dev/null; then
+        kill -TERM "$mux_pid" 2>/dev/null || true
+        for _attempt in {1..100}; do
+            kill -0 "$mux_pid" 2>/dev/null || break
+            sleep 0.05
+        done
+        if kill -0 "$mux_pid" 2>/dev/null; then
+            kill -KILL "$mux_pid" 2>/dev/null || true
+        fi
+        wait "$mux_pid" 2>/dev/null || true
+    fi
+    if ((worktree_added == 1)); then
+        git -C "$wakterm_repo" worktree remove --force "$worktree_source" \
+            >/dev/null 2>&1 || true
+    fi
+    if [[ -n $evidence_partial ]]; then
+        rm -f -- "$evidence_partial"
+    fi
+    rm -rf -- "$work"
+}
+trap cleanup EXIT HUP INT TERM
+
+git -C "$wakterm_repo" worktree add --detach "$worktree_source" "$required_commit"
+worktree_added=1
+export PANETONE_WAKTERM_SOURCE="$worktree_source"
+export CARGO_TARGET_DIR="$repo/.dev/wakterm-target/$short_commit"
+mkdir -p "$CARGO_TARGET_DIR"
+chmod 0700 "$repo/.dev" "$repo/.dev/wakterm-target" "$CARGO_TARGET_DIR"
+"$repo/dev/wakterm-dev" build
+
+wakterm_cli="$CARGO_TARGET_DIR/debug/wakterm"
+wakterm_mux="$CARGO_TARGET_DIR/debug/wakterm-mux-server"
+cli_version=$($wakterm_cli --version)
+mux_version=$($wakterm_mux --version)
+if [[ $cli_version != *"$short_commit"* || $mux_version != *"$short_commit"* ]]; then
+    printf 'debug binaries do not identify pinned commit %s\n' "$short_commit" >&2
+    exit 1
+fi
+
+export PANETONE_WAKTERM_DEV_RUNTIME_ROOT="$runtime_root"
+export PANETONE_WAKTERM_DEV_STATE_ROOT="$state_root"
+"$repo/dev/wakterm-dev" serve >"$serve_log" 2>&1 &
+mux_pid=$!
+for _attempt in {1..200}; do
+    if [[ -S $socket ]]; then
+        break
+    fi
+    if ! kill -0 "$mux_pid" 2>/dev/null; then
+        printf '%s\n' 'disposable Wakterm mux exited before creating its socket' >&2
+        sed -n '1,120p' "$serve_log" >&2
+        exit 1
+    fi
+    sleep 0.05
+done
+if [[ ! -S $socket ]]; then
+    printf '%s\n' 'disposable Wakterm mux did not create its socket' >&2
+    exit 1
+fi
+
+"$repo/dev/wakterm-dev" cli agent capabilities >"$work/capabilities.json"
+"$repo/dev/wakterm-dev" cli agent catalog >"$work/catalog.json"
+after_sequence=$(python3 - "$work/catalog.json" <<'PY'
+import json
+import sys
+
+catalog = json.load(open(sys.argv[1], encoding="utf-8"))
+if catalog.get("schema") != "wakterm.agent-api.v1":
+    raise SystemExit("unexpected catalog schema")
+sequence = catalog.get("as_of_event_sequence")
+if not isinstance(sequence, int) or sequence < 0:
+    raise SystemExit("catalog has no valid event lower bound")
+print(sequence)
+PY
+)
+"$repo/dev/wakterm-dev" cli agent events --after "$after_sequence" --limit 100 \
+    >"$work/events.json"
+
+python3 - "$work/capabilities.json" "$work/events.json" "$after_sequence" <<'PY'
+import json
+import sys
+
+capabilities = json.load(open(sys.argv[1], encoding="utf-8"))
+events = json.load(open(sys.argv[2], encoding="utf-8"))
+after = int(sys.argv[3])
+required = {
+    "catalog.v1",
+    "prompt_admission.v1",
+    "return_request_terminal_stream.v1",
+    "event_stream.v1",
+}
+if capabilities.get("schema") != "wakterm.agent-api.v1":
+    raise SystemExit("unexpected capability schema")
+if capabilities.get("api_major") != 1:
+    raise SystemExit("unexpected Agent API major")
+if not required.issubset(set(capabilities.get("capabilities", []))):
+    raise SystemExit("required live capabilities are absent")
+if events.get("schema") != "wakterm.agent-events.v1" or events.get("status") != "ok":
+    raise SystemExit("event page is not a successful v1 page")
+if events.get("requested_after_sequence") != after:
+    raise SystemExit("event page did not preserve the requested cursor")
+next_after = events.get("next_after_sequence")
+latest = events.get("latest_sequence")
+if not isinstance(next_after, int) or not isinstance(latest, int):
+    raise SystemExit("event page has no durable cursor bounds")
+if next_after < after or next_after > latest:
+    raise SystemExit("event page cursor bounds are inconsistent")
+known = {
+    "agent_lifecycle",
+    "turn_started",
+    "turn_state_changed",
+    "plan",
+    "assistant_message",
+    "observer_failure",
+    "turn_final",
+}
+previous = after
+for event in events.get("events", []):
+    sequence = event.get("sequence")
+    if not isinstance(sequence, int) or sequence <= previous or sequence > latest:
+        raise SystemExit("event page ordering is invalid")
+    if event.get("kind") not in known:
+        raise SystemExit("event page contains an unknown kind")
+    previous = sequence
+PY
+
+env -u CARGO_TARGET_DIR \
+    PANETONE_TEST_WAKTERM_BIN="$wakterm_cli" \
+    PANETONE_TEST_WAKTERM_SOCKET="$socket" \
+    cargo test --locked --manifest-path "$repo/Cargo.toml" \
+        --test rust_wakterm_cli configured_development_mux_matches_the_current_contract
+
+cli_hash=$(sha256sum "$wakterm_cli" | cut -d' ' -f1)
+mux_hash=$(sha256sum "$wakterm_mux" | cut -d' ' -f1)
+serve_log_hash=$(sha256sum "$serve_log" | cut -d' ' -f1)
+panetone_commit=$(git -C "$repo" rev-parse HEAD)
+evidence_parent=$(dirname -- "$evidence")
+if [[ ! -e $evidence_parent ]]; then
+    mkdir -p -m 0700 "$evidence_parent"
+elif [[ -L $evidence_parent || ! -d $evidence_parent ]]; then
+    printf 'evidence parent is not a regular directory: %s\n' "$evidence_parent" >&2
+    exit 1
+fi
+evidence_partial="$evidence_parent/.$(basename -- "$evidence").partial.$$"
+python3 - \
+    "$work/capabilities.json" "$work/catalog.json" "$work/events.json" \
+    "$actual_commit" "$panetone_commit" "$cli_version" "$mux_version" \
+    "$cli_hash" "$mux_hash" "$serve_log_hash" "$evidence_partial" <<'PY'
+import datetime
+import json
+import pathlib
+import sys
+
+(
+    capabilities_path,
+    catalog_path,
+    events_path,
+    wakterm_commit,
+    panetone_commit,
+    cli_version,
+    mux_version,
+    cli_hash,
+    mux_hash,
+    serve_log_hash,
+    output_path,
+) = sys.argv[1:]
+catalog = json.load(open(catalog_path, encoding="utf-8"))
+events = json.load(open(events_path, encoding="utf-8"))
+record = {
+    "schema": "panetone.wakterm-phase5b-preflight.v1",
+    "status": "passed",
+    "recorded_at": datetime.datetime.now(datetime.UTC).isoformat(),
+    "production_effects": False,
+    "wakterm": {
+        "commit": wakterm_commit,
+        "cli_version": cli_version,
+        "mux_version": mux_version,
+        "cli_sha256": cli_hash,
+        "mux_sha256": mux_hash,
+        "capabilities": json.load(open(capabilities_path, encoding="utf-8")),
+        "catalog_as_of_event_sequence": catalog["as_of_event_sequence"],
+        "event_page": {
+            "requested_after_sequence": events["requested_after_sequence"],
+            "oldest_available_sequence": events["oldest_available_sequence"],
+            "latest_sequence": events["latest_sequence"],
+            "next_after_sequence": events["next_after_sequence"],
+            "event_count": len(events.get("events", [])),
+        },
+        "serve_log_sha256": serve_log_hash,
+    },
+    "panetone_commit": panetone_commit,
+}
+pathlib.Path(output_path).write_text(
+    json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY
+chmod 0600 "$evidence_partial"
+mv -- "$evidence_partial" "$evidence"
+printf 'Phase 5B Wakterm preflight passed: %s\n' "$evidence"

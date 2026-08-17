@@ -19,6 +19,12 @@ and uses the system-labelled `/usr/local/bin/panetone`. It requires the Wakterm
 mux system service under the same system manager. Move Wakterm separately and
 restore its agents before scheduling Panetone promotion.
 
+The Wakterm maintenance procedure is separate and documented in
+[wakterm-phase5b-promotion.md](wakterm-phase5b-promotion.md). Run its disposable
+preflight first. Do not use the isolated development mux as production evidence,
+and do not restart the production mux until every PTY agent has a tested manual
+resume plan.
+
 ## Configuration
 
 The environment file can contain:

@@ -77,6 +77,31 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertIn("systemctl disable --now panetone.service", installer)
         self.assertIn('delivery_hold"] is True', installer)
 
+    def test_wakterm_preflight_is_pinned_and_production_isolated(self):
+        script = (ROOT / "dev" / "phase5b-wakterm-preflight").read_text()
+
+        self.assertIn("01eb38255ff8a18202e2b16163a3d0e1a399d6ad", script)
+        self.assertIn("worktree add --detach", script)
+        self.assertIn("PANETONE_WAKTERM_SOURCE", script)
+        self.assertIn("CARGO_TARGET_DIR", script)
+        self.assertIn("env -u CARGO_TARGET_DIR", script)
+        self.assertIn("PANETONE_WAKTERM_DEV_RUNTIME_ROOT", script)
+        self.assertIn("PANETONE_WAKTERM_DEV_STATE_ROOT", script)
+        self.assertIn("agent capabilities", script)
+        self.assertIn("agent catalog", script)
+        self.assertIn("agent events", script)
+        self.assertIn("production_effects", script)
+        self.assertNotIn("systemctl", script)
+        self.assertNotIn("agent admit", script)
+
+    def test_wakterm_production_checklist_requires_manual_agent_restoration(self):
+        checklist = (ROOT / "docs" / "wakterm-phase5b-promotion.md").read_text()
+
+        self.assertIn("reliable automatic", checklist)
+        self.assertIn("Manually run each recorded exact", checklist)
+        self.assertIn("mixed-codec", checklist)
+        self.assertIn("keep Panetone stopped", checklist)
+
 
 if __name__ == "__main__":
     unittest.main()
