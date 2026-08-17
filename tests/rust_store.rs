@@ -355,6 +355,8 @@ async fn routes_outbox_inbox_and_metadata_are_durable_and_deduplicated() {
         id: EffectId::new(Uuid::from_u128(42)),
         channel: ChannelKind::Signal,
         external_id: "external-1".into(),
+        destination: "group-one".into(),
+        sender: Some("alice".into()),
         body: "hello".into(),
         state: "pending".into(),
         created_at_ms: 100,

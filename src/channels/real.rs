@@ -445,7 +445,7 @@ async fn telegram_send(
     }
 }
 
-fn http_client(
+pub(super) fn http_client(
     deadline: Duration,
     kind: ChannelKind,
 ) -> Result<reqwest::Client, ChannelDeliveryError> {
@@ -474,7 +474,7 @@ fn retry_after_header(response: &reqwest::Response) -> u64 {
         .unwrap_or(1)
 }
 
-async fn response_body(
+pub(super) async fn response_body(
     mut response: reqwest::Response,
     kind: ChannelKind,
 ) -> Result<Vec<u8>, ChannelDeliveryError> {

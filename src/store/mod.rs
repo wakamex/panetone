@@ -80,6 +80,10 @@ pub struct InboxItem {
     pub id: EffectId,
     pub channel: ChannelKind,
     pub external_id: String,
+    #[serde(default)]
+    pub destination: String,
+    #[serde(default)]
+    pub sender: Option<String>,
     pub body: String,
     pub state: String,
     pub created_at_ms: i64,
