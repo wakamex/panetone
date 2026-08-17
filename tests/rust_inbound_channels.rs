@@ -1,14 +1,11 @@
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
-use panetone::channels::{SignalSubscriber, SlackSocket, TelegramPoller};
+use panetone::channels::{SignalSubscriber, TelegramPoller};
 use panetone::service::InboundIngestor;
 use panetone::store::StoreHandle;
 use tempfile::tempdir;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener};
-use tokio_tungstenite::accept_async;
-use tokio_tungstenite::tungstenite::Message;
 
 async fn telegram_server(
     response_body: &str,
@@ -113,52 +110,6 @@ async fn telegram_updates_are_durable_before_the_confirmation_cursor_advances() 
             .unwrap(),
         0
     );
-    assert_eq!(store.status().await.unwrap().pending_inbox, 1);
-    store.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn slack_ack_is_sent_only_after_the_envelope_is_durable() {
-    let directory = tempdir().unwrap();
-    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
-    let server_store = store.clone();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut socket = accept_async(stream).await.unwrap();
-        socket
-            .send(Message::Text(
-                serde_json::json!({
-                    "envelope_id": "envelope-1",
-                    "type": "events_api",
-                    "payload": {
-                        "event": {
-                            "type": "message",
-                            "channel": "C123",
-                            "user": "U456",
-                            "text": "review this"
-                        }
-                    }
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
-            .unwrap();
-        let acknowledgement = socket.next().await.unwrap().unwrap();
-        let acknowledgement: serde_json::Value =
-            serde_json::from_str(acknowledgement.to_text().unwrap()).unwrap();
-        assert_eq!(acknowledgement["envelope_id"], "envelope-1");
-        assert_eq!(server_store.status().await.unwrap().pending_inbox, 1);
-    });
-
-    let mut socket = SlackSocket::connect(&format!("ws://{address}"), Duration::from_secs(2))
-        .await
-        .unwrap();
-    let ingestor = InboundIngestor::new(store.clone());
-    assert!(ingestor.ingest_slack_once(&mut socket, 200).await.unwrap());
-    server.await.unwrap();
     assert_eq!(store.status().await.unwrap().pending_inbox, 1);
     store.shutdown().await.unwrap();
 }

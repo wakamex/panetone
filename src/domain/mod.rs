@@ -5,8 +5,7 @@ mod workflow;
 
 pub use channel::{
     ChannelAvailability, ChannelBinding, ChannelKind, ChannelSelection, OutboxItem, OutboxState,
-    chunk_lines, chunk_utf16, fair_retry_indices, format_slack_tables, normalize_signal_group_id,
-    select_channel,
+    chunk_lines, chunk_utf16, fair_retry_indices, normalize_signal_group_id, select_channel,
 };
 pub use ids::{EffectId, RouteId, WorkflowId};
 pub use route::{

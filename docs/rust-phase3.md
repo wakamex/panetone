@@ -2,7 +2,7 @@
 
 Phase 3 replaces the Phase 2 recording boundaries with production-shaped
 adapters, but it does not enable them in production. Every adapter test uses a
-temporary HTTP, WebSocket, Unix, process, mux, or SQLite endpoint. No test loads
+temporary HTTP, Unix, process, mux, or SQLite endpoint. No test loads
 channel credentials, sends a real message, submits a prompt to a production
 agent, or restarts a production service.
 
@@ -45,14 +45,13 @@ does not submit a prompt or start a channel adapter.
 
 ## Channels
 
-Telegram and Debate use the Bot API with bounded JSON responses. Slack outbound
-uses `chat.postMessage` with the durable effect UUID as `client_msg_id`. Signal
-uses newline-delimited JSON-RPC over its Unix socket. Tokens are private fields
+Telegram uses the Bot API with bounded JSON responses. Debate is a Signal route,
+not a separate transport. Signal uses newline-delimited JSON-RPC over its Unix
+socket. Tokens are private fields
 and transport errors do not include request URLs, authorization headers, or
 remote response bodies beyond a short sanitized API description.
 
 Inbound Telegram offsets advance only after every relevant update is durable.
-Slack Socket Mode acknowledgements are sent only after the envelope is durable.
 Signal notifications use a dedicated subscription connection and stable
 sender-plus-timestamp identity. Repeated external identities are acknowledged
 without creating duplicate inbox work.
@@ -69,10 +68,10 @@ The permanent tests cover:
 - exact Wakterm catalog joins, admissions, terminal resume, and subprocess
   limits against a fake CLI
 - current capability preflight against the isolated development mux
-- Telegram, Debate, Slack, and Signal outbound requests against local servers
+- Telegram and Signal outbound requests against local servers
 - rate limits, deleted destinations, partial and malformed responses, timeouts,
   disconnects, and secret-free errors
-- Telegram, Slack, and Signal inbound persistence and acknowledgement order
+- Telegram and Signal inbound persistence and acknowledgement order
 - the real adapters running through the durable audit-first workflow, including
   duplicate UUID suppression and indeterminate Wakterm response handling
 - Python-current and Rust-target control traces against one shared fixture,
@@ -98,6 +97,9 @@ Dependency license and advisory checks remain required. Phase 3 evidence is
 discovery and local adapter evidence only. State migration, production binary
 installation, service restart, real credential loading, and provider ownership
 cutover remain Phase 4 and Phase 5 work.
+
+Slack was explicitly removed after Phase 3. Its HTTP and Socket Mode adapters,
+dependencies, fixtures, and configuration are not part of the candidate.
 
 ## Completion evidence
 

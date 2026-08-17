@@ -170,19 +170,15 @@ fn item(index: u128, kind: ChannelKind) -> OutboxItem {
 #[test]
 fn recording_channels_cover_all_transports_and_do_not_hide_at_least_once_replays() {
     let channels = RecordingChannels::default();
-    for (index, kind) in [
-        ChannelKind::Telegram,
-        ChannelKind::Signal,
-        ChannelKind::Slack,
-    ]
-    .into_iter()
-    .enumerate()
+    for (index, kind) in [ChannelKind::Telegram, ChannelKind::Signal]
+        .into_iter()
+        .enumerate()
     {
         let item = item(index as u128 + 1, kind);
         channels.send(&item).unwrap();
         channels.send(&item).unwrap();
     }
-    assert_eq!(channels.calls().len(), 6);
+    assert_eq!(channels.calls().len(), 4);
 
     channels.fail(ChannelKind::Telegram);
     assert!(channels.send(&item(10, ChannelKind::Telegram)).is_err());

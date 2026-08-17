@@ -73,6 +73,10 @@ pub enum MigrationError {
     SourceChanged(String),
     #[error("legacy state is malformed: {0}")]
     Malformed(String),
+    #[error(
+        "legacy pending item {0:?} uses removed Slack delivery; archive or dispose it before migration"
+    )]
+    RemovedSlackPending(String),
     #[error("filesystem error: {0}")]
     Io(#[from] std::io::Error),
     #[error("database error: {0}")]
@@ -462,6 +466,7 @@ fn import_routes(
 
     let mut preferences = BTreeMap::new();
     let mut held_debate_preferences = BTreeMap::new();
+    let mut removed_slack_preferences = BTreeMap::new();
     if let Some(sources) = optional_object(state, "last_sources")? {
         for (title, source) in sources {
             let source = source.as_str().ok_or_else(|| {
@@ -473,6 +478,13 @@ fn import_routes(
                 )));
             }
             let key = normalize_title(title)?;
+            if source == "slack" {
+                removed_slack_preferences.insert(key, source.to_owned());
+                warnings.insert(format!(
+                    "legacy Slack preference for {title:?} was preserved as deprecated metadata and is not deliverable"
+                ));
+                continue;
+            }
             if let Some(route) = routes.get(&key) {
                 if source == "debate" {
                     if route
@@ -509,6 +521,11 @@ fn import_routes(
         transaction,
         "legacy_debate_preferences_held",
         &serde_json::to_string(&held_debate_preferences)?,
+    )?;
+    insert_metadata(
+        transaction,
+        "legacy_removed_slack_preferences_v1",
+        &serde_json::to_string(&removed_slack_preferences)?,
     )?;
 
     let muted_groups = optional_array(state, "clod_off_groups")?;
@@ -620,7 +637,6 @@ fn same_channel_kind(left: &ChannelBinding, right: &ChannelBinding) -> bool {
             ChannelBinding::Telegram { .. },
             ChannelBinding::Telegram { .. }
         ) | (ChannelBinding::Signal { .. }, ChannelBinding::Signal { .. })
-            | (ChannelBinding::Slack { .. }, ChannelBinding::Slack { .. })
     )
 }
 
@@ -628,7 +644,6 @@ fn channel_order(channel: &ChannelBinding) -> u8 {
     match channel {
         ChannelBinding::Telegram { .. } => 0,
         ChannelBinding::Signal { .. } => 1,
-        ChannelBinding::Slack { .. } => 2,
     }
 }
 
@@ -688,7 +703,7 @@ fn import_pending(
         let kind = match legacy_kind {
             "tg" => Some(ChannelKind::Telegram),
             "sig" => Some(ChannelKind::Signal),
-            "slack" => Some(ChannelKind::Slack),
+            "slack" => return Err(MigrationError::RemovedSlackPending(legacy_id.to_owned())),
             "debate" => None,
             other => {
                 return Err(MigrationError::Malformed(format!(
@@ -788,9 +803,6 @@ fn resolve_pending_route(
                 }
                 (ChannelKind::Signal, ChannelBinding::Signal { group_id }) => {
                     group_id == &normalized_signal
-                }
-                (ChannelKind::Slack, ChannelBinding::Slack { channel_id }) => {
-                    channel_id == destination
                 }
                 _ => false,
             })
@@ -1524,7 +1536,6 @@ fn channel_name(kind: ChannelKind) -> &'static str {
     match kind {
         ChannelKind::Telegram => "telegram",
         ChannelKind::Signal => "signal",
-        ChannelKind::Slack => "slack",
     }
 }
 

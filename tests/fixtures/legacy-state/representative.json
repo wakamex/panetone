@@ -92,15 +92,6 @@
         "pane_id": 13,
         "harness": "gemini",
         "route_title": ""
-      },
-      {
-        "id": "out-slack-1",
-        "kind": "slack",
-        "target": "C012345",
-        "chunk": "Slack pending text",
-        "pane_id": 14,
-        "harness": "opencode",
-        "route_title": ""
       }
     ]
   },

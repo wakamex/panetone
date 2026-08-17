@@ -56,8 +56,8 @@ fn routes() -> (Route, Route) {
             1,
             "source",
             binding("source", "source-incarnation-1", 1),
-            ChannelBinding::Slack {
-                channel_id: "source-channel".into(),
+            ChannelBinding::Signal {
+                group_id: "source-group".into(),
             },
         ),
         route(

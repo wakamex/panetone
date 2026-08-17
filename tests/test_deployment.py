@@ -24,7 +24,7 @@ class DeploymentContractTests(unittest.TestCase):
 
         self.assertEqual(
             requirements,
-            {"aiohttp", "python-telegram-bot", "slack-sdk"},
+            {"aiohttp", "python-telegram-bot"},
         )
 
     def test_system_unit_runs_the_installed_rust_binary_as_mihai(self):

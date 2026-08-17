@@ -2077,7 +2077,6 @@ fn output_destination(route: &Route, preference: Option<&str>) -> Option<(Channe
     let preferred = match preference {
         Some("tg") => Some(ChannelKind::Telegram),
         Some("sig") => Some(ChannelKind::Signal),
-        Some("slack") => Some(ChannelKind::Slack),
         _ => None,
     };
     let telegram_topic = route.channels.iter().find_map(|binding| match binding {
@@ -2088,10 +2087,6 @@ fn output_destination(route: &Route, preference: Option<&str>) -> Option<(Channe
         crate::domain::ChannelBinding::Signal { group_id } => Some(group_id.as_str()),
         _ => None,
     });
-    let slack_channel = route.channels.iter().find_map(|binding| match binding {
-        crate::domain::ChannelBinding::Slack { channel_id } => Some(channel_id.as_str()),
-        _ => None,
-    });
     crate::domain::select_channel(
         preferred,
         &route.title,
@@ -2099,8 +2094,6 @@ fn output_destination(route: &Route, preference: Option<&str>) -> Option<(Channe
             telegram_topic,
             signal_enabled: signal_group.is_some(),
             signal_group,
-            slack_enabled: slack_channel.is_some(),
-            slack_channel,
         },
     )
     .map(|selection| (selection.kind, selection.destination))
@@ -2318,7 +2311,6 @@ fn save_inbox(
             match channel {
                 ChannelKind::Telegram => "tg",
                 ChannelKind::Signal => "sig",
-                ChannelKind::Slack => "slack",
             }
             .into(),
         );

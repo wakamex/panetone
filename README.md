@@ -18,6 +18,15 @@ Each wezterm tab gets its own Telegram forum topic and/or Signal group chat. Mul
 - **Session tailing** — reads `.claude` and `.codex` JSONL session files directly, no screen scraping
 - **Signal support** — optionally mirror output to Signal groups via signal-cli (no extra Python deps)
 
+## Removed transports
+
+Slack support was removed on 2026-08-17. Panetone no longer loads Slack
+credentials, opens Socket Mode, accepts Slack input, or sends Slack output.
+Legacy Slack output preferences are ignored and retained only as migration
+metadata. Migration refuses any pending Slack delivery so it cannot be
+silently replayed or discarded. Archive or explicitly dispose those legacy
+items before migration, then revoke the old Slack app and bot tokens.
+
 ## Telegram Setup
 
 1. Create a Telegram group with [Topics enabled](https://telegram.org/blog/topics-in-groups-collectible-usernames#topics-in-groups)

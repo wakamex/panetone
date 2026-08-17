@@ -1,8 +1,6 @@
 use thiserror::Error;
 
-use crate::channels::{
-    ChannelDeliveryError, InboundBatch, InboundMessage, SignalSubscriber, SlackSocket,
-};
+use crate::channels::{ChannelDeliveryError, InboundBatch, InboundMessage, SignalSubscriber};
 use crate::store::{InboxItem, StoreError, StoreHandle};
 
 #[derive(Debug, Error)]
@@ -55,20 +53,6 @@ impl InboundIngestor {
         self.store
             .set_metadata(cursor_key.into(), batch.next_offset.to_string())
             .await?;
-        Ok(inserted)
-    }
-
-    pub async fn ingest_slack_once(
-        &self,
-        socket: &mut SlackSocket,
-        now_ms: i64,
-    ) -> Result<bool, InboundIngestError> {
-        let envelope = socket.next().await?;
-        let inserted = match envelope.message {
-            Some(message) => self.persist(message, now_ms).await?,
-            None => false,
-        };
-        socket.acknowledge(&envelope.envelope_id).await?;
         Ok(inserted)
     }
 

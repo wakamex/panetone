@@ -4,7 +4,7 @@ Phase 5A makes the Rust candidate deployable and rehearses promotion without
 changing the production service. It does not authorize the Phase 5B cutover.
 
 The candidate is one `panetone` binary. Its production `daemon` uses only the
-live Wakterm Agent API and configured Telegram, Signal, and Slack adapters. The
+live Wakterm Agent API and configured Telegram and Signal adapters. The
 old fixture-backed daemon remains available only as the hidden
 `conformance-backend` test command. Debate has no transport or Telegram bot. A
 Debate route is an ordinary Signal group binding.
@@ -93,7 +93,7 @@ at most once when uncertain. Return terminal results are persisted and their
 Wakterm sequence is checkpointed before a held source route is considered for
 mirror or callback delivery.
 
-Inbound Telegram, Signal, and Slack messages are durable before routing.
+Inbound Telegram and Signal messages are durable before routing.
 Telegram and Signal preserve an explicit sender identity for authorization.
 An inbound prompt is marked `admission_prepared` before Wakterm. Restarting at
 that boundary makes it indeterminate instead of redelivering it.

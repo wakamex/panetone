@@ -39,15 +39,19 @@ WEZ_TG_OWNER=123456789
 WEZ_SIG_SOCKET=/run/signal-cli/socket
 WEZ_SIG_ACCOUNT=+15550000000
 WEZ_SIG_OWNER=+15551111111
-WEZ_SLACK_BOT_TOKEN=xoxb-...
-WEZ_SLACK_APP_TOKEN=xapp-...
 ```
 
 Telegram requires a chat and Claude token together. Other harness tokens select
 the visible output identity. Signal is enabled only when its socket, account,
-and owner are all present. Slack output uses the bot token and Socket Mode uses
-the app token. `PANETONE_SLACK_SOCKET_URL` is a test-only alternative to the app
-token. Debate needs no additional variable because it is a Signal group route.
+and owner are all present. Debate needs no additional variable because it is a
+Signal group route.
+
+Slack is removed and has no accepted configuration. Delete any `WEZ_SLACK_*`
+or `PANETONE_SLACK_*` entries when preparing the Rust environment. The offline
+migration retains an old Slack preference only as deprecated metadata and
+refuses a pending Slack delivery. Resolve such an item before promotion rather
+than silently replaying or dropping it. Revoke the old Slack credentials after
+the Python service that used them is permanently retired.
 
 ## Side-effect-free candidate check
 

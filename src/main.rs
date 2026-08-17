@@ -5,8 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use panetone::channels::{
-    RealChannels, SignalClient, SignalSubscriber, SlackClient, SlackSocket, TelegramClient,
-    TelegramPoller,
+    RealChannels, SignalClient, SignalSubscriber, TelegramClient, TelegramPoller,
 };
 use panetone::control::{CONTROL_SCHEMA, ControlRequest, ControlServer, SendParams, request};
 use panetone::migration::{MigrationOptions, migrate};
@@ -93,18 +92,6 @@ struct ProductionArgs {
     signal_account: Option<String>,
     #[arg(long, env = "WEZ_SIG_OWNER")]
     signal_owner: Option<String>,
-    #[arg(
-        long,
-        env = "PANETONE_SLACK_API_BASE",
-        default_value = "https://slack.com/api"
-    )]
-    slack_api_base: String,
-    #[arg(long, env = "WEZ_SLACK_BOT_TOKEN")]
-    slack_bot_token: Option<String>,
-    #[arg(long, env = "WEZ_SLACK_APP_TOKEN")]
-    slack_app_token: Option<String>,
-    #[arg(long, env = "PANETONE_SLACK_SOCKET_URL")]
-    slack_socket_url: Option<String>,
     #[arg(long, env = "PANETONE_WORKER_POLL_MS", default_value_t = 1000)]
     worker_poll_ms: u64,
 }
@@ -275,6 +262,7 @@ enum ProductionWorker {
 }
 
 async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
+    reject_removed_slack_configuration()?;
     let deadline = Duration::from_secs(10);
     let wakterm = WaktermCli::new(&args.wakterm_bin, &args.wakterm_socket, deadline);
     let (version, capabilities, _catalog) =
@@ -289,7 +277,7 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
         "Wakterm production preflight succeeded"
     );
 
-    let (channels, telegram, signal, slack) = production_channels(&args, deadline)?;
+    let (channels, telegram, signal) = production_channels(&args, deadline)?;
     let store = StoreHandle::open(&args.database).context("open production store")?;
     let server = ControlServer::bind(&args.socket)
         .await
@@ -344,15 +332,6 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
             signal_loop(socket, account, owner, ingestor, channel_store, shutdown).await
         });
     }
-    if let Some(slack) = slack {
-        let ingestor = InboundIngestor::new(store.clone());
-        let channel_store = store.clone();
-        let shutdown = supervisor.shutdown_receiver();
-        supervisor.spawn("slack-inbound", TaskPolicy::Degraded, async move {
-            slack_loop(slack, ingestor, channel_store, shutdown).await
-        });
-    }
-
     supervisor
         .run_until(shutdown_signal())
         .await
@@ -361,20 +340,34 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
     Ok(())
 }
 
+fn reject_removed_slack_configuration() -> Result<()> {
+    const REMOVED: &[&str] = &[
+        "WEZ_SLACK_BOT_TOKEN",
+        "WEZ_SLACK_APP_TOKEN",
+        "WEZ_SLACK_CHANNELS",
+        "WEZ_SLACK_TABS",
+        "WEZ_SLACK_DIRECT",
+        "PANETONE_SLACK_API_BASE",
+        "PANETONE_SLACK_SOCKET_URL",
+    ];
+    let configured = REMOVED
+        .iter()
+        .filter(|name| std::env::var(name).is_ok_and(|value| !value.is_empty()))
+        .copied()
+        .collect::<Vec<_>>();
+    if !configured.is_empty() {
+        bail!(
+            "Slack support was removed; delete the deprecated configuration: {}",
+            configured.join(", ")
+        );
+    }
+    Ok(())
+}
+
 type TelegramRuntime = (TelegramPoller, Option<String>);
 type SignalRuntime = (PathBuf, String, String);
 
-enum SlackRuntime {
-    Url(String),
-    AppToken { api_base: String, token: String },
-}
-
-type ProductionChannels = (
-    RealChannels,
-    Option<TelegramRuntime>,
-    Option<SignalRuntime>,
-    Option<SlackRuntime>,
-);
+type ProductionChannels = (RealChannels, Option<TelegramRuntime>, Option<SignalRuntime>);
 
 fn production_channels(args: &ProductionArgs, deadline: Duration) -> Result<ProductionChannels> {
     let mut channels = RealChannels::default();
@@ -425,27 +418,7 @@ fn production_channels(args: &ProductionArgs, deadline: Duration) -> Result<Prod
         _ => bail!("Signal requires WEZ_SIG_SOCKET, WEZ_SIG_ACCOUNT, and WEZ_SIG_OWNER together"),
     };
 
-    if let Some(token) = args.slack_bot_token.as_ref() {
-        channels.slack = Some(SlackClient::new(&args.slack_api_base, token, deadline)?);
-    }
-    let slack = match (
-        args.slack_socket_url.as_ref(),
-        args.slack_app_token.as_ref(),
-    ) {
-        (Some(url), None) => Some(SlackRuntime::Url(url.clone())),
-        (None, Some(token)) => Some(SlackRuntime::AppToken {
-            api_base: args.slack_api_base.clone(),
-            token: token.clone(),
-        }),
-        (None, None) => None,
-        (Some(_), Some(_)) => {
-            bail!("configure either PANETONE_SLACK_SOCKET_URL or WEZ_SLACK_APP_TOKEN, not both")
-        }
-    };
-    if slack.is_some() && channels.slack.is_none() {
-        bail!("Slack inbound requires WEZ_SLACK_BOT_TOKEN for outbound parity");
-    }
-    Ok((channels, telegram, signal, slack))
+    Ok((channels, telegram, signal))
 }
 
 async fn production_worker_loop(
@@ -563,58 +536,6 @@ async fn signal_loop(
                     if message.sender_id.as_deref() == Some(owner.as_str()) {
                         ingestor.persist(message, wall_now_ms()).await.map_err(|error| error.to_string())?;
                     }
-                }
-            }
-            if store
-                .promotion_status()
-                .await
-                .map_err(|error| error.to_string())?
-                .delivery_hold
-            {
-                break;
-            }
-        }
-    }
-}
-
-async fn slack_loop(
-    runtime: SlackRuntime,
-    ingestor: InboundIngestor,
-    store: StoreHandle,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) -> Result<(), String> {
-    loop {
-        if *shutdown.borrow() {
-            return Ok(());
-        }
-        if store
-            .promotion_status()
-            .await
-            .map_err(|error| error.to_string())?
-            .delivery_hold
-        {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                _ = shutdown.changed() => continue,
-            }
-            continue;
-        }
-        let mut socket = match &runtime {
-            SlackRuntime::Url(url) => SlackSocket::connect(url, Duration::from_secs(35)).await,
-            SlackRuntime::AppToken { api_base, token } => {
-                SlackSocket::connect_with_app_token(api_base, token, Duration::from_secs(35)).await
-            }
-        }
-        .map_err(|error| error.to_string())?;
-        loop {
-            tokio::select! {
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return Ok(());
-                    }
-                }
-                result = ingestor.ingest_slack_once(&mut socket, wall_now_ms()) => {
-                    result.map_err(|error| error.to_string())?;
                 }
             }
             if store

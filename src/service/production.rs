@@ -787,7 +787,6 @@ impl ProductionService {
                     "channels": {
                         "telegram": self.channels.telegram.is_some() || !self.channels.telegram_by_harness.is_empty(),
                         "signal": self.channels.signal.is_some(),
-                        "slack": self.channels.slack.is_some(),
                     },
                     "control": {"path": self.control_socket},
                     "tasks": self.health.snapshot(),
@@ -860,9 +859,6 @@ fn route_matches_inbox(route: &Route, item: &InboxItem) -> bool {
             }
             (ChannelBinding::Signal { group_id }, ChannelKind::Signal) => {
                 group_id.trim_end_matches('=') == item.destination.trim_end_matches('=')
-            }
-            (ChannelBinding::Slack { channel_id }, ChannelKind::Slack) => {
-                channel_id == &item.destination
             }
             _ => false,
         })

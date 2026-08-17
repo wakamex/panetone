@@ -1,8 +1,8 @@
 # Rust Phase 2 offline core
 
 Phase 2 is an offline implementation. It has no production Telegram, Signal,
-Slack, Debate, or Wakterm connection code and it was not installed or started as
-a service. The fakes execute the same typed workflow boundaries and record every
+Debate, or Wakterm connection code and it was not installed or started as a
+service. The fakes execute the same typed workflow boundaries and record every
 attempt so restart and effect-count assertions remain meaningful.
 
 ## Package and commands
@@ -81,7 +81,7 @@ The focused Rust suites cover:
 - malformed, oversized, stale, live, symlink, permission, and inode-replacement
   control socket cases
 - current and fixture-only future Wakterm capabilities and golden events
-- all four recording channel adapters
+- the supported Telegram and Signal recording channel adapters
 - busy target and callback queues, source disappearance, unrelated finals,
   audit failure, and linked audit states
 - injected crashes after prompt and callback effects with exact effect counts

@@ -80,6 +80,32 @@ fn route(id: u128, title: &str, pane_id: u64, topic_id: i64) -> Route {
     }
 }
 
+#[test]
+fn production_refuses_removed_slack_configuration_without_contacting_wakterm() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("control.sock");
+    let database = directory.path().join("state.sqlite3");
+    let output = Command::new(env!("CARGO_BIN_EXE_panetone"))
+        .arg("daemon")
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--database")
+        .arg(&database)
+        .arg("--wakterm-bin")
+        .arg("/does/not/exist")
+        .arg("--wakterm-socket")
+        .arg("/does/not/exist")
+        .env("WEZ_SLACK_BOT_TOKEN", "deprecated-secret")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Slack support was removed"));
+    assert!(stderr.contains("WEZ_SLACK_BOT_TOKEN"));
+    assert!(!stderr.contains("deprecated-secret"));
+    assert!(!socket.exists());
+}
+
 #[tokio::test]
 async fn held_production_daemon_opens_state_without_polling_or_external_effects() {
     let directory = tempdir().unwrap();

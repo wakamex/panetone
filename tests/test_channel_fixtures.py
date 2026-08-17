@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.14"
-# dependencies = ["python-telegram-bot>=22.0", "slack-sdk>=3.0", "aiohttp"]
+# dependencies = ["python-telegram-bot>=22.0", "aiohttp"]
 # ///
 
 import json
@@ -22,8 +22,6 @@ os.environ.update({
     "WEZ_SIG_ACCOUNT": "",
     "WEZ_SIG_OWNER": "",
     "WEZ_TG_DEBATE_CHAT": "0",
-    "WEZ_SLACK_BOT_TOKEN": "",
-    "WEZ_SLACK_APP_TOKEN": "",
 })
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -49,7 +47,6 @@ class ChannelRoutingFixtureTests(unittest.IsolatedAsyncioTestCase):
         bridge.sig_tab_name.clear()
         bridge.tab_last_source.clear()
         bridge.last_source_name.clear()
-        bridge._slack_direct_tab.clear()
         bridge._pending_sends.clear()
 
     def tearDown(self):
@@ -70,16 +67,12 @@ class ChannelRoutingFixtureTests(unittest.IsolatedAsyncioTestCase):
                     bridge.sig_tab_name[tab_id] = "Alpha"
                 if case["source"] is not None:
                     bridge.tab_last_source[tab_id] = case["source"]
-                if case["slack_channel"] is not None:
-                    bridge._slack_direct_tab[tab_id] = case["slack_channel"]
-
                 with patch.multiple(
                     bridge,
                     SIGNAL_ENABLED=case["signal_enabled"],
                     DEBATE_ENABLED=case["debate_enabled"],
                     DEBATE_TABS=case["debate_tabs"],
                     DEBATE_CHAT=case.get("debate_chat", 0),
-                    SLACK_ENABLED=case["slack_enabled"],
                 ):
                     actual = bridge._pane_main_route(pane_id)
                 if actual is not None:
@@ -88,8 +81,6 @@ class ChannelRoutingFixtureTests(unittest.IsolatedAsyncioTestCase):
 
     def test_text_format_golden_cases(self):
         cases = FIXTURE["format_cases"]
-        slack = cases["slack_markdown_table"]
-        self.assertEqual(bridge._md_tables_to_slack(slack["input"]), slack["expected"])
         for case in cases["signal_group_ids"]:
             with self.subTest(signal_group=case["input"]):
                 self.assertEqual(

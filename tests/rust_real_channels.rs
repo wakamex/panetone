@@ -1,8 +1,6 @@
 use std::time::Duration;
 
-use panetone::channels::{
-    ChannelDeliveryError, RealChannels, SignalClient, SlackClient, TelegramClient,
-};
+use panetone::channels::{ChannelDeliveryError, RealChannels, SignalClient, TelegramClient};
 use panetone::domain::{ChannelKind, EffectId, OutboxItem, OutboxState};
 use serde_json::Value;
 use tempfile::tempdir;
@@ -122,39 +120,6 @@ async fn telegram_uses_the_originating_harness_bot_when_configured() {
         request.await.unwrap().request_line,
         "POST /botcodex-token/sendMessage HTTP/1.1"
     );
-}
-
-#[tokio::test]
-async fn slack_uses_client_message_id_and_classifies_destinations() {
-    let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 24\r\n\r\n{\"ok\":true,\"ts\":\"9.100\"}";
-    let (base, request) = http_server(response, Duration::ZERO).await;
-    let slack = SlackClient::new(&base, "xoxb-secret", Duration::from_secs(2)).unwrap();
-    let receipt = slack.send(&item(ChannelKind::Slack, "C123")).await.unwrap();
-    assert_eq!(receipt.external_id, "9.100");
-    let request = request.await.unwrap();
-    assert_eq!(request.request_line, "POST /chat.postMessage HTTP/1.1");
-    assert_eq!(request.body["channel"], "C123");
-    assert_eq!(
-        request.body["client_msg_id"],
-        "11111111-1111-4111-8111-111111111111"
-    );
-    assert!(
-        request
-            .headers
-            .contains("authorization: Bearer xoxb-secret")
-    );
-
-    let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 40\r\n\r\n{\"ok\":false,\"error\":\"channel_not_found\"}";
-    let (base, request) = http_server(response, Duration::ZERO).await;
-    let slack = SlackClient::new(&base, "secret", Duration::from_secs(2)).unwrap();
-    assert!(matches!(
-        slack.send(&item(ChannelKind::Slack, "gone")).await,
-        Err(ChannelDeliveryError::DestinationUnavailable {
-            kind: ChannelKind::Slack,
-            ..
-        })
-    ));
-    request.await.unwrap();
 }
 
 #[tokio::test]

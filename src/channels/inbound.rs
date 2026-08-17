@@ -1,14 +1,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::UnixStream;
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 use uuid::Uuid;
 
 use crate::domain::{ChannelKind, EffectId};
@@ -143,124 +140,6 @@ impl TelegramPoller {
             messages,
             next_offset,
         })
-    }
-}
-
-type SlackStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
-
-pub struct SlackSocket {
-    stream: SlackStream,
-    deadline: Duration,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SlackEnvelope {
-    pub envelope_id: String,
-    pub message: Option<InboundMessage>,
-}
-
-impl SlackSocket {
-    pub async fn connect(url: &str, deadline: Duration) -> Result<Self, ChannelDeliveryError> {
-        let config = WebSocketConfig::default()
-            .read_buffer_size(16 * 1024)
-            .write_buffer_size(16 * 1024)
-            .max_write_buffer_size(MAX_INBOUND_BYTES)
-            .max_message_size(Some(MAX_INBOUND_BYTES))
-            .max_frame_size(Some(MAX_INBOUND_BYTES));
-        let (stream, _) = timeout(
-            deadline,
-            connect_async_with_config(url, Some(config), false),
-        )
-        .await
-        .map_err(|_| ChannelDeliveryError::Timeout(ChannelKind::Slack))?
-        .map_err(|_| ChannelDeliveryError::Transport(ChannelKind::Slack))?;
-        Ok(Self { stream, deadline })
-    }
-
-    pub async fn connect_with_app_token(
-        api_base: &str,
-        app_token: &str,
-        deadline: Duration,
-    ) -> Result<Self, ChannelDeliveryError> {
-        let response = http_client(deadline, ChannelKind::Slack)?
-            .post(format!(
-                "{}/apps.connections.open",
-                api_base.trim_end_matches('/')
-            ))
-            .bearer_auth(app_token)
-            .send()
-            .await
-            .map_err(|error| {
-                if error.is_timeout() {
-                    ChannelDeliveryError::Timeout(ChannelKind::Slack)
-                } else {
-                    ChannelDeliveryError::Transport(ChannelKind::Slack)
-                }
-            })?;
-        let body = response_body(response, ChannelKind::Slack).await?;
-        let response: SlackConnectionResponse = serde_json::from_slice(&body)
-            .map_err(|_| ChannelDeliveryError::Malformed(ChannelKind::Slack))?;
-        let url = response
-            .url
-            .filter(|url| response.ok && !url.is_empty())
-            .ok_or_else(|| ChannelDeliveryError::Rejected {
-                kind: ChannelKind::Slack,
-                detail: safe_detail(response.error.as_deref().unwrap_or("Socket Mode rejected")),
-            })?;
-        Self::connect(&url, deadline).await
-    }
-
-    pub async fn next(&mut self) -> Result<SlackEnvelope, ChannelDeliveryError> {
-        loop {
-            let frame = timeout(self.deadline, self.stream.next())
-                .await
-                .map_err(|_| ChannelDeliveryError::Timeout(ChannelKind::Slack))?
-                .ok_or(ChannelDeliveryError::Transport(ChannelKind::Slack))?
-                .map_err(|_| ChannelDeliveryError::Transport(ChannelKind::Slack))?;
-            let Message::Text(text) = frame else {
-                if matches!(frame, Message::Close(_)) {
-                    return Err(ChannelDeliveryError::Transport(ChannelKind::Slack));
-                }
-                continue;
-            };
-            let wire: SlackWireEnvelope = serde_json::from_str(text.as_ref())
-                .map_err(|_| ChannelDeliveryError::Malformed(ChannelKind::Slack))?;
-            if wire.envelope_id.is_empty() {
-                return Err(ChannelDeliveryError::Malformed(ChannelKind::Slack));
-            }
-            let message = wire
-                .payload
-                .and_then(|payload| payload.event)
-                .filter(|event| event.kind == "message")
-                .and_then(|event| {
-                    let destination = event.channel?;
-                    let body = event.text?;
-                    Some(InboundMessage {
-                        channel: ChannelKind::Slack,
-                        external_id: wire.envelope_id.clone(),
-                        destination,
-                        sender_id: event.user.clone().or_else(|| event.bot_id.clone()),
-                        sender: event.user.or(event.bot_id),
-                        body,
-                    })
-                });
-            return Ok(SlackEnvelope {
-                envelope_id: wire.envelope_id,
-                message,
-            });
-        }
-    }
-
-    pub async fn acknowledge(&mut self, envelope_id: &str) -> Result<(), ChannelDeliveryError> {
-        timeout(
-            self.deadline,
-            self.stream.send(Message::Text(
-                json!({"envelope_id": envelope_id}).to_string().into(),
-            )),
-        )
-        .await
-        .map_err(|_| ChannelDeliveryError::Timeout(ChannelKind::Slack))?
-        .map_err(|_| ChannelDeliveryError::Transport(ChannelKind::Slack))
     }
 }
 
@@ -406,34 +285,6 @@ impl TelegramUser {
             Some(name)
         }
     }
-}
-
-#[derive(Deserialize)]
-struct SlackWireEnvelope {
-    envelope_id: String,
-    payload: Option<SlackPayload>,
-}
-
-#[derive(Deserialize)]
-struct SlackConnectionResponse {
-    ok: bool,
-    url: Option<String>,
-    error: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct SlackPayload {
-    event: Option<SlackEvent>,
-}
-
-#[derive(Deserialize)]
-struct SlackEvent {
-    #[serde(rename = "type")]
-    kind: String,
-    channel: Option<String>,
-    text: Option<String>,
-    user: Option<String>,
-    bot_id: Option<String>,
 }
 
 async fn read_bounded_line(

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.14"
-# dependencies = ["python-telegram-bot>=22.0", "slack-sdk>=3.0", "aiohttp"]
+# dependencies = ["python-telegram-bot>=22.0", "aiohttp"]
 # ///
 
 import asyncio
@@ -28,8 +28,6 @@ os.environ.update({
     "WEZ_SIG_ACCOUNT": "",
     "WEZ_SIG_OWNER": "",
     "WEZ_TG_DEBATE_CHAT": "0",
-    "WEZ_SLACK_BOT_TOKEN": "",
-    "WEZ_SLACK_APP_TOKEN": "",
 })
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -145,6 +143,19 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
         bridge._tg_verified_names.clear()
         bridge._tg_stale_topics.clear()
         self.tmp.cleanup()
+
+    def test_removed_slack_configuration_fails_without_exposing_its_value(self):
+        with patch.dict(
+            os.environ,
+            {"WEZ_SLACK_BOT_TOKEN": "deprecated-secret"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Slack support was removed.*WEZ_SLACK_BOT_TOKEN",
+            ) as raised:
+                bridge._reject_removed_slack_configuration()
+        self.assertNotIn("deprecated-secret", str(raised.exception))
 
     def _configure_output(self, bot=None):
         bridge.pane_harness[9] = "codex"

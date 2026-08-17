@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.14"
-# dependencies = ["python-telegram-bot>=22.0", "slack-sdk>=3.0", "aiohttp"]
+# dependencies = ["python-telegram-bot>=22.0", "aiohttp"]
 # ///
 
 import json
@@ -24,8 +24,6 @@ os.environ.update({
     "WEZ_SIG_ACCOUNT": "",
     "WEZ_SIG_OWNER": "",
     "WEZ_TG_DEBATE_CHAT": "0",
-    "WEZ_SLACK_BOT_TOKEN": "",
-    "WEZ_SLACK_APP_TOKEN": "",
 })
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -69,7 +67,7 @@ class LegacyStateFixtureTests(unittest.TestCase):
         )
         self.assertEqual(
             {item["kind"] for item in self.fixture["pending_json"]["items"]},
-            {"tg", "sig", "debate", "slack"},
+            {"tg", "sig", "debate"},
         )
 
     def test_pending_state_round_trips_through_current_decoder(self):
@@ -83,6 +81,26 @@ class LegacyStateFixtureTests(unittest.TestCase):
         self.assertEqual(encoded["schema"], "panetone.delivery-state.v2")
         self.assertEqual(encoded["cursors"], self.fixture["pending_json"]["cursors"])
         self.assertEqual(encoded["items"], self.fixture["pending_json"]["items"])
+
+    def test_pending_slack_delivery_is_explicitly_rejected(self):
+        pending = json.loads(json.dumps(self.fixture["pending_json"]))
+        pending["items"].append({
+            "id": "removed-slack-delivery",
+            "kind": "slack",
+            "target": "C012345",
+            "chunk": "must not be replayed",
+            "pane_id": 14,
+            "harness": "opencode",
+            "route_title": "",
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pending.json"
+            path.write_text(json.dumps(pending))
+            with patch.object(bridge, "PENDING_STATE", path):
+                with self.assertRaisesRegex(RuntimeError, "Slack support was removed"):
+                    bridge._load_pending()
+
+        self.assertEqual(bridge._pending_sends, [])
 
     def test_signal_fixture_reproduces_pending_inbox_selection(self):
         with tempfile.TemporaryDirectory() as tmp:

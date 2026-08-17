@@ -99,78 +99,6 @@ impl TelegramClient {
 }
 
 #[derive(Clone)]
-pub struct SlackClient {
-    http: reqwest::Client,
-    api_base: String,
-    token: String,
-}
-
-impl SlackClient {
-    pub fn new(
-        api_base: impl Into<String>,
-        token: impl Into<String>,
-        deadline: Duration,
-    ) -> Result<Self, ChannelDeliveryError> {
-        Ok(Self {
-            http: http_client(deadline, ChannelKind::Slack)?,
-            api_base: api_base.into().trim_end_matches('/').to_owned(),
-            token: token.into(),
-        })
-    }
-
-    pub async fn send(&self, item: &OutboxItem) -> Result<DeliveryReceipt, ChannelDeliveryError> {
-        if item.kind != ChannelKind::Slack || item.destination.is_empty() {
-            return Err(ChannelDeliveryError::InvalidDestination(item.kind));
-        }
-        let response = self
-            .http
-            .post(format!("{}/chat.postMessage", self.api_base))
-            .bearer_auth(&self.token)
-            .header("x-panetone-delivery-id", item.id.to_string())
-            .json(&json!({
-                "channel": item.destination,
-                "text": item.body,
-                "client_msg_id": item.id.to_string()
-            }))
-            .send()
-            .await
-            .map_err(|error| map_http_error(ChannelKind::Slack, &error))?;
-        if response.status() == StatusCode::TOO_MANY_REQUESTS {
-            return Err(ChannelDeliveryError::RateLimited {
-                kind: ChannelKind::Slack,
-                retry_after_secs: retry_after_header(&response),
-            });
-        }
-        let status = response.status();
-        let body = response_body(response, ChannelKind::Slack).await?;
-        let parsed: SlackResponse = serde_json::from_slice(&body)
-            .map_err(|_| ChannelDeliveryError::Malformed(ChannelKind::Slack))?;
-        if status.is_success() && parsed.ok {
-            return parsed
-                .ts
-                .filter(|value| !value.is_empty())
-                .map(|external_id| DeliveryReceipt { external_id })
-                .ok_or(ChannelDeliveryError::Malformed(ChannelKind::Slack));
-        }
-        let detail = safe_remote_detail(parsed.error.as_deref().unwrap_or("unknown Slack error"));
-        if matches!(
-            detail.as_str(),
-            "channel_not_found" | "is_archived" | "not_in_channel"
-        ) {
-            Err(ChannelDeliveryError::DestinationUnavailable {
-                kind: ChannelKind::Slack,
-                detail,
-            })
-        } else {
-            Err(ChannelDeliveryError::Rejected {
-                kind: ChannelKind::Slack,
-                detail,
-            })
-        }
-    }
-}
-
-#[derive(Clone)]
 pub struct SignalClient {
     socket: PathBuf,
     account: String,
@@ -274,7 +202,6 @@ pub struct RealChannels {
     pub telegram: Option<TelegramClient>,
     pub telegram_by_harness: BTreeMap<String, TelegramClient>,
     pub signal: Option<SignalClient>,
-    pub slack: Option<SlackClient>,
 }
 
 impl RealChannels {
@@ -291,13 +218,6 @@ impl RealChannels {
             }
             ChannelKind::Signal => {
                 self.signal
-                    .as_ref()
-                    .ok_or(ChannelDeliveryError::NotConfigured(item.kind))?
-                    .send(item)
-                    .await
-            }
-            ChannelKind::Slack => {
-                self.slack
                     .as_ref()
                     .ok_or(ChannelDeliveryError::NotConfigured(item.kind))?
                     .send(item)
@@ -324,13 +244,6 @@ struct TelegramMessage {
 #[derive(Deserialize)]
 struct TelegramParameters {
     retry_after: Option<u64>,
-}
-
-#[derive(Deserialize)]
-struct SlackResponse {
-    ok: bool,
-    ts: Option<String>,
-    error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -416,15 +329,6 @@ fn map_http_error(kind: ChannelKind, error: &reqwest::Error) -> ChannelDeliveryE
     } else {
         ChannelDeliveryError::Transport(kind)
     }
-}
-
-fn retry_after_header(response: &reqwest::Response) -> u64 {
-    response
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(1)
 }
 
 pub(super) async fn response_body(

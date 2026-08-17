@@ -9,7 +9,6 @@ use super::{EffectId, RouteId};
 pub enum ChannelKind {
     Telegram,
     Signal,
-    Slack,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -17,7 +16,6 @@ pub enum ChannelKind {
 pub enum ChannelBinding {
     Telegram { topic_id: i64 },
     Signal { group_id: String },
-    Slack { channel_id: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,8 +30,6 @@ pub struct ChannelAvailability<'a> {
     pub telegram_topic: Option<i64>,
     pub signal_enabled: bool,
     pub signal_group: Option<&'a str>,
-    pub slack_enabled: bool,
-    pub slack_channel: Option<&'a str>,
 }
 
 pub fn select_channel(
@@ -62,15 +58,6 @@ pub fn select_channel(
                 destination: group_id.into(),
                 route_title: String::new(),
             })
-        }
-        ChannelKind::Slack if availability.slack_enabled => {
-            availability
-                .slack_channel
-                .map(|channel_id| ChannelSelection {
-                    kind: selected,
-                    destination: channel_id.into(),
-                    route_title: String::new(),
-                })
         }
         _ => None,
     }
@@ -165,63 +152,6 @@ pub fn normalize_signal_group_id(group_id: Option<&str>) -> String {
         .into()
 }
 
-pub fn format_slack_tables(text: &str) -> String {
-    fn flush(table: &mut Vec<Vec<String>>, output: &mut Vec<String>, trailing_blank: bool) {
-        if table.is_empty() {
-            return;
-        }
-        let columns = table[0].len();
-        let widths = (0..columns)
-            .map(|column| {
-                table
-                    .iter()
-                    .filter_map(|row| row.get(column))
-                    .map(String::len)
-                    .max()
-                    .unwrap_or(0)
-            })
-            .collect::<Vec<_>>();
-        for row in table.drain(..) {
-            let rendered = row
-                .iter()
-                .enumerate()
-                .map(|(column, cell)| format!("{cell:<width$}", width = widths[column]))
-                .collect::<Vec<_>>()
-                .join("  ");
-            output.push(rendered);
-        }
-        if trailing_blank {
-            output.push(String::new());
-        }
-    }
-
-    let mut output = Vec::new();
-    let mut table = Vec::new();
-    for line in text.split('\n') {
-        let trimmed = line.trim();
-        let is_table = trimmed.starts_with('|') && trimmed.ends_with('|');
-        if is_table {
-            let inner = trimmed.trim_matches('|');
-            let separator = inner
-                .chars()
-                .all(|character| matches!(character, '-' | ' ' | '|' | ':'));
-            if !separator {
-                table.push(
-                    inner
-                        .split('|')
-                        .map(|cell| cell.trim().to_owned())
-                        .collect(),
-                );
-            }
-        } else {
-            flush(&mut table, &mut output, true);
-            output.push(line.to_owned());
-        }
-    }
-    flush(&mut table, &mut output, false);
-    output.join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,11 +163,7 @@ mod tests {
     }
 
     #[test]
-    fn formats_tables_and_signal_ids() {
-        assert_eq!(
-            format_slack_tables("Before\n| A | B |\n| - | -: |\n| x | 2 |\nAfter"),
-            "Before\nA  B\nx  2\n\nAfter"
-        );
+    fn normalizes_signal_ids() {
         assert_eq!(normalize_signal_group_id(Some(" group== ")), "group");
         assert_eq!(normalize_signal_group_id(None), "");
     }

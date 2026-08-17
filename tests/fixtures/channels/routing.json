@@ -9,8 +9,6 @@
       "signal_group": null,
       "debate_enabled": false,
       "debate_tabs": [],
-      "slack_enabled": false,
-      "slack_channel": null,
       "expected": ["tg", 101, "Alpha"]
     },
     {
@@ -21,8 +19,6 @@
       "signal_group": "signal-alpha",
       "debate_enabled": false,
       "debate_tabs": [],
-      "slack_enabled": false,
-      "slack_channel": null,
       "expected": ["sig", "signal-alpha", ""]
     },
     {
@@ -33,8 +29,6 @@
       "signal_group": "signal-alpha",
       "debate_enabled": false,
       "debate_tabs": [],
-      "slack_enabled": false,
-      "slack_channel": null,
       "expected": ["tg", 101, "Alpha"]
     },
     {
@@ -46,21 +40,7 @@
       "debate_enabled": true,
       "debate_tabs": ["alpha"],
       "debate_chat": -100123,
-      "slack_enabled": false,
-      "slack_channel": null,
       "expected": ["debate", -100123, ""]
-    },
-    {
-      "name": "slack_requires_live_direct_binding",
-      "source": "slack",
-      "telegram_topic": 101,
-      "signal_enabled": false,
-      "signal_group": null,
-      "debate_enabled": false,
-      "debate_tabs": [],
-      "slack_enabled": true,
-      "slack_channel": "C012345",
-      "expected": ["slack", "C012345", ""]
     },
     {
       "name": "unavailable_selected_destination_does_not_fall_back",
@@ -70,16 +50,10 @@
       "signal_group": null,
       "debate_enabled": false,
       "debate_tabs": [],
-      "slack_enabled": false,
-      "slack_channel": null,
       "expected": null
     }
   ],
   "format_cases": {
-    "slack_markdown_table": {
-      "input": "Before\n| Name | Value |\n| --- | ---: |\n| alpha | 1 |\n| b | 22 |\nAfter",
-      "expected": "Before\nName   Value\nalpha  1    \nb      22   \n\nAfter"
-    },
     "signal_group_ids": [
       {"input": "group==", "expected": "group"},
       {"input": " group= ", "expected": "group"},
@@ -103,9 +77,8 @@
       ["tg", 101, "tg-2", 11, "codex", "alpha", "item-2"],
       ["tg", 102, "tg-other", 12, "claude", "beta", "item-3"],
       ["sig", "group-a", "sig-1", 11, "codex", "", "item-4"],
-      ["sig", "group-a", "sig-2", 11, "codex", "", "item-5"],
-      ["slack", "C012345", "slack-1", 13, "gemini", "", "item-6"]
+      ["sig", "group-a", "sig-2", 11, "codex", "", "item-5"]
     ],
-    "expected_attempt_ids": ["item-1", "item-4", "item-6"]
+    "expected_attempt_ids": ["item-1", "item-4"]
   }
 }

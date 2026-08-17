@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.14"
-# dependencies = ["python-telegram-bot>=22.0", "slack-sdk>=3.0", "aiohttp"]
+# dependencies = ["python-telegram-bot>=22.0", "aiohttp"]
 # ///
 
 import sys

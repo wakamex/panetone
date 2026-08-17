@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.14"
-# dependencies = ["python-telegram-bot>=22.0", "slack-sdk>=3.0", "aiohttp"]
+# dependencies = ["python-telegram-bot>=22.0", "aiohttp"]
 # ///
 """Compare one Codex output interval through Wakterm and the legacy reader.
 
@@ -33,8 +33,6 @@ def _load_bridge():
     os.environ.setdefault("WEZ_SIG_ACCOUNT", "")
     os.environ.setdefault("WEZ_SIG_OWNER", "")
     os.environ.setdefault("WEZ_TG_DEBATE_CHAT", "0")
-    os.environ.setdefault("WEZ_SLACK_BOT_TOKEN", "")
-    os.environ.setdefault("WEZ_SLACK_APP_TOKEN", "")
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import bridge
 

@@ -1,6 +1,6 @@
 # Panetone conformance fixtures
 
-The Phase 1 corpus records observable contracts before the Rust replacement is implemented. Tests may read local fixture files and temporary databases, but they must not contact Telegram, Signal, Slack, or a live agent.
+The Phase 1 corpus records observable contracts before the Rust replacement is implemented. Tests may read local fixture files and temporary databases, but they must not contact Telegram, Signal, or a live agent.
 
 ## Control v1 black-box runner
 
@@ -47,7 +47,7 @@ These are consumer requirements, not a shared parser specification. Wakterm owns
 
 ## Legacy state and channel decisions
 
-`tests/fixtures/legacy-state/representative.json` contains every legacy state source, all four pending output destinations, all control terminal classes, Signal inbox states, and a callback whose legacy error cannot be attributed to one destination. It contains no production path, token, chat ID, phone number, message, or provider identifier.
+`tests/fixtures/legacy-state/representative.json` contains every legacy state source, every supported pending output destination, the held Debate destination, all control terminal classes, Signal inbox states, and a callback whose legacy error cannot be attributed to one destination. Its legacy Slack preference verifies explicit deprecation without making Slack deliverable. It contains no production path, token, chat ID, phone number, message, or provider identifier.
 
 The state fixture is migration input and rollback evidence. A migration test must copy it, migrate twice, and compare validated identities, row counts, cursor or watermark mappings, payload hashes, and delivery states. It must reject ambiguous route recovery.
 

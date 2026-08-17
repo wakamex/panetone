@@ -260,7 +260,7 @@ async fn migration_is_copy_only_idempotent_and_preserves_conservative_state() {
     assert!(!first.reused);
     assert_eq!(first.manifest.target_schema_version, 5);
     assert_eq!(first.manifest.counts["routes"], 3);
-    assert_eq!(first.manifest.counts["pending_outbox"], 3);
+    assert_eq!(first.manifest.counts["pending_outbox"], 2);
     assert_eq!(first.manifest.counts["legacy_debate_outbox_held"], 1);
     assert_eq!(first.manifest.counts["signal_messages"], 4);
     assert_eq!(first.manifest.counts["pending_signal_inbox"], 2);
@@ -273,6 +273,14 @@ async fn migration_is_copy_only_idempotent_and_preserves_conservative_state() {
             .warnings
             .iter()
             .any(|warning| warning.contains("collaboration tab IDs"))
+    );
+    assert!(
+        first
+            .manifest
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Slack preference")
+                && warning.contains("not deliverable"))
     );
     assert_eq!(fs::read(&sources.options.state).unwrap(), original_state);
     assert_eq!(
@@ -415,7 +423,7 @@ async fn migration_is_copy_only_idempotent_and_preserves_conservative_state() {
     assert_eq!(status.legacy_control_requests, 4);
     assert_eq!(status.legacy_indeterminate_requests, 2);
     assert_eq!(status.legacy_unresolved_returns, 1);
-    assert_eq!(status.pending_outbox, 3);
+    assert_eq!(status.pending_outbox, 2);
     assert_eq!(status.legacy_debate_outbox, 1);
     assert_eq!(status.pending_inbox, 2);
     store.shutdown().await.unwrap();
@@ -423,6 +431,38 @@ async fn migration_is_copy_only_idempotent_and_preserves_conservative_state() {
     let second = migrate(&sources.options).unwrap();
     assert!(second.reused);
     assert_eq!(second.manifest, first.manifest);
+}
+
+#[test]
+fn migration_rejects_pending_slack_delivery_without_replaying_or_discarding_it() {
+    let sources = setup_sources();
+    let mut pending: Value =
+        serde_json::from_slice(&fs::read(&sources.options.pending).unwrap()).unwrap();
+    pending["items"].as_array_mut().unwrap().push(json!({
+        "id": "removed-slack-delivery",
+        "kind": "slack",
+        "target": "C012345",
+        "chunk": "must not be replayed",
+        "pane_id": 14,
+        "harness": "opencode",
+        "route_title": ""
+    }));
+    fs::write(
+        &sources.options.pending,
+        serde_json::to_vec(&pending).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&sources.options.pending, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let error = migrate(&sources.options).unwrap_err();
+    assert!(matches!(
+        error,
+        MigrationError::RemovedSlackPending(ref id) if id == "removed-slack-delivery"
+    ));
+    assert!(!sources.options.output.exists());
+    let saved: Value =
+        serde_json::from_slice(&fs::read(&sources.options.pending).unwrap()).unwrap();
+    assert_eq!(saved["items"].as_array().unwrap().len(), 4);
 }
 
 #[test]
@@ -553,7 +593,7 @@ fn migration_cli_returns_a_structured_reusable_bundle_acknowledgement() {
     let first: Value = serde_json::from_slice(&first.stdout).unwrap();
     assert_eq!(first["ok"], true);
     assert_eq!(first["reused"], false);
-    assert_eq!(first["manifest"]["counts"]["pending_outbox"], 3);
+    assert_eq!(first["manifest"]["counts"]["pending_outbox"], 2);
     assert_eq!(first["manifest"]["counts"]["legacy_debate_outbox_held"], 1);
     let second = run();
     assert!(second.status.success());

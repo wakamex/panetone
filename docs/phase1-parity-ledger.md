@@ -2,6 +2,10 @@
 
 Date: 2026-08-16
 
+Slack was removed on 2026-08-17. The Slack rows below now document how legacy
+state is rejected or retained as rollback evidence, not a supported parity
+target.
+
 This ledger freezes observable Python behavior for conformance work. It separates behavior that must remain compatible from known implementation details and deliberate future changes. A fixture or test reference is added as each row becomes executable.
 
 ## Compatibility labels
@@ -41,8 +45,8 @@ This ledger freezes observable Python behavior for conformance work. It separate
 | Provider parsing | Panetone reads Claude and Codex JSONL, Gemini JSON, and OpenCode SQLite parts into normalized text | Retire | Provider-output fixtures |
 | First observation | An existing source is baselined at its current tail on fresh startup; a genuinely new session discovered later begins at its first record | Replace with an explicit Wakterm cursor and lifecycle event | Cursor fixtures |
 | Cursor checkpoint | All output chunks and the next source cursor are written in one atomic JSON replacement before any remote send | Preserve invariant in one SQLite transaction | Restart fixtures |
-| Missing route during read | Do not advance the source cursor when messages exist but no main route or active Slack observer can receive them | Preserve | Routing fixtures |
-| Main output route | Use the stable last source for the route, falling back through configured Telegram, Signal, debate, or Slack bindings | Preserve decisions | Routing fixtures |
+| Missing route during read | Do not advance the source cursor when messages exist but no main route can receive them | Preserve | Routing fixtures |
+| Main output route | Use the stable last source for the route, falling back through configured Telegram, Signal, or Debate bindings | Preserve decisions | Routing fixtures |
 | Collab forwarding | Agent output can be prefixed and forwarded to other panes, with finite rounds and signoff completion | Preserve until policy is deliberately revised | Collab fixtures |
 | Authoritative future stream | Wakterm emits normalized messages, plans, turns, finals, lifecycle, and observer failures with durable sequence and incarnation identity | New boundary | Wakterm Agent API fixtures |
 | Codex shadow | Compare Wakterm events with the Python reader through recording sinks only | Discovery | Shadow comparison report |
@@ -57,7 +61,7 @@ This ledger freezes observable Python behavior for conformance work. It separate
 | Signal groups | Title-keyed group IDs persist and padding is normalized. Legacy numeric tab keys and muted backlog are migrated on startup. | Migrate once offline into route and channel binding tables. |
 | Signal inbox | Accepted incoming messages are archived in SQLite and remain pending until submitted. Duplicate envelopes are ignored by group, sender, and timestamp. | Preserve durable inbox and deduplication in the unified store. |
 | Signal queues | Command and decoded-input queues are process-local lists. | Persist accepted work before queueing and use bounded channels. |
-| Slack observer | Message buffers, `!obs` work, direct input, and the one active observer reply destination are process-local. | Persist accepted work and use bounded per-adapter commands. |
+| Slack observer | Legacy message buffers, `!obs` work, and direct input were process-local. | Removed. No input, output, observer, credentials, or adapter remains. |
 | Debate routing | Reply maps and crosspost toggle are process-local; configured chat and tab patterns determine participation. | Preserve user-visible policy, but make required workflow state explicit. |
 
 ## Durable state inventory
@@ -72,7 +76,7 @@ Default path: `~/.config/wez-tg/state.json` or `WEZ_TG_STATE`.
 | `collab` | object from decimal tab ID string to remaining rounds | Current persistence uses ephemeral tab IDs. Migration must resolve from the stopped layout snapshot or reject ambiguity. |
 | `clod_off_groups` | array of normalized Signal group IDs | Muted groups. Preserve exactly. |
 | `signal_groups` | object from lowercase title to Signal group ID | Stable Signal binding. Preserve normalized IDs. |
-| `last_sources` | object from lowercase title to `tg`, `sig`, `debate`, or `slack` | Preferred output channel. Preserve only recognized values. |
+| `last_sources` | legacy object from lowercase title to `tg`, `sig`, `debate`, or `slack` | Preserve Slack values only as deprecated migration metadata. They never select output. |
 | `clod_off` | legacy array of tab IDs | Resolve through legacy state or reject ambiguity, then remove. |
 | `clod_history` | legacy object from group ID to message list | Import into Signal inbox without marking delivered, then remove. |
 | `signal_group_names` | legacy object from tab ID to title | Used only to recover legacy numeric `signal_groups` keys. |
@@ -88,7 +92,7 @@ Default path: beside `state.json` or `WEZ_TG_PENDING`. Schema is `panetone.deliv
 | `saved_at` | Unix milliseconds | Diagnostic timestamp, not ordering authority. |
 | `cursors` | object from stable source key to provider-specific cursor object | Import for rollback evidence only. Rust never reads provider stores. A provider cutover maps the last safe cursor to a Wakterm event watermark. |
 | `items[].id` | string UUID | Durable output item identity. Preserve. |
-| `items[].kind` | `tg`, `sig`, `debate`, or `slack` | Destination adapter. Preserve. |
+| `items[].kind` | legacy `tg`, `sig`, `debate`, or `slack` | Migrate Telegram and Signal, hold Debate for exact Signal reconciliation, and reject pending Slack with its item ID. |
 | `items[].target` | adapter-specific topic, group, or channel ID | Resolve into a channel binding without silently changing destination. |
 | `items[].chunk` | string | Pending body. Preserve byte-for-byte after JSON decoding. |
 | `items[].pane_id` | integer | Historical origin only. Do not use as durable identity. |
@@ -117,7 +121,7 @@ Migration preserves all requests, including pending and indeterminate rows, resp
 | Telegram, Signal, and debate reply maps | Channel handlers | Lost | Durable inbound work or explicitly best-effort UI context |
 | Last active pane per route | Channel and output handlers | Lost | Opaque live agent selection recorded with an incarnation |
 | Signal command and input queues | Signal callback | Lost | Durable inbox plus bounded worker queue |
-| Slack message, observer, and direct queues | Slack callback | Lost | Durable inbox plus bounded worker queue |
+| Slack message, observer, and direct queues | Removed Slack callback | Lost | Removed. No replacement queue is created. |
 | Collab signoffs and debate crosspost toggle | Workflow handlers | Lost | Persist if retained as supported behavior |
 | Background task handles and health | Startup supervisor set | Cancelled at clean shutdown, failures logged | One typed supervisor and explicit degraded state |
 
@@ -130,7 +134,7 @@ The following are not parity failures when backed by their migration or compatib
 - permanent compact UUID tombstones replace expiration of completed idempotency
 - provider discovery, parsing, and file cursors move entirely to Wakterm
 - each callback destination receives its own error field
-- accepted Telegram, Signal, and Slack input is not intentionally dropped on restart
+- accepted Telegram and Signal input is not intentionally dropped on restart
 - all durable truth moves into one versioned SQLite database
 - task failure and backlog become visible through `status --json` and `doctor`
 

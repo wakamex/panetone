@@ -1,8 +1,8 @@
 use panetone::domain::{
     AgentBinding, ChannelAvailability, ChannelBinding, ChannelKind, EffectId, LiveRoute,
     OutboxItem, OutboxState, ReconcileDecision, Route, RouteError, RouteId, RouteStatus,
-    chunk_lines, chunk_utf16, fair_retry_indices, format_slack_tables, normalize_signal_group_id,
-    resolve_live_route, select_channel,
+    chunk_lines, chunk_utf16, fair_retry_indices, normalize_signal_group_id, resolve_live_route,
+    select_channel,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -92,7 +92,6 @@ fn channel_routing_and_formatting_match_frozen_fixture() {
         let source = match case["source"].as_str() {
             Some("tg") => Some(ChannelKind::Telegram),
             Some("sig") => Some(ChannelKind::Signal),
-            Some("slack") => Some(ChannelKind::Slack),
             None => None,
             Some(other) => panic!("unknown source {other}"),
         };
@@ -100,14 +99,11 @@ fn channel_routing_and_formatting_match_frozen_fixture() {
             telegram_topic: case["telegram_topic"].as_i64(),
             signal_enabled: case["signal_enabled"].as_bool().unwrap(),
             signal_group: case["signal_group"].as_str(),
-            slack_enabled: case["slack_enabled"].as_bool().unwrap(),
-            slack_channel: case["slack_channel"].as_str(),
         };
         let actual = select_channel(source, "Alpha", &availability).map(|selection| {
             let kind = match selection.kind {
                 ChannelKind::Telegram => "tg",
                 ChannelKind::Signal => "sig",
-                ChannelKind::Slack => "slack",
             };
             serde_json::json!([kind, selection.destination, selection.route_title])
         });
@@ -127,12 +123,6 @@ fn channel_routing_and_formatting_match_frozen_fixture() {
     assert!(serde_json::from_str::<ChannelKind>(r#""debate""#).is_err());
 
     let formats = &data["format_cases"];
-    assert_eq!(
-        format_slack_tables(formats["slack_markdown_table"]["input"].as_str().unwrap()),
-        formats["slack_markdown_table"]["expected"]
-            .as_str()
-            .unwrap()
-    );
     for case in formats["signal_group_ids"].as_array().unwrap() {
         assert_eq!(
             normalize_signal_group_id(case["input"].as_str()),
@@ -179,7 +169,6 @@ fn retry_selection_is_fair_per_destination() {
             kind: match item[0].as_str().unwrap() {
                 "tg" => ChannelKind::Telegram,
                 "sig" => ChannelKind::Signal,
-                "slack" => ChannelKind::Slack,
                 other => panic!("unknown channel {other}"),
             },
             destination: match &item[1] {
