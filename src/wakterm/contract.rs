@@ -18,7 +18,7 @@ pub enum ProfileKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CatalogAgent {
     pub agent_id: String,
-    pub incarnation_id: String,
+    pub incarnation_id: Option<String>,
     pub pane_id: u64,
     pub name: String,
     pub harness: String,
@@ -31,6 +31,7 @@ pub struct CatalogAgent {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentCatalog {
     pub schema: String,
+    #[serde(default)]
     pub as_of_event_sequence: u64,
     pub agents: Vec<CatalogAgent>,
 }
@@ -82,6 +83,8 @@ pub enum ContractError {
     MissingPane(u64),
     #[error("pane id {0} is ambiguous in the catalog")]
     AmbiguousPane(u64),
+    #[error("live catalog agent on pane {0} has no process incarnation")]
+    MissingIncarnation(u64),
     #[error("the catalog changed agent identity while resolving the route")]
     UnstableCatalog,
 }
@@ -217,9 +220,13 @@ pub fn join_catalog_binding(
     if first.agent_id != second.agent_id || first.incarnation_id != second.incarnation_id {
         return Err(ContractError::UnstableCatalog);
     }
+    let incarnation_id = second
+        .incarnation_id
+        .clone()
+        .ok_or(ContractError::MissingIncarnation(pane_id))?;
     Ok(AgentBinding {
         agent_id: second.agent_id.clone(),
-        incarnation_id: second.incarnation_id.clone(),
+        incarnation_id,
         harness: second.harness.clone(),
         pane_id: Some(pane_id),
     })

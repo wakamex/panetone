@@ -91,6 +91,20 @@ fn pane_is_only_a_fresh_catalog_join_and_names_are_not_identity() {
         join_catalog_binding(9, &before, &after),
         Err(ContractError::UnstableCatalog)
     ));
+
+    let mut after = before.clone();
+    after.agents[0].incarnation_id = None;
+    assert!(matches!(
+        join_catalog_binding(9, &before, &after),
+        Err(ContractError::UnstableCatalog)
+    ));
+
+    let mut before = before;
+    before.agents[0].incarnation_id = None;
+    assert!(matches!(
+        join_catalog_binding(9, &before, &before),
+        Err(ContractError::MissingIncarnation(9))
+    ));
 }
 
 #[test]
