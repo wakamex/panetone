@@ -7,6 +7,5 @@ pub use inbound::{
     InboundBatch, InboundMessage, SignalSubscriber, SlackEnvelope, SlackSocket, TelegramPoller,
 };
 pub use real::{
-    ChannelDeliveryError, DebateClient, DeliveryReceipt, RealChannels, SignalClient, SlackClient,
-    TelegramClient,
+    ChannelDeliveryError, DeliveryReceipt, RealChannels, SignalClient, SlackClient, TelegramClient,
 };

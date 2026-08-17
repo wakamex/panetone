@@ -64,9 +64,12 @@ boundary explicitly.
   Routes retain channel bindings but start unavailable with no agent binding.
   Phase 5 must reconcile each route through a fresh Wakterm catalog. Pane and
   tab IDs never become durable identity.
-- Pending Telegram, Signal, Slack, and Debate chunks become canonical pending
-  outbox work with deterministic effect IDs. A route ID is attached only when
-  the title or channel destination identifies exactly one migrated route.
+- Pending Telegram, Signal, and Slack chunks become canonical pending outbox
+  work with deterministic effect IDs. A route ID is attached only when the
+  title or channel destination identifies exactly one migrated route. Legacy
+  `debate` chunks are held in a reconciliation table because Debate is a named
+  Signal group, not a separate transport. Phase 5 may convert one only after
+  matching its destination to the configured Signal group exactly.
 - Every Signal row remains in the canonical Signal archive. Accepted,
   undelivered, non-command incoming text becomes pending inbox work. The older
   JSON mute backlog also becomes pending inbox work with deterministic legacy
@@ -90,8 +93,10 @@ boundary explicitly.
   rollback-only and appears as a manifest warning.
 
 The migrated database exposes legacy indeterminate controls and unresolved
-returns in both `status` and `doctor`. `doctor` remains degraded until those
-records receive explicit operator resolution during promotion.
+returns in both `status` and `doctor`. Held legacy Debate output is visible in
+the same diagnostics and is never sent through Telegram. `doctor` remains
+degraded until those records receive explicit operator resolution during
+promotion.
 
 ## Restore drill
 

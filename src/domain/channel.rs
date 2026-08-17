@@ -10,7 +10,6 @@ pub enum ChannelKind {
     Telegram,
     Signal,
     Slack,
-    Debate,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -19,7 +18,6 @@ pub enum ChannelBinding {
     Telegram { topic_id: i64 },
     Signal { group_id: String },
     Slack { channel_id: String },
-    Debate { chat_id: i64 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,9 +32,6 @@ pub struct ChannelAvailability<'a> {
     pub telegram_topic: Option<i64>,
     pub signal_enabled: bool,
     pub signal_group: Option<&'a str>,
-    pub debate_enabled: bool,
-    pub debate_matches_route: bool,
-    pub debate_chat: Option<i64>,
     pub slack_enabled: bool,
     pub slack_channel: Option<&'a str>,
 }
@@ -65,13 +60,6 @@ pub fn select_channel(
             availability.signal_group.map(|group_id| ChannelSelection {
                 kind: selected,
                 destination: group_id.into(),
-                route_title: String::new(),
-            })
-        }
-        ChannelKind::Debate if availability.debate_enabled && availability.debate_matches_route => {
-            availability.debate_chat.map(|chat_id| ChannelSelection {
-                kind: selected,
-                destination: chat_id.to_string(),
                 route_title: String::new(),
             })
         }

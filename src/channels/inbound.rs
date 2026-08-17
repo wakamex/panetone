@@ -64,15 +64,6 @@ impl TelegramPoller {
         Self::new(api_base, token, ChannelKind::Telegram, chat_id, deadline)
     }
 
-    pub fn debate(
-        api_base: impl Into<String>,
-        token: impl Into<String>,
-        chat_id: i64,
-        deadline: Duration,
-    ) -> Result<Self, ChannelDeliveryError> {
-        Self::new(api_base, token, ChannelKind::Debate, chat_id, deadline)
-    }
-
     fn new(
         api_base: impl Into<String>,
         token: impl Into<String>,
@@ -134,16 +125,10 @@ impl TelegramPoller {
             let Some(body) = message.text else {
                 continue;
             };
-            let destination = match self.kind {
-                ChannelKind::Telegram => {
-                    let Some(topic) = message.message_thread_id else {
-                        continue;
-                    };
-                    topic.to_string()
-                }
-                ChannelKind::Debate => self.chat_id.to_string(),
-                _ => unreachable!("Telegram poller has a Telegram-derived kind"),
+            let Some(topic) = message.message_thread_id else {
+                continue;
             };
+            let destination = topic.to_string();
             messages.push(InboundMessage {
                 channel: self.kind,
                 external_id: update.update_id.to_string(),

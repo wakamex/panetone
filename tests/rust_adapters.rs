@@ -168,7 +168,6 @@ fn recording_channels_cover_all_transports_and_do_not_hide_at_least_once_replays
         ChannelKind::Telegram,
         ChannelKind::Signal,
         ChannelKind::Slack,
-        ChannelKind::Debate,
     ]
     .into_iter()
     .enumerate()
@@ -177,7 +176,7 @@ fn recording_channels_cover_all_transports_and_do_not_hide_at_least_once_replays
         channels.send(&item).unwrap();
         channels.send(&item).unwrap();
     }
-    assert_eq!(channels.calls().len(), 8);
+    assert_eq!(channels.calls().len(), 6);
 
     channels.fail(ChannelKind::Telegram);
     assert!(channels.send(&item(10, ChannelKind::Telegram)).is_err());

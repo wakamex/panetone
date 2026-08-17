@@ -258,9 +258,10 @@ async fn migration_is_copy_only_idempotent_and_preserves_conservative_state() {
     let original_pending = fs::read(&sources.options.pending).unwrap();
     let first = migrate(&sources.options).unwrap();
     assert!(!first.reused);
-    assert_eq!(first.manifest.target_schema_version, 2);
+    assert_eq!(first.manifest.target_schema_version, 3);
     assert_eq!(first.manifest.counts["routes"], 3);
-    assert_eq!(first.manifest.counts["pending_outbox"], 4);
+    assert_eq!(first.manifest.counts["pending_outbox"], 3);
+    assert_eq!(first.manifest.counts["legacy_debate_outbox_held"], 1);
     assert_eq!(first.manifest.counts["signal_messages"], 4);
     assert_eq!(first.manifest.counts["pending_signal_inbox"], 2);
     assert_eq!(first.manifest.counts["legacy_control_requests"], 4);
@@ -330,6 +331,14 @@ async fn migration_is_copy_only_idempotent_and_preserves_conservative_state() {
         migrated_return,
         ("delivered".into(), "indeterminate".into())
     );
+    let held_debate: (String, String) = connection
+        .query_row(
+            "SELECT destination, resolution_state FROM legacy_debate_outbox",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(held_debate, ("-100123".into(), "held".into()));
     let routes = connection
         .prepare("SELECT route_json FROM routes ORDER BY route_id")
         .unwrap()
@@ -406,7 +415,8 @@ async fn migration_is_copy_only_idempotent_and_preserves_conservative_state() {
     assert_eq!(status.legacy_control_requests, 4);
     assert_eq!(status.legacy_indeterminate_requests, 2);
     assert_eq!(status.legacy_unresolved_returns, 1);
-    assert_eq!(status.pending_outbox, 4);
+    assert_eq!(status.pending_outbox, 3);
+    assert_eq!(status.legacy_debate_outbox, 1);
     assert_eq!(status.pending_inbox, 2);
     store.shutdown().await.unwrap();
 
@@ -543,7 +553,8 @@ fn migration_cli_returns_a_structured_reusable_bundle_acknowledgement() {
     let first: Value = serde_json::from_slice(&first.stdout).unwrap();
     assert_eq!(first["ok"], true);
     assert_eq!(first["reused"], false);
-    assert_eq!(first["manifest"]["counts"]["pending_outbox"], 4);
+    assert_eq!(first["manifest"]["counts"]["pending_outbox"], 3);
+    assert_eq!(first["manifest"]["counts"]["legacy_debate_outbox_held"], 1);
     let second = run();
     assert!(second.status.success());
     let second: Value = serde_json::from_slice(&second.stdout).unwrap();

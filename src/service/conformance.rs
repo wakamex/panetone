@@ -217,8 +217,7 @@ impl ControlHandler for ConformanceService {
                             "channels": {
                                 "telegram": "fake_ready",
                                 "signal": "fake_ready",
-                                "slack": "fake_ready",
-                                "debate": "fake_ready"
+                                "slack": "fake_ready"
                             },
                             "tasks": self.health.as_ref().map(SupervisorHandle::snapshot).unwrap_or_default()
                         }),

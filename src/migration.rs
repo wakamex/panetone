@@ -183,8 +183,12 @@ fn build_bundle(
         let transaction = target.transaction()?;
         let routes = import_routes(&transaction, &state, &mut warnings)?;
         counts.insert("routes".into(), routes.len() as u64);
-        let outbox = import_pending(&transaction, &pending, &routes, &mut warnings)?;
-        counts.insert("pending_outbox".into(), outbox);
+        let pending_counts = import_pending(&transaction, &pending, &routes, &mut warnings)?;
+        counts.insert("pending_outbox".into(), pending_counts.outbox);
+        counts.insert(
+            "legacy_debate_outbox_held".into(),
+            pending_counts.debate_held,
+        );
         let signal = import_signal(
             &transaction,
             &snapshot,
@@ -457,6 +461,7 @@ fn import_routes(
     }
 
     let mut preferences = BTreeMap::new();
+    let mut held_debate_preferences = BTreeMap::new();
     if let Some(sources) = optional_object(state, "last_sources")? {
         for (title, source) in sources {
             let source = source.as_str().ok_or_else(|| {
@@ -469,7 +474,25 @@ fn import_routes(
             }
             let key = normalize_title(title)?;
             if let Some(route) = routes.get(&key) {
-                preferences.insert(route.id.to_string(), source.to_owned());
+                if source == "debate" {
+                    if route
+                        .channels
+                        .iter()
+                        .any(|binding| matches!(binding, ChannelBinding::Signal { .. }))
+                    {
+                        preferences.insert(route.id.to_string(), "sig".to_owned());
+                        warnings.insert(format!(
+                            "legacy Debate preference for {title:?} was normalized to its exact Signal route"
+                        ));
+                    } else {
+                        held_debate_preferences.insert(route.id.to_string(), source.to_owned());
+                        warnings.insert(format!(
+                            "legacy Debate preference for {title:?} has no exact Signal binding and remains held"
+                        ));
+                    }
+                } else {
+                    preferences.insert(route.id.to_string(), source.to_owned());
+                }
             } else {
                 warnings.insert(format!(
                     "last-source route {title:?} has no stable channel binding"
@@ -481,6 +504,11 @@ fn import_routes(
         transaction,
         "migrated_route_preferences_v1",
         &serde_json::to_string(&preferences)?,
+    )?;
+    insert_metadata(
+        transaction,
+        "legacy_debate_preferences_held",
+        &serde_json::to_string(&held_debate_preferences)?,
     )?;
 
     let muted_groups = optional_array(state, "clod_off_groups")?;
@@ -593,7 +621,6 @@ fn same_channel_kind(left: &ChannelBinding, right: &ChannelBinding) -> bool {
             ChannelBinding::Telegram { .. }
         ) | (ChannelBinding::Signal { .. }, ChannelBinding::Signal { .. })
             | (ChannelBinding::Slack { .. }, ChannelBinding::Slack { .. })
-            | (ChannelBinding::Debate { .. }, ChannelBinding::Debate { .. })
     )
 }
 
@@ -602,8 +629,13 @@ fn channel_order(channel: &ChannelBinding) -> u8 {
         ChannelBinding::Telegram { .. } => 0,
         ChannelBinding::Signal { .. } => 1,
         ChannelBinding::Slack { .. } => 2,
-        ChannelBinding::Debate { .. } => 3,
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PendingCounts {
+    outbox: u64,
+    debate_held: u64,
 }
 
 fn import_pending(
@@ -611,7 +643,7 @@ fn import_pending(
     pending: &Value,
     routes: &BTreeMap<String, Route>,
     warnings: &mut BTreeSet<String>,
-) -> MigrationResult<u64> {
+) -> MigrationResult<PendingCounts> {
     let pending = object(pending, "pending_sends.json")?;
     if pending.get("schema").and_then(Value::as_str) != Some("panetone.delivery-state.v2") {
         return Err(MigrationError::Malformed(
@@ -643,6 +675,7 @@ fn import_pending(
         .and_then(Value::as_array)
         .ok_or_else(|| MigrationError::Malformed("pending item list is missing".into()))?;
     let mut identities = BTreeSet::new();
+    let mut counts = PendingCounts::default();
     for item in items {
         let item = object(item, "pending item")?;
         let legacy_id = required_string(item, "id", "pending item")?;
@@ -651,11 +684,12 @@ fn import_pending(
                 "pending item ID {legacy_id:?} is duplicated"
             )));
         }
-        let kind = match required_string(item, "kind", "pending item")? {
-            "tg" => ChannelKind::Telegram,
-            "sig" => ChannelKind::Signal,
-            "slack" => ChannelKind::Slack,
-            "debate" => ChannelKind::Debate,
+        let legacy_kind = required_string(item, "kind", "pending item")?;
+        let kind = match legacy_kind {
+            "tg" => Some(ChannelKind::Telegram),
+            "sig" => Some(ChannelKind::Signal),
+            "slack" => Some(ChannelKind::Slack),
+            "debate" => None,
             other => {
                 return Err(MigrationError::Malformed(format!(
                     "pending item {legacy_id:?} has unknown kind {other:?}"
@@ -678,13 +712,32 @@ fn import_pending(
             .and_then(Value::as_u64)
             .ok_or_else(|| MigrationError::Malformed("pending pane_id is invalid".into()))?;
         required_string(item, "harness", "pending item")?;
+        let effect_id = stable_effect_id("python-pending-output", legacy_id);
+        let Some(kind) = kind else {
+            transaction.execute(
+                "INSERT INTO legacy_debate_outbox(
+                     effect_id, destination, record_json, resolution_state,
+                     resolution_json, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, 'held', NULL, ?4, ?4)",
+                params![
+                    effect_id.to_string(),
+                    destination,
+                    serde_json::to_string(item)?,
+                    saved_at,
+                ],
+            )?;
+            counts.debate_held += 1;
+            warnings.insert(format!(
+                "legacy Debate pending item {legacy_id:?} remains held until its Signal group is matched exactly"
+            ));
+            continue;
+        };
         let route_id = resolve_pending_route(kind, &destination, route_title, routes)?;
         if route_id.is_none() && matches!(kind, ChannelKind::Telegram | ChannelKind::Signal) {
             warnings.insert(format!(
                 "pending {kind:?} item {legacy_id:?} has no unique stable route binding"
             ));
         }
-        let effect_id = stable_effect_id("python-pending-output", legacy_id);
         let record = OutboxItem {
             id: effect_id,
             route_id,
@@ -709,8 +762,9 @@ fn import_pending(
                 saved_at,
             ],
         )?;
+        counts.outbox += 1;
     }
-    Ok(items.len() as u64)
+    Ok(counts)
 }
 
 fn resolve_pending_route(
@@ -736,9 +790,6 @@ fn resolve_pending_route(
                 }
                 (ChannelKind::Slack, ChannelBinding::Slack { channel_id }) => {
                     channel_id == destination
-                }
-                (ChannelKind::Debate, ChannelBinding::Debate { chat_id }) => {
-                    chat_id.to_string() == destination
                 }
                 _ => false,
             })
@@ -1471,7 +1522,6 @@ fn channel_name(kind: ChannelKind) -> &'static str {
         ChannelKind::Telegram => "telegram",
         ChannelKind::Signal => "signal",
         ChannelKind::Slack => "slack",
-        ChannelKind::Debate => "debate",
     }
 }
 

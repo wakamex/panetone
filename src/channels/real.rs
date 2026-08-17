@@ -98,49 +98,6 @@ impl TelegramClient {
 }
 
 #[derive(Clone)]
-pub struct DebateClient {
-    http: reqwest::Client,
-    api_base: String,
-    token: String,
-}
-
-impl DebateClient {
-    pub fn new(
-        api_base: impl Into<String>,
-        token: impl Into<String>,
-        deadline: Duration,
-    ) -> Result<Self, ChannelDeliveryError> {
-        Ok(Self {
-            http: http_client(deadline, ChannelKind::Debate)?,
-            api_base: api_base.into().trim_end_matches('/').to_owned(),
-            token: token.into(),
-        })
-    }
-
-    pub async fn send(&self, item: &OutboxItem) -> Result<DeliveryReceipt, ChannelDeliveryError> {
-        if item.kind != ChannelKind::Debate {
-            return Err(ChannelDeliveryError::InvalidDestination(item.kind));
-        }
-        let chat_id = item
-            .destination
-            .parse::<i64>()
-            .map_err(|_| ChannelDeliveryError::InvalidDestination(item.kind))?;
-        telegram_send(
-            &self.http,
-            &self.api_base,
-            &self.token,
-            json!({
-                "chat_id": chat_id,
-                "text": item.body,
-                "link_preview_options": {"is_disabled": true}
-            }),
-            item,
-        )
-        .await
-    }
-}
-
-#[derive(Clone)]
 pub struct SlackClient {
     http: reqwest::Client,
     api_base: String,
@@ -316,7 +273,6 @@ pub struct RealChannels {
     pub telegram: Option<TelegramClient>,
     pub signal: Option<SignalClient>,
     pub slack: Option<SlackClient>,
-    pub debate: Option<DebateClient>,
 }
 
 impl RealChannels {
@@ -338,13 +294,6 @@ impl RealChannels {
             }
             ChannelKind::Slack => {
                 self.slack
-                    .as_ref()
-                    .ok_or(ChannelDeliveryError::NotConfigured(item.kind))?
-                    .send(item)
-                    .await
-            }
-            ChannelKind::Debate => {
-                self.debate
                     .as_ref()
                     .ok_or(ChannelDeliveryError::NotConfigured(item.kind))?
                     .send(item)

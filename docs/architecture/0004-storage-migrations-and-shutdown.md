@@ -27,6 +27,11 @@ semantically equivalent in the Python protocol. It never converts a provider
 file cursor into a Wakterm event cursor, and every nonterminal external control
 operation is migrated as indeterminate.
 
+Debate is a named Signal group, not a separate transport. Legacy rows labelled
+`debate` remain held with their original destination and payload until an
+operator can match them to the configured Signal group exactly. They are never
+reinterpreted as Telegram output.
+
 One supervisor owns every long-running task. It records handles, propagates fatal failures into health, and coordinates cancellation. Shutdown follows this order:
 
 1. stop accepting new control and inbound work

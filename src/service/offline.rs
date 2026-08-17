@@ -765,7 +765,6 @@ fn channel_destination(route: &Route) -> Result<(ChannelKind, String), ServiceEr
             ChannelBinding::Telegram { topic_id } => (ChannelKind::Telegram, topic_id.to_string()),
             ChannelBinding::Signal { group_id } => (ChannelKind::Signal, group_id.clone()),
             ChannelBinding::Slack { channel_id } => (ChannelKind::Slack, channel_id.clone()),
-            ChannelBinding::Debate { chat_id } => (ChannelKind::Debate, chat_id.to_string()),
         })
         .ok_or_else(|| ServiceError::MissingChannel(route.title.clone()))
 }

@@ -85,7 +85,7 @@ async fn store_is_private_and_rejects_newer_schemas() {
         StoreHandle::open(&path),
         Err(StoreError::NewerSchema {
             found: 99,
-            supported: 2
+            supported: 3
         })
     ));
 }
@@ -99,7 +99,8 @@ async fn version_one_store_upgrades_without_changing_native_hash_semantics() {
     let connection = Connection::open(&path).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE signal_messages;
+            "DROP TABLE legacy_debate_outbox;
+             DROP TABLE signal_messages;
              DROP TABLE legacy_return_deliveries;
              DROP TABLE legacy_control_requests;
              ALTER TABLE idempotency_tombstones DROP COLUMN hash_kind;
@@ -109,7 +110,7 @@ async fn version_one_store_upgrades_without_changing_native_hash_semantics() {
     drop(connection);
 
     let upgraded = StoreHandle::open(&path).unwrap();
-    assert_eq!(upgraded.status().await.unwrap().schema_version, 2);
+    assert_eq!(upgraded.status().await.unwrap().schema_version, 3);
     let request = id(9);
     assert!(matches!(
         upgraded
@@ -135,6 +136,54 @@ async fn version_one_store_upgrades_without_changing_native_hash_semantics() {
         )
         .unwrap();
     assert_eq!(hash_kind, "semantic_v1");
+}
+
+#[tokio::test]
+async fn version_two_store_holds_legacy_debate_output_instead_of_sending_it() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("state.sqlite3");
+    let store = StoreHandle::open(&path).unwrap();
+    store.shutdown().await.unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE legacy_debate_outbox;
+             INSERT INTO outbox(
+                 effect_id, request_id, channel, destination, state, record_json,
+                 created_at_ms, updated_at_ms
+             ) VALUES (
+                 '00000000-0000-4000-8000-000000000099', NULL, 'debate',
+                 '-100123', 'pending',
+                 '{\"kind\":\"debate\",\"body\":\"legacy\"}', 10, 11
+             );
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let upgraded = StoreHandle::open(&path).unwrap();
+    let status = upgraded.status().await.unwrap();
+    assert_eq!(status.schema_version, 3);
+    assert_eq!(status.pending_outbox, 0);
+    assert_eq!(status.legacy_debate_outbox, 1);
+    upgraded.shutdown().await.unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    let held: (String, String) = connection
+        .query_row(
+            "SELECT destination, resolution_state FROM legacy_debate_outbox",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(held, ("-100123".into(), "held".into()));
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM outbox", [], |row| row
+                .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use panetone::channels::{
-    ChannelDeliveryError, DebateClient, RealChannels, SignalClient, SlackClient, TelegramClient,
+    ChannelDeliveryError, RealChannels, SignalClient, SlackClient, TelegramClient,
 };
 use panetone::domain::{ChannelKind, EffectId, OutboxItem, OutboxState};
 use serde_json::Value;
@@ -82,7 +82,7 @@ fn item(kind: ChannelKind, destination: &str) -> OutboxItem {
 }
 
 #[tokio::test]
-async fn telegram_and_debate_send_expected_stable_requests() {
+async fn telegram_sends_the_expected_stable_request() {
     let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 39\r\n\r\n{\"ok\":true,\"result\":{\"message_id\":401}}";
     let (base, request) = http_server(response, Duration::ZERO).await;
     let telegram = TelegramClient::new(&base, "fake-token", -1001, Duration::from_secs(2)).unwrap();
@@ -100,16 +100,6 @@ async fn telegram_and_debate_send_expected_stable_requests() {
     assert_eq!(request.body["message_thread_id"], 77);
     assert_eq!(request.body["text"], "message café ✓");
     assert!(request.headers.contains("x-panetone-delivery-id: 11111111"));
-
-    let (base, request) = http_server(response, Duration::ZERO).await;
-    let debate = DebateClient::new(&base, "debate-token", Duration::from_secs(2)).unwrap();
-    debate
-        .send(&item(ChannelKind::Debate, "-2002"))
-        .await
-        .unwrap();
-    let request = request.await.unwrap();
-    assert_eq!(request.body["chat_id"], -2002);
-    assert!(request.body.get("message_thread_id").is_none());
 }
 
 #[tokio::test]

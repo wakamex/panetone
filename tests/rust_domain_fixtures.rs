@@ -86,10 +86,12 @@ fn route_lifecycle_matches_frozen_fixture() {
 fn channel_routing_and_formatting_match_frozen_fixture() {
     let data = fixture("tests/fixtures/channels/routing.json");
     for case in data["route_cases"].as_array().unwrap() {
+        if case["source"].as_str() == Some("debate") {
+            continue;
+        }
         let source = match case["source"].as_str() {
             Some("tg") => Some(ChannelKind::Telegram),
             Some("sig") => Some(ChannelKind::Signal),
-            Some("debate") => Some(ChannelKind::Debate),
             Some("slack") => Some(ChannelKind::Slack),
             None => None,
             Some(other) => panic!("unknown source {other}"),
@@ -98,13 +100,6 @@ fn channel_routing_and_formatting_match_frozen_fixture() {
             telegram_topic: case["telegram_topic"].as_i64(),
             signal_enabled: case["signal_enabled"].as_bool().unwrap(),
             signal_group: case["signal_group"].as_str(),
-            debate_enabled: case["debate_enabled"].as_bool().unwrap(),
-            debate_matches_route: case["debate_tabs"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|tab| tab.as_str() == Some("alpha")),
-            debate_chat: case["debate_chat"].as_i64(),
             slack_enabled: case["slack_enabled"].as_bool().unwrap(),
             slack_channel: case["slack_channel"].as_str(),
         };
@@ -113,7 +108,6 @@ fn channel_routing_and_formatting_match_frozen_fixture() {
                 ChannelKind::Telegram => "tg",
                 ChannelKind::Signal => "sig",
                 ChannelKind::Slack => "slack",
-                ChannelKind::Debate => "debate",
             };
             serde_json::json!([kind, selection.destination, selection.route_title])
         });
@@ -130,6 +124,7 @@ fn channel_routing_and_formatting_match_frozen_fixture() {
             });
         assert_eq!(actual, expected, "case {}", case["name"]);
     }
+    assert!(serde_json::from_str::<ChannelKind>(r#""debate""#).is_err());
 
     let formats = &data["format_cases"];
     assert_eq!(

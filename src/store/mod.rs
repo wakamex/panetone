@@ -15,7 +15,7 @@ use crate::domain::{
     semantic_request_hash, stored_request_hash_matches,
 };
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 const COMMAND_CAPACITY: usize = 128;
 
 #[derive(Debug, Error)]
@@ -107,6 +107,7 @@ pub struct StoreStatus {
     pub legacy_control_requests: u64,
     pub legacy_indeterminate_requests: u64,
     pub legacy_unresolved_returns: u64,
+    pub legacy_debate_outbox: u64,
     pub signal_messages: u64,
 }
 
@@ -595,7 +596,18 @@ pub(crate) fn migrate_schema(connection: &mut Connection) -> StoreResult<()> {
              );
              CREATE INDEX signal_messages_state
                  ON signal_messages(state, received_at_ms);
-             PRAGMA user_version = 2;",
+             CREATE TABLE legacy_debate_outbox (
+                 effect_id TEXT PRIMARY KEY,
+                 destination TEXT NOT NULL,
+                 record_json TEXT NOT NULL,
+                 resolution_state TEXT NOT NULL,
+                 resolution_json TEXT,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             CREATE INDEX legacy_debate_resolution
+                 ON legacy_debate_outbox(resolution_state, created_at_ms);
+             PRAGMA user_version = 3;",
         )?;
         transaction.commit()?;
     }
@@ -631,7 +643,52 @@ pub(crate) fn migrate_schema(connection: &mut Connection) -> StoreResult<()> {
              );
              CREATE INDEX signal_messages_state
                  ON signal_messages(state, received_at_ms);
-             PRAGMA user_version = 2;",
+             CREATE TABLE legacy_debate_outbox (
+                 effect_id TEXT PRIMARY KEY,
+                 destination TEXT NOT NULL,
+                 record_json TEXT NOT NULL,
+                 resolution_state TEXT NOT NULL,
+                 resolution_json TEXT,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             CREATE INDEX legacy_debate_resolution
+                 ON legacy_debate_outbox(resolution_state, created_at_ms);
+             INSERT INTO legacy_debate_outbox(
+                 effect_id, destination, record_json, resolution_state,
+                 resolution_json, created_at_ms, updated_at_ms
+             )
+             SELECT effect_id, destination, record_json, 'held', NULL,
+                    created_at_ms, updated_at_ms
+             FROM outbox WHERE channel = 'debate';
+             DELETE FROM outbox WHERE channel = 'debate';
+             PRAGMA user_version = 3;",
+        )?;
+        transaction.commit()?;
+    }
+    if version == 2 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE legacy_debate_outbox (
+                 effect_id TEXT PRIMARY KEY,
+                 destination TEXT NOT NULL,
+                 record_json TEXT NOT NULL,
+                 resolution_state TEXT NOT NULL,
+                 resolution_json TEXT,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             CREATE INDEX legacy_debate_resolution
+                 ON legacy_debate_outbox(resolution_state, created_at_ms);
+             INSERT INTO legacy_debate_outbox(
+                 effect_id, destination, record_json, resolution_state,
+                 resolution_json, created_at_ms, updated_at_ms
+             )
+             SELECT effect_id, destination, record_json, 'held', NULL,
+                    created_at_ms, updated_at_ms
+             FROM outbox WHERE channel = 'debate';
+             DELETE FROM outbox WHERE channel = 'debate';
+             PRAGMA user_version = 3;",
         )?;
         transaction.commit()?;
     }
@@ -1111,6 +1168,10 @@ fn status(connection: &Connection) -> StoreResult<StoreStatus> {
             connection,
             "SELECT COUNT(*) FROM legacy_return_deliveries
              WHERE agent_state != 'delivered' OR mirror_state != 'delivered'",
+        )?,
+        legacy_debate_outbox: count(
+            connection,
+            "SELECT COUNT(*) FROM legacy_debate_outbox WHERE resolution_state = 'held'",
         )?,
         signal_messages: count(connection, "SELECT COUNT(*) FROM signal_messages")?,
     })
