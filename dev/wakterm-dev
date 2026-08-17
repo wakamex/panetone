@@ -1,0 +1,170 @@
+#!/bin/bash
+
+set -euo pipefail
+
+panetone_dev_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+wakterm_source=/code/wakterm
+host_runtime_root="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+dev_runtime_root="$host_runtime_root/panetone-wakterm-dev"
+dev_state_root="$panetone_dev_root/.dev/wakterm"
+dev_socket="$dev_runtime_root/wakterm/sock"
+wakterm_cli="$wakterm_source/target/debug/wakterm"
+wakterm_mux="$wakterm_source/target/debug/wakterm-mux-server"
+
+prepare_environment() {
+  mkdir -p \
+    "$dev_runtime_root" \
+    "$dev_state_root/cache" \
+    "$dev_state_root/config" \
+    "$dev_state_root/data"
+  chmod 0700 \
+    "$dev_runtime_root" \
+    "$dev_state_root" \
+    "$dev_state_root/cache" \
+    "$dev_state_root/config" \
+    "$dev_state_root/data"
+
+  export XDG_RUNTIME_DIR="$dev_runtime_root"
+  export XDG_CACHE_HOME="$dev_state_root/cache"
+  export XDG_CONFIG_HOME="$dev_state_root/config"
+  export XDG_DATA_HOME="$dev_state_root/data"
+  export WAKTERM_UNIX_SOCKET="$dev_socket"
+  unset WAKTERM_CONFIG_DIR WAKTERM_CONFIG_FILE WAKTERM_PANE
+}
+
+stop_mux() {
+  local attempt
+
+  if ! kill -0 "$mux_pid" 2>/dev/null; then
+    wait "$mux_pid" 2>/dev/null || true
+    return
+  fi
+
+  kill -TERM "$mux_pid" 2>/dev/null || true
+  for attempt in {1..20}; do
+    if ! kill -0 "$mux_pid" 2>/dev/null; then
+      wait "$mux_pid" 2>/dev/null || true
+      return
+    fi
+    sleep 0.1
+  done
+
+  echo "development mux did not stop after SIGTERM; sending SIGKILL" >&2
+  kill -KILL "$mux_pid" 2>/dev/null || true
+  wait "$mux_pid" 2>/dev/null || true
+}
+
+remove_stale_socket() {
+  if [[ -S "$dev_socket" ]]; then
+    rm -f -- "$dev_socket"
+  fi
+}
+
+handle_int() {
+  trap - INT TERM HUP
+  stop_mux
+  remove_stale_socket
+  exit 130
+}
+
+handle_term() {
+  trap - INT TERM HUP
+  stop_mux
+  remove_stale_socket
+  exit 143
+}
+
+handle_hup() {
+  trap - INT TERM HUP
+  stop_mux
+  remove_stale_socket
+  exit 129
+}
+
+require_binary() {
+  local binary=$1
+  if [[ ! -x "$binary" ]]; then
+    echo "missing $binary; run: dev/wakterm-dev build" >&2
+    exit 1
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+Usage: dev/wakterm-dev COMMAND [ARGS...]
+
+Commands:
+  build          Build current /code/wakterm CLI and mux server in debug mode
+  serve          Run the isolated mux server in the foreground
+  cli ARGS...    Run a CLI command against only the isolated mux
+  paths          Print the isolated executable and state paths
+  version        Print the isolated development CLI version
+
+The development mux never loads the production Wakterm configuration. It uses
+its own socket, session, cache, config, and data directories. Stop `serve` with
+Ctrl-C. The production mux is not started, stopped, or restarted by this tool.
+EOF
+}
+
+command=${1:-}
+if [[ -n "$command" ]]; then
+  shift
+fi
+
+case "$command" in
+  build)
+    exec cargo build --locked \
+      --manifest-path "$wakterm_source/Cargo.toml" \
+      -p wakterm \
+      -p wakterm-mux-server
+    ;;
+  serve)
+    prepare_environment
+    require_binary "$wakterm_mux"
+    exec 9>"$dev_runtime_root/serve.lock"
+    if ! flock -n 9; then
+      echo "development mux is already running" >&2
+      exit 1
+    fi
+
+    trap handle_int INT
+    trap handle_term TERM
+    trap handle_hup HUP
+    "$wakterm_mux" --skip-config --cwd "$panetone_dev_root" \
+      -- /bin/bash --noprofile --norc &
+    mux_pid=$!
+    set +e
+    wait "$mux_pid"
+    mux_status=$?
+    set -e
+    trap - INT TERM HUP
+    remove_stale_socket
+    exit "$mux_status"
+    ;;
+  cli)
+    prepare_environment
+    require_binary "$wakterm_cli"
+    exec "$wakterm_cli" --skip-config cli --prefer-mux --no-auto-start "$@"
+    ;;
+  paths)
+    prepare_environment
+    printf 'wakterm_source=%s\n' "$wakterm_source"
+    printf 'wakterm_cli=%s\n' "$wakterm_cli"
+    printf 'wakterm_mux=%s\n' "$wakterm_mux"
+    printf 'runtime_root=%s\n' "$dev_runtime_root"
+    printf 'socket=%s\n' "$dev_socket"
+    printf 'state_root=%s\n' "$dev_state_root"
+    ;;
+  version)
+    require_binary "$wakterm_cli"
+    exec "$wakterm_cli" --version
+    ;;
+  help|-h|--help|'')
+    usage
+    ;;
+  *)
+    echo "unknown command: $command" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

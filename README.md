@@ -61,6 +61,20 @@ sudo /bin/bash /code/panetone/deploy/install-system-service.sh
 The installer checks the committed lock before stopping the current service and
 restores the user service automatically if system-service promotion fails.
 
+For Wakterm adapter development, build and run the current `/code/wakterm`
+checkout behind a separate development mux:
+
+```sh
+dev/wakterm-dev build
+dev/wakterm-dev serve
+```
+
+Run development CLI probes from another terminal with, for example,
+`dev/wakterm-dev cli agent capabilities`. The launcher disables Wakterm config
+loading and isolates the mux socket, saved session, cache, config, and data below
+the Panetone development worktree. It runs in the foreground and never manages
+or restarts the production mux. Stop it with Ctrl-C when the test is complete.
+
 Panetone negotiates the Wakterm Agent API once during startup. Return mode
 requires catalog, prompt-admission, and durable return-stream capabilities so a
 callback can be queued while its exact source agent is busy instead of steering
