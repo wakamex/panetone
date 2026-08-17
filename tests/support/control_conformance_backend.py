@@ -10,7 +10,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from panetone_control import ControlJournal, ControlServer, DurableDispatcher
+from panetone_control import (
+    ControlJournal,
+    ControlServer,
+    DurableDispatcher,
+    RequestFailure,
+)
 
 
 def append_effect(path, request_id):
@@ -39,6 +44,12 @@ async def run(args):
         await asyncio.to_thread(append_effect, args.effect_log, request["id"])
         if params["message"] == "__hold_after_effect__":
             await asyncio.Event().wait()
+        if params["message"] == "__target_busy__":
+            raise RequestFailure(
+                "wakterm_delivery_indeterminate",
+                "the target was busy after the audit and current Python cannot queue it safely",
+                indeterminate=True,
+            )
         return {
             "accepted": True,
             "reply_pending": params.get("return_final", False),

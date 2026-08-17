@@ -110,6 +110,13 @@ def expected_for(step, case, profile):
     return step.get("expected", case.get("expected"))
 
 
+def expected_effects_for(case, profile):
+    by_profile = case.get("expected_effects_by_profile")
+    if by_profile:
+        return by_profile[profile]
+    return case["expected_effects"]
+
+
 def run_suite(command, fixture_path, profile):
     fixture = json.loads(fixture_path.read_text())
     if fixture.get("schema") != "panetone.conformance.control.v1":
@@ -168,10 +175,11 @@ def run_suite(command, fixture_path, profile):
                                 f"actual={actual!r}\nexpected={expected!r}"
                             )
                 actual_effects = effect_count(backend.effect_log, request_id)
-                if actual_effects != case["expected_effects"]:
+                expected_effects = expected_effects_for(case, profile)
+                if actual_effects != expected_effects:
                     raise AssertionError(
                         f"{case['name']}: {actual_effects} effects, "
-                        f"expected {case['expected_effects']}"
+                        f"expected {expected_effects}"
                     )
         finally:
             backend.stop()

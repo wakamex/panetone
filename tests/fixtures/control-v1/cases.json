@@ -231,6 +231,45 @@
         }
       },
       "expected_effects": 1
+    },
+    {
+      "name": "busy_target_admission",
+      "request": {
+        "schema": "panetone.control.v1",
+        "id": "88888888-8888-4888-8888-888888888888",
+        "method": "send",
+        "params": {
+          "from": "source",
+          "to": "target",
+          "message": "__target_busy__"
+        }
+      },
+      "expected_by_profile": {
+        "python-current": {
+          "schema": "panetone.control.v1",
+          "id": "88888888-8888-4888-8888-888888888888",
+          "ok": false,
+          "error": {
+            "code": "wakterm_delivery_indeterminate",
+            "message": "the target was busy after the audit and current Python cannot queue it safely"
+          }
+        },
+        "target": {
+          "schema": "panetone.control.v1",
+          "id": "88888888-8888-4888-8888-888888888888",
+          "ok": true,
+          "result": {
+            "accepted": true,
+            "delivery_state": "queued",
+            "submitted": false,
+            "reply_pending": false
+          }
+        }
+      },
+      "expected_effects_by_profile": {
+        "python-current": 1,
+        "target": 0
+      }
     }
   ]
 }

@@ -28,7 +28,9 @@ python3 tests/run_control_conformance.py \
 
 The runner owns a temporary directory, starts and stops the backend, speaks newline-delimited control v1 over the Unix socket, and counts durable effect records in the JSONL effect log. The crash case kills the backend after its recording effect and verifies that restart returns an indeterminate response without a second effect.
 
-`python-current` and `target` differ in one declared case. Current Python hashes omitted `return_final: false` and `timeout_ms: 0` differently from explicit defaults. The target profile requires those semantic equivalents to share one idempotency hash. A future compatibility migration must account for old journal hashes before production changes to the target behavior.
+`python-current` and `target` have two declared differences. Current Python hashes omitted `return_final: false` and `timeout_ms: 0` differently from explicit defaults. The target profile requires those semantic equivalents to share one idempotency hash. A future compatibility migration must account for old journal hashes before production changes to the target behavior.
+
+Current Python also treats Wakterm's busy refusal after the audit as indeterminate. The target profile requires a durable queued acknowledgement and no prompt effect, as specified by ADR 0005. The deterministic current backend cannot pass the target profile until that queue state exists, which prevents discovery evidence from being mistaken for implementation evidence.
 
 ## Provider observation fixtures
 
