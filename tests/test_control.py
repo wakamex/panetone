@@ -230,6 +230,37 @@ class DurableDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["agent_state"], "indeterminate")
         self.assertEqual(row["telegram_state"], "pending")
 
+    def test_definitive_missing_source_keeps_callback_result_durable(self):
+        request = make_request()
+        self.assertTrue(self.journal.claim(request, request_hash(request)))
+        self.journal.register_return_route(
+            request["id"],
+            {"title": "Source", "agent_id": "gone"},
+            {"title": "Target"},
+        )
+        result = {"request_id": request["id"], "state": "completed"}
+        self.journal.record_return_result(request["id"], result)
+        self.journal.set_return_destination(
+            request["id"], "agent", "failed", "source process changed"
+        )
+        self.journal.set_return_destination(
+            request["id"], "telegram", "delivered"
+        )
+        self.journal.finish(
+            request["id"],
+            "succeeded",
+            {"schema": SCHEMA, "id": request["id"], "ok": True},
+        )
+        with self.journal._connect() as db:
+            db.execute("UPDATE control_request SET updated_at = 0")
+
+        removed = self.journal.prune_completed(now=COMPLETED_RETENTION_SECONDS + 1)
+
+        self.assertEqual(removed, 0)
+        row = self.journal.get_return(request["id"])
+        self.assertEqual(row["agent_state"], "failed")
+        self.assertEqual(json.loads(row["result_json"]), result)
+
     def test_pruning_expires_only_completed_success_and_failure(self):
         requests = {
             state: make_request()

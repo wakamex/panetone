@@ -49,9 +49,12 @@ newline-terminated JSON response. Requests are limited to 256 KiB.
 
 The ID is both the correlation identifier and the idempotency key. Omitting
 `return_final`, or setting it to false, preserves one-way delivery. With
-`return_final: true`, Panetone durably registers the source agent and Telegram
-route before submitting the same ID to Wakterm. `timeout_ms` is optional and
-applies asynchronously. Zero disables the deadline.
+`return_final: true`, Panetone joins each currently resolved pane to a fresh
+Wakterm Agent API catalog entry, then durably registers the source agent ID,
+process incarnation, and Telegram route before submitting the same ID to
+Wakterm. The pane ID is only an ephemeral join key. Agent ID plus incarnation
+ID identify later callback admission. `timeout_ms` is optional and applies
+asynchronously. Zero disables the deadline.
 
 The Telegram audit contains the original message. The prompt submitted to
 Wakterm adds this deterministic envelope:
@@ -83,14 +86,20 @@ routing attribution, not cryptographic authentication of the calling pane.
       "tab_id": 1,
       "pane_id": 1,
       "harness": "codex",
-      "topic_id": 164000
+      "topic_id": 164000,
+      "agent_id": "agent-ufopedia",
+      "incarnation_id": "incarnation-ufopedia-3",
+      "agent_name": "ufopedia_codex"
     },
     "target": {
       "title": "wakterm",
       "tab_id": 7,
       "pane_id": 8,
       "harness": "codex",
-      "topic_id": 164481
+      "topic_id": 164481,
+      "agent_id": "agent-wakterm",
+      "incarnation_id": "incarnation-wakterm-5",
+      "agent_name": "wakterm_codex"
     },
     "telegram": {
       "chat_id": -1000000000000,
@@ -123,21 +132,28 @@ message. The CLI exits while the delegated turn is still running. For one-way
 delivery, the older `submitted` and observer acknowledgement receipt is
 unchanged.
 
-Return mode is capability-dependent. Panetone probes for Wakterm durable agent
-request support at startup and enables the return watcher only when that probe
-succeeds. Installing a compatible Wakterm takes effect after a deliberate
-Panetone restart. The current Wakterm implementation supports correlated return
-requests for Codex targets. Other harnesses require equivalent observer
-support. The startup probe detects the command-level capability, not support for
-a particular target harness. If Wakterm rejects a target during submission, the
-normal audit-linked Wakterm failure and indeterminate-delivery policy applies.
+Return mode is capability-dependent. Panetone negotiates the versioned Wakterm
+Agent API at startup and requires `catalog.v1`, `prompt_admission.v1`, and
+`return_request_terminal_stream.v1`. It enables the return watcher only when
+all three are present. Installing a compatible Wakterm takes effect after a
+deliberate Panetone restart. The current Wakterm implementation supports
+correlated return requests for Codex targets. Other harnesses require
+equivalent observer support. If Wakterm rejects a target during submission,
+the normal audit-linked Wakterm failure and indeterminate-delivery policy
+applies.
+
+The general `event_stream.v1` contract remains fixture-only. Panetone must not
+consume it in production until a live Wakterm capability response advertises
+it.
 
 ## Delivery order and failures
 
 Panetone performs these steps:
 
 1. Claim the UUID durably as `in_progress`.
-2. Refresh and resolve the live source and target routes.
+2. Refresh and resolve the live source and target routes. For return mode, join
+   their pane IDs to a fresh Wakterm catalog and persist exact agent and
+   incarnation identities.
 3. Post `SOURCE → TARGET`, the UUID marked `[pending]`, and the message in the
    target Telegram topic.
 4. Persist the Telegram receipt as `audit_posted`.
@@ -151,8 +167,18 @@ Panetone performs these steps:
 9. Store the registration response.
 10. Consume Wakterm's resumable terminal request stream in one background
     subscription.
-11. Persist the terminal result, then deliver one correlated callback to the
-    source agent and its Telegram topic.
+11. Persist the terminal result and mirror it to the source Telegram topic.
+    Submit the agent callback through authoritative Wakterm admission using the
+    persisted source incarnation and a stable callback request ID derived from
+    the original ID.
+
+If the source is busy, a definitive `busy` receipt with `prompt_written: false`
+returns the agent destination to durable `pending` state. The retry loop reuses
+the same callback ID and exact callback text after the source becomes idle. It
+does not steer the active turn. An indeterminate receipt is terminal and is not
+retried. A stale or unavailable source incarnation is recorded as a definitive
+agent callback failure without rebinding by title, while the terminal result
+remains durable and visible in the source Telegram topic.
 
 If Telegram fails before any audit is visible, Panetone does not invoke
 Wakterm. If an audit is partially visible, Panetone adds or edits a linked

@@ -170,6 +170,10 @@ def _find_wakterm():
 
 WAKTERM_BIN = _find_wakterm()
 WAKTERM_SOCKET = _get_terminal_env("WAKTERM_UNIX_SOCKET", "WEZTERM_UNIX_SOCKET")
+WAKTERM_AGENT_API_SCHEMA = "wakterm.agent-api.v1"
+RETURN_CALLBACK_NAMESPACE = uuid.uuid5(
+    uuid.NAMESPACE_URL, "https://panetone.dev/control/v1/return-agent-callback"
+)
 print(f"[wakterm] binary: {WAKTERM_BIN}, socket: {WAKTERM_SOCKET or '(auto)'}")
 
 
@@ -256,28 +260,163 @@ def _agent_send_sync(pid, text, *, return_final=False, request_id=None, timeout_
     return receipt
 
 
-def _wakterm_return_capability_sync():
-    """Probe return-request support once without creating a request."""
+def _wakterm_json_sync(*args, input_text=None, timeout=5):
+    """Run a Wakterm Agent API command and require one JSON object."""
     try:
         result = subprocess.run(
-            [WAKTERM_BIN, "cli", "agent", "request", "watch", "--help"],
+            [WAKTERM_BIN, "cli", "agent", *args],
+            input=input_text,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=timeout,
             check=False,
         )
-    except subprocess.TimeoutExpired:
-        return False, "capability probe timed out"
-    except FileNotFoundError:
-        return False, f"Wakterm binary not found: {WAKTERM_BIN}"
-    if result.returncode == 0:
-        return True, None
-    detail = result.stderr.strip() or result.stdout.strip() or "unsupported command"
-    return False, detail.splitlines()[0]
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"Wakterm agent {' '.join(args)} timed out") from error
+    except FileNotFoundError as error:
+        raise RuntimeError(f"Wakterm binary not found: {WAKTERM_BIN}") from error
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown Wakterm error"
+        raise RuntimeError(
+            f"Wakterm agent {' '.join(args)} failed (rc={result.returncode}): {detail}"
+        )
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            f"Wakterm agent {' '.join(args)} returned invalid JSON"
+        ) from error
+    if not isinstance(value, dict):
+        raise RuntimeError(f"Wakterm agent {' '.join(args)} returned a non-object")
+    return value
+
+
+def _wakterm_return_capability_sync():
+    """Negotiate the complete safe return-final capability set."""
+    try:
+        response = _wakterm_json_sync("capabilities")
+    except RuntimeError as error:
+        return False, str(error).splitlines()[0]
+    if (
+        response.get("schema") != WAKTERM_AGENT_API_SCHEMA
+        or response.get("api_major") != 1
+    ):
+        return False, "incompatible Wakterm Agent API schema"
+    capabilities = response.get("capabilities")
+    required = {
+        "catalog.v1",
+        "prompt_admission.v1",
+        "return_request_terminal_stream.v1",
+    }
+    available = (
+        set(capabilities)
+        if isinstance(capabilities, list)
+        and all(isinstance(capability, str) for capability in capabilities)
+        else set()
+    )
+    if not required.issubset(available):
+        missing = sorted(required.difference(available))
+        return False, f"missing Wakterm Agent API capabilities: {', '.join(missing)}"
+    return True, None
+
+
+def _wakterm_agent_catalog_sync():
+    catalog = _wakterm_json_sync("catalog")
+    if catalog.get("schema") != WAKTERM_AGENT_API_SCHEMA:
+        raise RuntimeError("Wakterm agent catalog has an incompatible schema")
+    agents = catalog.get("agents")
+    if not isinstance(agents, list):
+        raise RuntimeError("Wakterm agent catalog is missing agents")
+    return agents
+
+
+def _bind_route_agent(route, agents):
+    matches = [
+        agent
+        for agent in agents
+        if isinstance(agent, dict) and agent.get("pane_id") == route["pane_id"]
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"route {route['title']!r} pane {route['pane_id']} did not match exactly one "
+            "Wakterm catalog agent"
+        )
+    agent = matches[0]
+    agent_id = agent.get("agent_id")
+    incarnation_id = agent.get("incarnation_id")
+    if agent.get("harness") != route["harness"]:
+        raise RuntimeError(
+            f"route {route['title']!r} and Wakterm catalog disagree on harness"
+        )
+    if not agent.get("alive") or not isinstance(agent_id, str) or not isinstance(
+        incarnation_id, str
+    ):
+        raise RuntimeError(f"route {route['title']!r} has no live Wakterm incarnation")
+    return {
+        **route,
+        "agent_id": agent_id,
+        "incarnation_id": incarnation_id,
+        "agent_name": agent.get("name"),
+    }
+
+
+def _return_callback_request_id(request_id):
+    return str(uuid.uuid5(RETURN_CALLBACK_NAMESPACE, request_id))
+
+
+def _agent_admit_sync(route, text, *, request_id):
+    command = (
+        "admit",
+        route["agent_id"],
+        "--incarnation",
+        route["incarnation_id"],
+        "--request-id",
+        request_id,
+    )
+    receipt = _wakterm_json_sync(*command, input_text=text, timeout=10)
+    if receipt.get("schema") != WAKTERM_AGENT_API_SCHEMA:
+        raise RuntimeError("Wakterm admission receipt has an incompatible schema")
+    if receipt.get("request_id") != request_id:
+        raise RuntimeError("Wakterm admission receipt has the wrong request ID")
+    if receipt.get("agent_id") != route["agent_id"] or receipt.get(
+        "incarnation_id"
+    ) != route["incarnation_id"]:
+        raise RuntimeError("Wakterm admission receipt has the wrong agent identity")
+    status = receipt.get("status")
+    definitive = receipt.get("definitive")
+    prompt_written = receipt.get("prompt_written")
+    known_statuses = {
+        "accepted",
+        "busy",
+        "unsupported",
+        "unavailable",
+        "stale_incarnation",
+        "invalid",
+        "observer_failure",
+        "internal_failure",
+        "indeterminate",
+    }
+    if status not in known_statuses:
+        raise RuntimeError(f"Wakterm admission receipt has unknown status {status!r}")
+    if status == "accepted":
+        valid = definitive is True and prompt_written is True
+    elif status == "indeterminate":
+        valid = definitive is False and prompt_written is None
+    else:
+        valid = definitive is True and prompt_written is False
+    if not valid:
+        raise RuntimeError("Wakterm admission receipt has inconsistent delivery fields")
+    return receipt
 
 
 async def agent_send(pid, text, **kwargs):
     return await asyncio.to_thread(_agent_send_sync, pid, text, **kwargs)
+
+
+async def agent_admit(route, text, *, request_id):
+    return await asyncio.to_thread(
+        _agent_admit_sync, route, text, request_id=request_id
+    )
 
 
 async def send_text(pid, text):
@@ -3018,6 +3157,18 @@ async def _handle_control_send(request, transition, journal=None):
     await _refresh_telegram_routes()
     source = _control_route(params["from"])
     target = _control_route(params["to"])
+    if return_final:
+        try:
+            agents = await asyncio.to_thread(_wakterm_agent_catalog_sync)
+            source = _bind_route_agent(source, agents)
+            target = _bind_route_agent(target, agents)
+        except Exception as error:
+            raise RequestFailure(
+                "return_final_unavailable",
+                "Wakterm could not bind the return request to exact live agents; "
+                "no delivery was attempted",
+                details={"reason": str(error)},
+            ) from error
     delivered_prompt = _control_prompt_envelope(
         request_id,
         source,
@@ -3238,6 +3389,7 @@ async def _deliver_return(request_id, journal):
         callback = _return_callback_text(result, source, target)
 
         if row["agent_state"] == "pending":
+            callback_request_id = _return_callback_request_id(request_id)
             await asyncio.to_thread(
                 journal.set_return_destination,
                 request_id,
@@ -3245,9 +3397,15 @@ async def _deliver_return(request_id, journal):
                 "delivering",
             )
             try:
-                await _refresh_telegram_routes()
-                live_source = _control_route(source["title"])
-                await agent_send(live_source["pane_id"], callback)
+                if not source.get("agent_id") or not source.get("incarnation_id"):
+                    raise RuntimeError(
+                        "the persisted source route lacks an exact Wakterm agent incarnation"
+                    )
+                receipt = await agent_admit(
+                    source,
+                    callback,
+                    request_id=callback_request_id,
+                )
             except Exception as error:
                 await asyncio.to_thread(
                     journal.set_return_destination,
@@ -3258,12 +3416,40 @@ async def _deliver_return(request_id, journal):
                 )
                 print(f"[control>{source['title']}] agent callback indeterminate: {error}")
             else:
-                await asyncio.to_thread(
-                    journal.set_return_destination,
-                    request_id,
-                    "agent",
-                    "delivered",
-                )
+                status = receipt["status"]
+                if status == "accepted":
+                    await asyncio.to_thread(
+                        journal.set_return_destination,
+                        request_id,
+                        "agent",
+                        "delivered",
+                    )
+                elif status == "busy":
+                    await asyncio.to_thread(
+                        journal.set_return_destination,
+                        request_id,
+                        "agent",
+                        "pending",
+                    )
+                    print(
+                        f"[control>{source['title']}] source busy; callback remains queued"
+                    )
+                elif status == "indeterminate":
+                    await asyncio.to_thread(
+                        journal.set_return_destination,
+                        request_id,
+                        "agent",
+                        "indeterminate",
+                        receipt.get("detail"),
+                    )
+                else:
+                    await asyncio.to_thread(
+                        journal.set_return_destination,
+                        request_id,
+                        "agent",
+                        "failed",
+                        receipt.get("detail") or f"Wakterm admission returned {status}",
+                    )
 
         row = await asyncio.to_thread(journal.get_return, request_id)
         if row["telegram_state"] == "pending":

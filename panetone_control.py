@@ -419,7 +419,13 @@ class ControlJournal:
     def set_return_destination(self, request_id, destination, state, error=None):
         if destination not in {"agent", "telegram"}:
             raise ValueError("invalid return destination")
-        if state not in {"pending", "delivering", "delivered", "indeterminate"}:
+        if state not in {
+            "pending",
+            "delivering",
+            "delivered",
+            "failed",
+            "indeterminate",
+        }:
             raise ValueError("invalid return destination state")
         column = f"{destination}_state"
         with self._connect() as db:

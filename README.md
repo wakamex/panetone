@@ -61,10 +61,13 @@ sudo /bin/bash /code/panetone/deploy/install-system-service.sh
 The installer checks the committed lock before stopping the current service and
 restores the user service automatically if system-service promotion fails.
 
-Panetone probes Wakterm durable-return support once during startup. When the
-installed Wakterm lacks that capability, ordinary one-way sends remain enabled
-but `--return-final` fails before Telegram or prompt delivery. A compatible
-Wakterm installation takes effect after a deliberate Panetone restart.
+Panetone negotiates the Wakterm Agent API once during startup. Return mode
+requires catalog, prompt-admission, and durable return-stream capabilities so a
+callback can be queued while its exact source agent is busy instead of steering
+an active turn. When the installed Wakterm lacks that boundary, ordinary
+one-way sends remain enabled but `--return-final` fails before Telegram or
+prompt delivery. A compatible Wakterm installation takes effect after a
+deliberate Panetone restart.
 
 ## Signal Setup (optional)
 
