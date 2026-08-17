@@ -168,6 +168,7 @@ async fn configured_development_mux_matches_the_current_contract() {
         "the live adapter test refuses a production-looking mux socket"
     );
     let cli = WaktermCli::new(binary, socket, Duration::from_secs(5));
+    assert!(cli.version().await.unwrap().starts_with("wakterm "));
     let capabilities = cli.capabilities().await.unwrap();
     assert!(!capabilities.general_event_consumer_enabled());
     let catalog = cli.catalog().await.unwrap();

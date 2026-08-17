@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -7,7 +8,7 @@ use panetone::control::{CONTROL_SCHEMA, ControlRequest, ControlServer, SendParam
 use panetone::service::ConformanceService;
 use panetone::store::StoreHandle;
 use panetone::supervisor::{Supervisor, TaskPolicy};
-use panetone::wakterm::{ProfileKind, WaktermContract};
+use panetone::wakterm::{ProfileKind, WaktermCli, WaktermContract};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -102,6 +103,10 @@ struct DoctorArgs {
         default_value = "/code/wakterm/docs/agent-api/v1/golden-fixtures.json"
     )]
     wakterm_fixture: PathBuf,
+    #[arg(long, requires = "wakterm_socket")]
+    wakterm_bin: Option<PathBuf>,
+    #[arg(long, requires = "wakterm_bin")]
+    wakterm_socket: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -232,22 +237,41 @@ async fn run_doctor(args: DoctorArgs) -> Result<()> {
         .parent()
         .context("control socket requires a parent directory")?;
     let parent_check = private_directory_check(parent);
-    let wakterm_check = match std::fs::read_to_string(&args.wakterm_fixture) {
-        Ok(fixture) => match (
-            WaktermContract::from_golden_json(&fixture, ProfileKind::Current),
-            WaktermContract::from_golden_json(&fixture, ProfileKind::FutureEvents),
-        ) {
-            (Ok(current), Ok(future)) => json!({
-                "ok": !current.general_event_consumer_enabled() && future.general_event_consumer_enabled(),
-                "detail": "current and fixture-only future profiles are compatible",
-                "current_capabilities": current.capabilities,
-                "future_capabilities": future.capabilities
-            }),
-            (Err(error), _) | (_, Err(error)) => {
-                json!({"ok": false, "detail": error.to_string()})
+    let live_preflight = args.wakterm_bin.is_some();
+    let wakterm_check = match (args.wakterm_bin.as_ref(), args.wakterm_socket.as_ref()) {
+        (Some(binary), Some(socket)) => {
+            let cli = WaktermCli::new(binary, socket, Duration::from_secs(5));
+            match tokio::try_join!(cli.version(), cli.capabilities(), cli.catalog()) {
+                Ok((version, capabilities, catalog)) => json!({
+                    "ok": true,
+                    "detail": "explicit Wakterm Agent API preflight succeeded",
+                    "version": version,
+                    "socket": socket,
+                    "capabilities": capabilities.capabilities,
+                    "general_event_consumer": capabilities.general_event_consumer_enabled(),
+                    "catalog_agents": catalog.agents.len()
+                }),
+                Err(error) => json!({"ok": false, "detail": error.to_string()}),
             }
+        }
+        (None, None) => match std::fs::read_to_string(&args.wakterm_fixture) {
+            Ok(fixture) => match (
+                WaktermContract::from_golden_json(&fixture, ProfileKind::Current),
+                WaktermContract::from_golden_json(&fixture, ProfileKind::FutureEvents),
+            ) {
+                (Ok(current), Ok(future)) => json!({
+                    "ok": !current.general_event_consumer_enabled() && future.general_event_consumer_enabled(),
+                    "detail": "current and fixture-only future profiles are compatible",
+                    "current_capabilities": current.capabilities,
+                    "future_capabilities": future.capabilities
+                }),
+                (Err(error), _) | (_, Err(error)) => {
+                    json!({"ok": false, "detail": error.to_string()})
+                }
+            },
+            Err(error) => json!({"ok": false, "detail": error.to_string()}),
         },
-        Err(error) => json!({"ok": false, "detail": error.to_string()}),
+        _ => unreachable!("clap requires both explicit Wakterm arguments"),
     };
     let store = StoreHandle::open(&args.journal);
     let (store_check, opened) = match store {
@@ -259,12 +283,19 @@ async fn run_doctor(args: DoctorArgs) -> Result<()> {
     };
     let report = json!({
         "ok": parent_check["ok"] == true && store_check["ok"] == true && wakterm_check["ok"] == true,
-        "mode": "offline_fake",
+        "mode": if live_preflight { "adapter_preflight" } else { "offline_fake" },
         "checks": {
             "runtime_directory": parent_check,
             "store": store_check,
             "wakterm_contract": wakterm_check,
-            "production_connections": {"ok": true, "detail": "disabled in Phase 2"}
+            "production_connections": {
+                "ok": true,
+                "detail": if live_preflight {
+                    "only the explicitly selected Wakterm Agent API was read; channel connections and prompt submission were disabled"
+                } else {
+                    "disabled in offline mode"
+                }
+            }
         }
     });
     println!("{}", serde_json::to_string_pretty(&report)?);

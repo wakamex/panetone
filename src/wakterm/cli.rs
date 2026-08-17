@@ -114,6 +114,18 @@ impl WaktermCli {
         &self.socket
     }
 
+    pub async fn version(&self) -> Result<String, WaktermCliError> {
+        let output = self.run_command(&["--version"], None, false).await?;
+        let version = String::from_utf8(output)
+            .map_err(|_| WaktermCliError::Rejected("version output was not UTF-8".into()))?;
+        let version = version.trim();
+        if version.is_empty() {
+            Err(WaktermCliError::Rejected("version output was empty".into()))
+        } else {
+            Ok(version.into())
+        }
+    }
+
     pub async fn capabilities(&self) -> Result<AgentApiCapabilities, WaktermCliError> {
         let capabilities: AgentApiCapabilities =
             self.run_json(&["agent", "capabilities"], None).await?;
@@ -204,10 +216,21 @@ impl WaktermCli {
     }
 
     async fn run(&self, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>, WaktermCliError> {
+        self.run_command(args, input, true).await
+    }
+
+    async fn run_command(
+        &self,
+        args: &[&str],
+        input: Option<&[u8]>,
+        cli_mode: bool,
+    ) -> Result<Vec<u8>, WaktermCliError> {
         let mut command = Command::new(&self.binary);
+        command.arg("--skip-config");
+        if cli_mode {
+            command.args(["cli", "--prefer-mux", "--no-auto-start"]);
+        }
         command
-            .arg("--skip-config")
-            .args(["cli", "--prefer-mux", "--no-auto-start"])
             .args(args)
             .env("WAKTERM_UNIX_SOCKET", &self.socket)
             .env_remove("WAKTERM_CONFIG_DIR")
