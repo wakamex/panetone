@@ -93,7 +93,9 @@ async fn real_adapters_execute_the_durable_workflow_once_in_audit_first_order() 
             r#"#!/bin/bash
 set -euo pipefail
 operation="$*"
-if [[ "$operation" == *"agent catalog"* ]]; then
+if [[ "$operation" == *"agent capabilities"* ]]; then
+  printf '%s\n' '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
+elif [[ "$operation" == *"agent catalog"* ]]; then
   printf '%s\n' '{{"schema":"wakterm.agent-api.v1","agents":[{{"agent_id":"agent-target","incarnation_id":"target-incarnation-1","pane_id":22,"name":"display-name-does-not-match-route","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"}}]}}'
 elif [[ "$operation" == *"agent admit"* ]]; then
   prompt=$(cat)
@@ -194,7 +196,9 @@ async fn lost_wakterm_response_becomes_durable_and_visibly_indeterminate() {
         &script,
         r#"#!/bin/bash
 set -euo pipefail
-if [[ "$*" == *"agent catalog"* ]]; then
+if [[ "$*" == *"agent capabilities"* ]]; then
+  printf '%s\n' '{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}'
+elif [[ "$*" == *"agent catalog"* ]]; then
   printf '%s\n' '{"schema":"wakterm.agent-api.v1","agents":[{"agent_id":"agent-target","incarnation_id":"target-incarnation-1","pane_id":22,"name":"target","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"}]}'
 else
   cat >/dev/null
@@ -277,7 +281,9 @@ async fn rejected_audit_is_durable_visible_and_prevents_prompt_submission() {
         format!(
             r#"#!/bin/bash
 set -euo pipefail
-if [[ "$*" == *"agent catalog"* ]]; then
+if [[ "$*" == *"agent capabilities"* ]]; then
+  printf '%s\n' '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
+elif [[ "$*" == *"agent catalog"* ]]; then
   printf '%s\n' '{{"schema":"wakterm.agent-api.v1","agents":[{{"agent_id":"agent-target","incarnation_id":"target-incarnation-1","pane_id":22,"name":"target","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"}}]}}'
 else
   printf 'unexpected admission\n' >> '{}'

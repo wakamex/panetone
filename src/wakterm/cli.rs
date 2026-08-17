@@ -13,7 +13,7 @@ use tokio::time::timeout;
 
 use crate::domain::{AdmissionReceipt, AgentBinding, EffectId};
 
-use super::{AgentCatalog, ContractError, join_catalog_binding};
+use super::{AgentCatalog, ContractError, EventRead, EventRecord, join_catalog_binding};
 
 const AGENT_API_SCHEMA: &str = "wakterm.agent-api.v1";
 const MAX_PROMPT_BYTES: usize = 1024 * 1024;
@@ -90,6 +90,12 @@ pub enum WaktermCliError {
     MissingCapability(&'static str),
     #[error("Wakterm Agent API response has an unexpected schema")]
     UnexpectedSchema,
+    #[error("no live Wakterm agent pane matches route title {0:?}")]
+    RouteNotFound(String),
+    #[error("more than one live Wakterm agent pane matches route title {0:?}")]
+    RouteAmbiguous(String),
+    #[error("Wakterm Agent API event page violates the v1 contract: {0}")]
+    InvalidEventPage(&'static str),
     #[error(transparent)]
     Contract(#[from] ContractError),
 }
@@ -99,6 +105,31 @@ struct WireReceipt {
     schema: String,
     #[serde(flatten)]
     receipt: AdmissionReceipt,
+}
+
+#[derive(Deserialize)]
+struct LivePane {
+    pane_id: u64,
+    tab_title: String,
+}
+
+#[derive(Deserialize)]
+struct WireEventPage {
+    schema: String,
+    status: String,
+    requested_after_sequence: u64,
+    oldest_available_sequence: u64,
+    latest_sequence: u64,
+    next_after_sequence: Option<u64>,
+    #[serde(default)]
+    events: Vec<EventRecord>,
+    recovery: Option<WireEventRecovery>,
+}
+
+#[derive(Deserialize)]
+struct WireEventRecovery {
+    kind: String,
+    catalog_as_of_sequence: u64,
 }
 
 impl WaktermCli {
@@ -134,6 +165,7 @@ impl WaktermCli {
     }
 
     pub async fn catalog(&self) -> Result<AgentCatalog, WaktermCliError> {
+        self.capabilities().await?;
         let catalog: AgentCatalog = self.run_json(&["agent", "catalog"], None).await?;
         if catalog.schema != AGENT_API_SCHEMA {
             return Err(WaktermCliError::UnexpectedSchema);
@@ -152,6 +184,31 @@ impl WaktermCli {
         Ok(join_catalog_binding(pane_id, &before, &after)?)
     }
 
+    pub async fn resolve_route_binding(
+        &self,
+        route_title: &str,
+    ) -> Result<AgentBinding, WaktermCliError> {
+        let before = self.catalog().await?;
+        let panes: Vec<LivePane> = self.run_json(&["list", "--format", "json"], None).await?;
+        let after = self.catalog().await?;
+        let mut matches = Vec::new();
+        for pane in panes
+            .into_iter()
+            .filter(|pane| pane.tab_title.eq_ignore_ascii_case(route_title))
+        {
+            match join_catalog_binding(pane.pane_id, &before, &after) {
+                Ok(binding) => matches.push(binding),
+                Err(ContractError::MissingPane(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        match matches.len() {
+            0 => Err(WaktermCliError::RouteNotFound(route_title.into())),
+            1 => Ok(matches.remove(0)),
+            _ => Err(WaktermCliError::RouteAmbiguous(route_title.into())),
+        }
+    }
+
     pub async fn admit(
         &self,
         request_id: EffectId,
@@ -163,6 +220,7 @@ impl WaktermCli {
         if prompt.len() > MAX_PROMPT_BYTES {
             return Err(WaktermCliError::InputTooLarge(MAX_PROMPT_BYTES));
         }
+        self.capabilities().await?;
         let request_id = request_id.to_string();
         let mut owned = vec![
             "agent".to_owned(),
@@ -191,6 +249,7 @@ impl WaktermCli {
         &self,
         after_sequence: u64,
     ) -> Result<Vec<ReturnTerminal>, WaktermCliError> {
+        self.capabilities().await?;
         let after = after_sequence.to_string();
         let output = self
             .run(
@@ -204,6 +263,76 @@ impl WaktermCli {
             .map(serde_json::from_slice)
             .collect::<Result<Vec<_>, _>>()
             .map_err(WaktermCliError::from)
+    }
+
+    pub async fn event_page(
+        &self,
+        after_sequence: u64,
+        limit: u32,
+    ) -> Result<EventRead, WaktermCliError> {
+        let capabilities = self.capabilities().await?;
+        if !capabilities.general_event_consumer_enabled() {
+            return Ok(EventRead::Unsupported);
+        }
+        let after = after_sequence.to_string();
+        let limit = limit.clamp(1, 1000).to_string();
+        let page: WireEventPage = self
+            .run_json(
+                &["agent", "events", "--after", &after, "--limit", &limit],
+                None,
+            )
+            .await?;
+        if page.schema != "wakterm.agent-events.v1"
+            || page.requested_after_sequence != after_sequence
+            || page.oldest_available_sequence > page.latest_sequence.saturating_add(1)
+        {
+            return Err(WaktermCliError::InvalidEventPage(
+                "schema, request cursor, or retention bounds are invalid",
+            ));
+        }
+        match page.status.as_str() {
+            "cursor_too_old" if page.events.is_empty() && page.next_after_sequence.is_none() => {
+                let recovery = page.recovery.ok_or(WaktermCliError::InvalidEventPage(
+                    "cursor gap has no catalog-snapshot recovery",
+                ))?;
+                if recovery.kind != "catalog_snapshot" {
+                    return Err(WaktermCliError::InvalidEventPage(
+                        "cursor gap has an unknown recovery kind",
+                    ));
+                }
+                Ok(EventRead::CursorTooOld {
+                    requested_after_sequence: after_sequence,
+                    oldest_available_sequence: page.oldest_available_sequence,
+                    latest_sequence: page.latest_sequence,
+                    catalog_as_of_sequence: recovery.catalog_as_of_sequence,
+                })
+            }
+            "ok" => {
+                validate_live_events(after_sequence, page.latest_sequence, &page.events)?;
+                let expected_next = page
+                    .events
+                    .last()
+                    .map_or(after_sequence, |event| event.sequence);
+                if page.next_after_sequence != Some(expected_next) {
+                    return Err(WaktermCliError::InvalidEventPage(
+                        "next cursor does not equal the last returned event sequence",
+                    ));
+                }
+                if expected_next < page.latest_sequence && page.events.is_empty() {
+                    return Err(WaktermCliError::InvalidEventPage(
+                        "an empty page did not reach the advertised stream head",
+                    ));
+                }
+                Ok(EventRead::Events {
+                    events: page.events,
+                    next_after_sequence: expected_next,
+                    latest_sequence: page.latest_sequence,
+                })
+            }
+            _ => Err(WaktermCliError::InvalidEventPage(
+                "event page status or payload is invalid",
+            )),
+        }
     }
 
     async fn run_json<T: DeserializeOwned>(
@@ -277,6 +406,49 @@ impl WaktermCli {
         }
         Ok(stdout)
     }
+}
+
+fn validate_live_events(
+    after_sequence: u64,
+    latest_sequence: u64,
+    events: &[EventRecord],
+) -> Result<(), WaktermCliError> {
+    let mut previous = after_sequence;
+    for event in events {
+        if event.sequence <= previous
+            || event.sequence > latest_sequence
+            || event.event_id.is_empty()
+            || event.agent_id.is_empty()
+            || event.incarnation_id.is_empty()
+            || !matches!(
+                event.kind.as_str(),
+                "agent_lifecycle"
+                    | "turn_started"
+                    | "turn_state_changed"
+                    | "plan"
+                    | "assistant_message"
+                    | "observer_failure"
+                    | "turn_final"
+            )
+        {
+            return Err(WaktermCliError::InvalidEventPage(
+                "events are unordered or contain an invalid required field",
+            ));
+        }
+        if matches!(event.kind.as_str(), "plan" | "assistant_message")
+            && event
+                .fields
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+        {
+            return Err(WaktermCliError::InvalidEventPage(
+                "visible output event has no text",
+            ));
+        }
+        previous = event.sequence;
+    }
+    Ok(())
 }
 
 async fn bounded_read(

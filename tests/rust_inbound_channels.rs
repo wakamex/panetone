@@ -64,7 +64,7 @@ async fn telegram_updates_are_durable_before_the_confirmation_cursor_advances() 
                 "message": {
                     "chat": {"id": -1001},
                     "message_thread_id": 77,
-                    "from": {"first_name": "Alice", "last_name": "Smith"},
+                    "from": {"id": 42, "first_name": "Alice", "last_name": "Smith"},
                     "text": "hello"
                 }
             },
@@ -89,6 +89,7 @@ async fn telegram_updates_are_durable_before_the_confirmation_cursor_advances() 
     assert_eq!(batch.next_offset, 13);
     assert_eq!(batch.messages.len(), 1);
     assert_eq!(batch.messages[0].destination, "77");
+    assert_eq!(batch.messages[0].sender_id.as_deref(), Some("42"));
     assert_eq!(batch.messages[0].sender.as_deref(), Some("Alice Smith"));
 
     let directory = tempdir().unwrap();

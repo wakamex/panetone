@@ -18,7 +18,7 @@ impl Daemon {
         let socket = directory.join(format!("{profile}.sock"));
         let child = Command::new(env!("CARGO_BIN_EXE_panetone"))
             .args([
-                "daemon",
+                "conformance-backend",
                 "--socket",
                 socket.to_str().unwrap(),
                 "--journal",
@@ -92,7 +92,7 @@ fn daemon_status_reports_supervision_backlog_and_capability_gating() {
     assert_eq!(status["ok"], true);
     assert_eq!(status["result"]["mode"], "offline_fake");
     assert_eq!(status["result"]["wakterm"]["profile"], "current");
-    assert_eq!(status["result"]["wakterm"]["general_event_consumer"], false);
+    assert_eq!(status["result"]["wakterm"]["general_event_consumer"], true);
     assert_eq!(status["result"]["tasks"]["control"]["state"], "running");
     assert_eq!(status["result"]["store"]["workflows"], 0);
     current.terminate();
@@ -104,7 +104,7 @@ fn daemon_status_reports_supervision_backlog_and_capability_gating() {
 }
 
 #[test]
-fn doctor_validates_both_profiles_and_confirms_production_is_disabled() {
+fn doctor_validates_both_pinned_profiles_without_opening_production_connections() {
     let directory = tempdir().unwrap();
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_panetone"))

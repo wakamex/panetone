@@ -79,7 +79,6 @@ pub fn resolve_live_route<'a>(
 impl Route {
     pub fn reconcile(&mut self, observed: Option<AgentBinding>) -> ReconcileDecision {
         let Some(observed) = observed else {
-            self.agent = None;
             self.status = RouteStatus::Unavailable;
             return ReconcileDecision::Unavailable;
         };
@@ -138,8 +137,10 @@ mod tests {
     #[test]
     fn disappearance_preserves_channel_binding() {
         let mut route = route();
+        let binding = route.agent.clone();
         assert_eq!(route.reconcile(None), ReconcileDecision::Unavailable);
         assert_eq!(route.channels.len(), 1);
+        assert_eq!(route.agent, binding);
         assert_eq!(route.status, RouteStatus::Unavailable);
     }
 

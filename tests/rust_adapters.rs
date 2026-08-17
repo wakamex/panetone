@@ -14,10 +14,13 @@ fn golden() -> String {
 }
 
 #[test]
-fn current_and_future_profiles_negotiate_distinct_event_behavior() {
+fn current_and_compatibility_alias_both_expose_live_event_behavior() {
     let current = WaktermContract::from_golden_json(&golden(), ProfileKind::Current).unwrap();
-    assert!(!current.general_event_consumer_enabled());
-    assert_eq!(current.read_events(0).unwrap(), EventRead::Unsupported);
+    assert!(current.general_event_consumer_enabled());
+    assert!(matches!(
+        current.read_events(100).unwrap(),
+        EventRead::Events { .. }
+    ));
 
     let future = WaktermContract::from_golden_json(&golden(), ProfileKind::FutureEvents).unwrap();
     assert!(future.general_event_consumer_enabled());
@@ -25,6 +28,7 @@ fn current_and_future_profiles_negotiate_distinct_event_behavior() {
         EventRead::Events {
             events,
             next_after_sequence,
+            ..
         } => {
             assert_eq!(events.len(), 8);
             assert_eq!(events.first().unwrap().sequence, 101);
@@ -38,7 +42,8 @@ fn current_and_future_profiles_negotiate_distinct_event_behavior() {
         EventRead::CursorTooOld {
             requested_after_sequence: 12,
             oldest_available_sequence: 90,
-            latest_sequence: 108
+            latest_sequence: 108,
+            ..
         }
     ));
 }

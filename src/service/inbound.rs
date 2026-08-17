@@ -33,6 +33,7 @@ impl InboundIngestor {
             channel: message.channel,
             external_id: message.external_id,
             destination: message.destination,
+            sender_id: message.sender_id,
             sender: message.sender,
             body: message.body,
             state: "pending".into(),

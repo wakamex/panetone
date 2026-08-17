@@ -22,6 +22,7 @@ pub struct InboundMessage {
     pub channel: ChannelKind,
     pub external_id: String,
     pub destination: String,
+    pub sender_id: Option<String>,
     pub sender: Option<String>,
     pub body: String,
 }
@@ -133,6 +134,7 @@ impl TelegramPoller {
                 channel: self.kind,
                 external_id: update.update_id.to_string(),
                 destination,
+                sender_id: message.from.as_ref().map(|user| user.id.to_string()),
                 sender: message.from.and_then(TelegramUser::display_name),
                 body,
             });
@@ -175,6 +177,39 @@ impl SlackSocket {
         Ok(Self { stream, deadline })
     }
 
+    pub async fn connect_with_app_token(
+        api_base: &str,
+        app_token: &str,
+        deadline: Duration,
+    ) -> Result<Self, ChannelDeliveryError> {
+        let response = http_client(deadline, ChannelKind::Slack)?
+            .post(format!(
+                "{}/apps.connections.open",
+                api_base.trim_end_matches('/')
+            ))
+            .bearer_auth(app_token)
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    ChannelDeliveryError::Timeout(ChannelKind::Slack)
+                } else {
+                    ChannelDeliveryError::Transport(ChannelKind::Slack)
+                }
+            })?;
+        let body = response_body(response, ChannelKind::Slack).await?;
+        let response: SlackConnectionResponse = serde_json::from_slice(&body)
+            .map_err(|_| ChannelDeliveryError::Malformed(ChannelKind::Slack))?;
+        let url = response
+            .url
+            .filter(|url| response.ok && !url.is_empty())
+            .ok_or_else(|| ChannelDeliveryError::Rejected {
+                kind: ChannelKind::Slack,
+                detail: safe_detail(response.error.as_deref().unwrap_or("Socket Mode rejected")),
+            })?;
+        Self::connect(&url, deadline).await
+    }
+
     pub async fn next(&mut self) -> Result<SlackEnvelope, ChannelDeliveryError> {
         loop {
             let frame = timeout(self.deadline, self.stream.next())
@@ -204,6 +239,7 @@ impl SlackSocket {
                         channel: ChannelKind::Slack,
                         external_id: wire.envelope_id.clone(),
                         destination,
+                        sender_id: event.user.clone().or_else(|| event.bot_id.clone()),
                         sender: event.user.or(event.bot_id),
                         body,
                     })
@@ -311,6 +347,7 @@ impl SignalSubscriber {
                 channel: ChannelKind::Signal,
                 external_id: format!("{source}:{timestamp}"),
                 destination: destination.trim_end_matches('=').into(),
+                sender_id: Some(source.into()),
                 sender: envelope["sourceName"]
                     .as_str()
                     .or_else(|| envelope["sourceNumber"].as_str())
@@ -350,6 +387,7 @@ struct TelegramChat {
 
 #[derive(Deserialize)]
 struct TelegramUser {
+    id: i64,
     first_name: Option<String>,
     last_name: Option<String>,
     username: Option<String>,
@@ -374,6 +412,13 @@ impl TelegramUser {
 struct SlackWireEnvelope {
     envelope_id: String,
     payload: Option<SlackPayload>,
+}
+
+#[derive(Deserialize)]
+struct SlackConnectionResponse {
+    ok: bool,
+    url: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Deserialize)]

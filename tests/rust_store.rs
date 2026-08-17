@@ -85,7 +85,7 @@ async fn store_is_private_and_rejects_newer_schemas() {
         StoreHandle::open(&path),
         Err(StoreError::NewerSchema {
             found: 99,
-            supported: 4
+            supported: 5
         })
     ));
 }
@@ -99,7 +99,8 @@ async fn version_one_store_upgrades_without_changing_native_hash_semantics() {
     let connection = Connection::open(&path).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE operator_actions;
+            "DROP TABLE agent_events;
+             DROP TABLE operator_actions;
              DROP TABLE legacy_dispositions;
              DROP TABLE route_delivery_policy;
              DROP TABLE promotion_state;
@@ -114,7 +115,7 @@ async fn version_one_store_upgrades_without_changing_native_hash_semantics() {
     drop(connection);
 
     let upgraded = StoreHandle::open(&path).unwrap();
-    assert_eq!(upgraded.status().await.unwrap().schema_version, 4);
+    assert_eq!(upgraded.status().await.unwrap().schema_version, 5);
     let request = id(9);
     assert!(matches!(
         upgraded
@@ -151,7 +152,8 @@ async fn version_two_store_holds_legacy_debate_output_instead_of_sending_it() {
     let connection = Connection::open(&path).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE operator_actions;
+            "DROP TABLE agent_events;
+             DROP TABLE operator_actions;
              DROP TABLE legacy_dispositions;
              DROP TABLE route_delivery_policy;
              DROP TABLE promotion_state;
@@ -171,7 +173,7 @@ async fn version_two_store_holds_legacy_debate_output_instead_of_sending_it() {
 
     let upgraded = StoreHandle::open(&path).unwrap();
     let status = upgraded.status().await.unwrap();
-    assert_eq!(status.schema_version, 4);
+    assert_eq!(status.schema_version, 5);
     assert_eq!(status.pending_outbox, 0);
     assert_eq!(status.legacy_debate_outbox, 1);
     upgraded.shutdown().await.unwrap();
@@ -462,6 +464,7 @@ async fn routes_outbox_inbox_and_metadata_are_durable_and_deduplicated() {
         channel: ChannelKind::Signal,
         external_id: "external-1".into(),
         destination: "group-one".into(),
+        sender_id: Some("+15551234567".into()),
         sender: Some("alice".into()),
         body: "hello".into(),
         state: "pending".into(),

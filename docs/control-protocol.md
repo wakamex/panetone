@@ -18,9 +18,10 @@ $XDG_RUNTIME_DIR/panetone/control.sock
 directory is mode `0700` and the socket is mode `0600`. On Linux, the server also
 checks that the peer UID matches the bridge UID.
 
-The Wakterm mux socket remains separate. Panetone invokes `wakterm cli agent
-send` as a client of that interface after it has resolved its own route and
-Telegram state.
+The Wakterm mux socket remains separate. Panetone invokes the versioned Wakterm
+Agent API as a client of that interface after it has resolved its own route and
+channel state. The Rust candidate uses authoritative `agent admit` receipts and
+never parses provider stores.
 
 At startup, Panetone refuses to replace a symlink, regular file, or active
 socket. It removes a socket only after a connection probe establishes that the
@@ -136,19 +137,23 @@ message. The CLI exits while the delegated turn is still running. For one-way
 delivery, the older `submitted` and observer acknowledgement receipt is
 unchanged.
 
-Return mode is capability-dependent. Panetone negotiates the versioned Wakterm
-Agent API at startup and requires `catalog.v1`, `prompt_admission.v1`, and
-`return_request_terminal_stream.v1`. It enables the return watcher only when
-all three are present. Installing a compatible Wakterm takes effect after a
-deliberate Panetone restart. The current Wakterm implementation supports
-correlated return requests for Codex targets. Other harnesses require
-equivalent observer support. If Wakterm rejects a target during submission,
-the normal audit-linked Wakterm failure and indeterminate-delivery policy
-applies.
+Return mode is capability-dependent and requires `catalog.v1`,
+`prompt_admission.v1`, and `return_request_terminal_stream.v1`. The Rust
+candidate negotiates these on each new Wakterm CLI connection. The current
+Wakterm implementation supports correlated return requests for Codex targets.
+Other harnesses require equivalent live observer evidence. If Wakterm rejects a
+target during submission, the normal audit-linked Wakterm failure and
+indeterminate-delivery policy applies.
 
-The general `event_stream.v1` contract remains fixture-only. Panetone must not
-consume it in production until a live Wakterm capability response advertises
-it.
+Wakterm commit `41e1ca00062bb51dd212e2254688ec50854ecd28` makes
+`event_stream.v1` a live capability after its durable store initializes. The
+Rust candidate consumes paged events, persists each page and its next cursor in
+one transaction, deduplicates by event ID plus process incarnation, and drains
+to the advertised head. Unknown major schemas or event kinds fail closed, while
+additive fields are tolerated. A `cursor_too_old` response causes a fresh
+catalog snapshot, a durable recovery baseline, and a global delivery hold. An
+operator must review and acknowledge the explicit gap before release. The
+existing return terminal stream remains the callback authority.
 
 ## Delivery order and failures
 
@@ -250,13 +255,16 @@ to Telegram or Wakterm again. Reusing it with different content returns
 `idempotency_conflict`. Finding a nonterminal request after restart persists and
 returns `request_indeterminate`; it is not replayed.
 
-Completed `succeeded` and `failed` UUIDs expire 30 days after their last update.
-For return mode, expiry requires both callback destinations to be delivered.
-After expiry, reusing that UUID is a new request and can deliver again. Pruning
-never removes `in_progress`, `audit_posted`, `delivering`, or `indeterminate`
-control records, or return rows with a pending, failed, or indeterminate
-destination. These safety records remain durable even if their retention causes
-the journal to reach its size bound.
+The installed Python journal expires completed `succeeded` and `failed` UUIDs
+30 days after their last update. For return mode, expiry requires both callback
+destinations to be delivered. Its pruning never removes `in_progress`,
+`audit_posted`, `delivering`, or `indeterminate` control records, or return rows
+with a pending, failed, or indeterminate destination.
+
+The Rust schema-v5 store uses permanent UUID tombstones instead. Completed
+payloads may be compacted, but the request hash, terminal state, and UUID remain
+reserved. Reusing that UUID can therefore never become a new prompt. Pending,
+failed, and indeterminate workflows and effects also remain durable.
 
 The CLI does not retry automatically. If the connection is lost, use the UUID
 shown by the CLI with `--id` and the exact same request. A cached result is safe

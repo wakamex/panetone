@@ -546,6 +546,19 @@ impl OfflineService {
         source_route: &Route,
         now_ms: i64,
     ) -> Result<ReturnDelivery, ServiceError> {
+        let workflow_id = terminal.workflow_id;
+        self.persist_terminal(terminal, source_route, now_ms)
+            .await?;
+        self.deliver_pending_return(workflow_id, source_route, now_ms)
+            .await
+    }
+
+    pub async fn persist_terminal(
+        &self,
+        terminal: TerminalResult,
+        source_route: &Route,
+        now_ms: i64,
+    ) -> Result<ReturnDelivery, ServiceError> {
         let workflow = self
             .store
             .get_workflow(terminal.workflow_id)
@@ -566,7 +579,6 @@ impl OfflineService {
         {
             return Err(ServiceError::TerminalIdentity);
         }
-        let (kind, destination) = channel_destination(source_route)?;
         let mirror_effect = EffectId::named(terminal.workflow_id, "return-mirror");
         let result = json!({
             "status": terminal.status,
@@ -594,28 +606,60 @@ impl OfflineService {
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         };
-        let mut returned =
-            if let Some(existing) = self.store.get_return(terminal.workflow_id).await? {
-                if existing.result != candidate.result
-                    || existing.agent.effect_id != candidate.agent.effect_id
-                    || existing.agent.source != candidate.agent.source
-                    || existing.mirror.effect_id != candidate.mirror.effect_id
-                {
-                    return Err(ServiceError::TerminalIdentity);
-                }
-                existing
-            } else {
-                self.store.register_return(candidate.clone()).await?;
-                self.faults.hit(FaultPoint::AfterReturnPersist)?;
-                candidate
-            };
+        let returned = if let Some(existing) = self.store.get_return(terminal.workflow_id).await? {
+            if existing.result != candidate.result
+                || existing.agent.effect_id != candidate.agent.effect_id
+                || existing.agent.source != candidate.agent.source
+                || existing.mirror.effect_id != candidate.mirror.effect_id
+            {
+                return Err(ServiceError::TerminalIdentity);
+            }
+            existing
+        } else {
+            self.store.register_return(candidate.clone()).await?;
+            self.faults.hit(FaultPoint::AfterReturnPersist)?;
+            candidate
+        };
+
+        Ok(returned)
+    }
+
+    pub async fn deliver_pending_return(
+        &self,
+        workflow_id: WorkflowId,
+        source_route: &Route,
+        now_ms: i64,
+    ) -> Result<ReturnDelivery, ServiceError> {
+        self.deliver_return(workflow_id, source_route, now_ms).await
+    }
+
+    async fn deliver_return(
+        &self,
+        workflow_id: WorkflowId,
+        source_route: &Route,
+        now_ms: i64,
+    ) -> Result<ReturnDelivery, ServiceError> {
+        let mut returned = self
+            .store
+            .get_return(workflow_id)
+            .await?
+            .ok_or(ServiceError::NotPending)?;
+        let workflow = self
+            .store
+            .get_workflow(workflow_id)
+            .await?
+            .ok_or(ServiceError::NotPending)?;
+        if workflow.workflow.source_route_id != source_route.id {
+            return Err(ServiceError::TerminalIdentity);
+        }
+        let (kind, destination) = channel_destination(source_route)?;
 
         if matches!(
             returned.mirror.state,
             DeliveryState::Pending | DeliveryState::Failed
         ) {
             let mut mirror = OutboxItem {
-                id: mirror_effect,
+                id: returned.mirror.effect_id,
                 route_id: Some(workflow.workflow.source_route_id),
                 sender_harness: workflow
                     .workflow
@@ -624,14 +668,14 @@ impl OfflineService {
                     .map(|binding| binding.harness.clone()),
                 kind,
                 destination,
-                body: callback_envelope(&workflow, &terminal),
+                body: callback_envelope_from_value(&workflow, &returned),
                 state: OutboxState::Pending,
                 attempts: returned.mirror.attempts,
                 last_error: returned.mirror.last_error.clone(),
                 external_receipt: None,
             };
             self.store
-                .enqueue_outbox(Some(terminal.workflow_id), mirror.clone(), now_ms)
+                .enqueue_outbox(Some(workflow_id), mirror.clone(), now_ms)
                 .await?;
             mirror.state = OutboxState::Delivering;
             mirror.attempts += 1;
@@ -774,20 +818,6 @@ fn channel_destination(route: &Route) -> Result<(ChannelKind, String), ServiceEr
             ChannelBinding::Slack { channel_id } => (ChannelKind::Slack, channel_id.clone()),
         })
         .ok_or_else(|| ServiceError::MissingChannel(route.title.clone()))
-}
-
-fn callback_envelope(workflow: &StoredWorkflow, terminal: &TerminalResult) -> String {
-    let delivery_id = EffectId::named(workflow.command.id, "return-mirror");
-    format!(
-        "[Panetone asynchronous final return]\nFrom: {} ({})\nTo: {} ({})\nRequest ID: {}\nDelivery ID: {delivery_id}\nStatus: {}\n\n{}",
-        workflow.command.target,
-        terminal.target.harness,
-        workflow.command.source,
-        terminal.source.harness,
-        workflow.command.id,
-        terminal.status,
-        terminal.message
-    )
 }
 
 fn callback_envelope_from_value(workflow: &StoredWorkflow, returned: &ReturnDelivery) -> String {

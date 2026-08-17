@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use panetone::domain::{AdmissionStatus, AgentBinding, EffectId};
-use panetone::wakterm::{WaktermCli, WaktermCliError};
+use panetone::wakterm::{EventRead, WaktermCli, WaktermCliError};
 use tempfile::tempdir;
 use uuid::Uuid;
 
@@ -35,9 +35,13 @@ async fn real_cli_boundary_negotiates_joins_admits_and_resumes_terminals() {
         r#"
 operation="$*"
 if [[ "$operation" == *"agent capabilities"* ]]; then
-  printf '%s\n' '{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","codex_output_shadow.experimental.v1"]}'
+  printf '%s\n' '{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1","codex_output_shadow.experimental.v1"]}'
 elif [[ "$operation" == *"agent catalog"* ]]; then
   printf '%s\n' '{"schema":"wakterm.agent-api.v1","agents":[{"agent_id":"agent-zola","incarnation_id":"incarnation-zola-7","pane_id":9,"name":"renamed display","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"}]}'
+elif [[ "$operation" == *"list --format json"* ]]; then
+  printf '%s\n' '[{"pane_id":9,"tab_title":"route title"}]'
+elif [[ "$operation" == *"agent events"* ]]; then
+  printf '%s\n' '{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":100,"oldest_available_sequence":90,"latest_sequence":101,"next_after_sequence":101,"events":[{"sequence":101,"event_id":"event-101","kind":"assistant_message","agent_id":"agent-zola","incarnation_id":"incarnation-zola-7","turn_id":"turn-1","observed_at":"2026-08-17T00:00:00Z","text":"done"}]}'
 elif [[ "$operation" == *"agent admit"* ]]; then
   prompt=$(cat)
   [[ "$operation" == *"agent-zola --exact-agent-id --incarnation incarnation-zola-7"* ]]
@@ -65,7 +69,7 @@ fi
     let cli = WaktermCli::new(&binary, &socket, Duration::from_secs(2));
 
     let capabilities = cli.capabilities().await.unwrap();
-    assert!(!capabilities.general_event_consumer_enabled());
+    assert!(capabilities.general_event_consumer_enabled());
     let route_observations = AtomicUsize::new(0);
     let resolved = cli
         .resolve_stable_binding(9, || {
@@ -76,6 +80,17 @@ fi
         .unwrap();
     assert_eq!(route_observations.load(Ordering::SeqCst), 1);
     assert_eq!(resolved, binding());
+    assert_eq!(
+        cli.resolve_route_binding("ROUTE TITLE").await.unwrap(),
+        binding()
+    );
+    assert!(matches!(
+        cli.event_page(100, 10).await.unwrap(),
+        EventRead::Events {
+            next_after_sequence: 101,
+            ..
+        }
+    ));
 
     let request_id =
         EffectId::new(Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap());
@@ -97,6 +112,10 @@ fi
 async fn real_cli_boundary_preserves_structured_observer_failure() {
     let (_directory, binary) = fake_cli(
         r#"
+if [[ "$*" == *"agent capabilities"* ]]; then
+  printf '%s\n' '{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}'
+  exit 0
+fi
 cat >/dev/null
 request_id=""
 while (($#)); do
@@ -140,10 +159,14 @@ async fn real_cli_boundary_rejects_incompatible_or_incomplete_capabilities() {
         r#"printf '%s\n' '{"schema":"wakterm.agent-api.v1","api_major":2,"capabilities":[]}'"#,
     );
     let cli = WaktermCli::new(binary, "/tmp/non-production.sock", Duration::from_secs(2));
-    assert!(matches!(
-        cli.capabilities().await,
-        Err(WaktermCliError::IncompatibleApi { major: 2, .. })
-    ));
+    let result = cli.capabilities().await;
+    assert!(
+        matches!(
+            result,
+            Err(WaktermCliError::IncompatibleApi { major: 2, .. })
+        ),
+        "unexpected result: {result:?}"
+    );
 
     let (_directory, binary) = fake_cli(
         r#"printf '%s\n' '{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1"]}'"#,
@@ -170,7 +193,7 @@ async fn configured_development_mux_matches_the_current_contract() {
     let cli = WaktermCli::new(binary, socket, Duration::from_secs(5));
     assert!(cli.version().await.unwrap().starts_with("wakterm "));
     let capabilities = cli.capabilities().await.unwrap();
-    assert!(!capabilities.general_event_consumer_enabled());
+    assert!(capabilities.general_event_consumer_enabled());
     let catalog = cli.catalog().await.unwrap();
     assert_eq!(catalog.schema, "wakterm.agent-api.v1");
 }

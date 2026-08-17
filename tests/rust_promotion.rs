@@ -14,6 +14,7 @@ fn route_id(value: u128) -> RouteId {
 fn operation(value: u128, action: OperatorAction) -> OperatorMutation {
     OperatorMutation {
         operation_id: Uuid::from_u128(value),
+        intent: None,
         action,
     }
 }
@@ -69,6 +70,7 @@ async fn promotion_requires_fresh_route_cursor_and_explicit_release() {
         OperatorAction::ReconcileRoute {
             route_id: route.id,
             binding: binding(),
+            replace_identity: false,
         },
     );
     let first = store

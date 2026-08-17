@@ -52,11 +52,13 @@ pub enum EventRead {
     Events {
         events: Vec<EventRecord>,
         next_after_sequence: u64,
+        latest_sequence: u64,
     },
     CursorTooOld {
         requested_after_sequence: u64,
         oldest_available_sequence: u64,
         latest_sequence: u64,
+        catalog_as_of_sequence: u64,
     },
     Unsupported,
 }
@@ -129,6 +131,11 @@ impl WaktermContract {
                 return Err(ContractError::Invalid("required capability is absent"));
             }
         }
+        if profile == ProfileKind::FutureEvents && !capabilities.contains("event_stream.v1") {
+            return Err(ContractError::Invalid(
+                "event fixture profile must enable general events",
+            ));
+        }
         let catalog: AgentCatalog = serde_json::from_value(root["catalog"].clone())?;
         if catalog.schema != AGENT_API_SCHEMA {
             return Err(ContractError::Invalid("catalog schema mismatch"));
@@ -142,21 +149,8 @@ impl WaktermContract {
             return Err(ContractError::Invalid("catalog pane ids are not unique"));
         }
 
-        let (events, oldest_available_sequence, latest_sequence) = match profile {
-            ProfileKind::Current => {
-                if capabilities.contains("event_stream.v1") {
-                    return Err(ContractError::Invalid(
-                        "current profile must not enable general events",
-                    ));
-                }
-                (Vec::new(), 0, 0)
-            }
-            ProfileKind::FutureEvents => {
-                if !capabilities.contains("event_stream.v1") {
-                    return Err(ContractError::Invalid(
-                        "future profile must enable general events",
-                    ));
-                }
+        let (events, oldest_available_sequence, latest_sequence) =
+            if capabilities.contains("event_stream.v1") {
                 let mut events = parse_page(&root["event_page"])?;
                 events.extend(parse_page(&root["lifecycle_page"])?);
                 events.sort_by_key(|event| event.sequence);
@@ -169,8 +163,9 @@ impl WaktermContract {
                     .ok_or(ContractError::Invalid("missing latest sequence"))?;
                 validate_events(&events)?;
                 (events, oldest, latest)
-            }
-        };
+            } else {
+                (Vec::new(), 0, 0)
+            };
         Ok(Self {
             profile,
             capabilities,
@@ -194,6 +189,7 @@ impl WaktermContract {
                 requested_after_sequence: after_sequence,
                 oldest_available_sequence: self.oldest_available_sequence,
                 latest_sequence: self.latest_sequence,
+                catalog_as_of_sequence: self.catalog.as_of_event_sequence,
             });
         }
         let events = self
@@ -206,6 +202,7 @@ impl WaktermContract {
         Ok(EventRead::Events {
             events,
             next_after_sequence: next,
+            latest_sequence: self.latest_sequence,
         })
     }
 }

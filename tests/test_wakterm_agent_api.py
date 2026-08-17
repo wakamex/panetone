@@ -28,7 +28,7 @@ class WaktermAgentApiContractTests(unittest.TestCase):
             )
         cls.fixture = json.loads(cls.path.read_text())
 
-    def test_live_capabilities_keep_general_event_stream_disabled(self):
+    def test_live_capabilities_advertise_the_general_event_stream(self):
         fixture = self.fixture
         current = fixture["current_capabilities"]
 
@@ -42,9 +42,9 @@ class WaktermAgentApiContractTests(unittest.TestCase):
                 "return_request_terminal_stream.v1",
             }.issubset(current["capabilities"])
         )
-        self.assertNotIn("event_stream.v1", current["capabilities"])
+        self.assertIn("event_stream.v1", current["capabilities"])
         self.assertEqual(
-            fixture["event_stream_capabilities"]["availability"], "fixture_only"
+            fixture["event_stream_capabilities"]["availability"], "live"
         )
         self.assertIn(
             "event_stream.v1",
@@ -103,12 +103,12 @@ class WaktermAgentApiContractTests(unittest.TestCase):
         self.assertEqual(classified["busy"], (True, False))
         self.assertEqual(classified["indeterminate"], (False, None))
 
-    def test_fixture_only_events_define_order_gap_and_lifecycle(self):
+    def test_live_event_examples_define_order_gap_and_lifecycle(self):
         page = self.fixture["event_page"]
         events = page["events"]
         sequences = [event["sequence"] for event in events]
 
-        self.assertEqual(page["availability"], "fixture_only")
+        self.assertEqual(page["availability"], "live_example")
         self.assertEqual(sequences, sorted(sequences))
         self.assertEqual(len(sequences), len(set(sequences)))
         self.assertEqual(page["next_after_sequence"], sequences[-1])
@@ -125,7 +125,7 @@ class WaktermAgentApiContractTests(unittest.TestCase):
         )
 
         lifecycle = self.fixture["lifecycle_page"]
-        self.assertEqual(lifecycle["availability"], "fixture_only")
+        self.assertEqual(lifecycle["availability"], "live_example")
         self.assertGreater(lifecycle["events"][0]["sequence"], sequences[-1])
         self.assertEqual(lifecycle["events"][0]["lifecycle"], "unavailable")
 

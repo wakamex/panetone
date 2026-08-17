@@ -16,11 +16,12 @@ use crate::domain::{
     WorkflowState, semantic_request_hash, stored_request_hash_matches,
 };
 use crate::promotion::{
-    LegacyDecision, LegacyRecordKind, OperatorAction, OperatorMutation, OperatorOutcome,
-    PromotionStatus,
+    EventCursorGap, LegacyDecision, LegacyRecordKind, OperatorAction, OperatorMutation,
+    OperatorOutcome, PromotionStatus,
 };
+use crate::wakterm::{AgentCatalog, EventRecord};
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 const COMMAND_CAPACITY: usize = 128;
 const PHASE5_SCHEMA_SQL: &str = "
     CREATE TABLE promotion_state (
@@ -53,6 +54,24 @@ const PHASE5_SCHEMA_SQL: &str = "
         created_at_ms INTEGER NOT NULL
     );
     PRAGMA user_version = 4;
+";
+const EVENT_SCHEMA_SQL: &str = "
+    CREATE TABLE agent_events (
+        sequence INTEGER PRIMARY KEY,
+        event_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        incarnation_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        route_id TEXT,
+        state TEXT NOT NULL,
+        record_json TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        UNIQUE(event_id, incarnation_id)
+    );
+    CREATE INDEX agent_events_state ON agent_events(state, sequence);
+    CREATE INDEX agent_events_agent
+        ON agent_events(agent_id, incarnation_id, sequence);
+    PRAGMA user_version = 5;
 ";
 
 #[derive(Debug, Error)]
@@ -121,6 +140,8 @@ pub struct InboxItem {
     #[serde(default)]
     pub destination: String,
     #[serde(default)]
+    pub sender_id: Option<String>,
+    #[serde(default)]
     pub sender: Option<String>,
     pub body: String,
     pub state: String,
@@ -146,7 +167,17 @@ pub struct StoreStatus {
     pub legacy_unresolved_returns: u64,
     pub legacy_debate_outbox: u64,
     pub signal_messages: u64,
+    pub unrouted_agent_events: u64,
+    pub observer_failure_events: u64,
     pub promotion: PromotionStatus,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EventIngestOutcome {
+    pub recorded: u64,
+    pub visible_outputs: u64,
+    pub unrouted: u64,
+    pub next_after_sequence: u64,
 }
 
 #[derive(Clone)]
@@ -222,6 +253,15 @@ enum Command {
         item: InboxItem,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
+    PendingInbox {
+        reply: oneshot::Sender<StoreResult<Vec<InboxItem>>>,
+    },
+    SaveInbox {
+        item: InboxItem,
+        expected_state: String,
+        route_preference: Option<(RouteId, ChannelKind)>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     SetMetadata {
         key: String,
         value: String,
@@ -239,10 +279,27 @@ enum Command {
         now_ms: i64,
         reply: oneshot::Sender<StoreResult<OperatorOutcome>>,
     },
+    OperatorReplay {
+        operation_id: Uuid,
+        intent: Value,
+        reply: oneshot::Sender<StoreResult<Option<OperatorOutcome>>>,
+    },
     AdvanceEventCursor {
         expected: u64,
         next: u64,
         reply: oneshot::Sender<StoreResult<()>>,
+    },
+    IngestAgentEvents {
+        expected: u64,
+        next: u64,
+        events: Vec<EventRecord>,
+        now_ms: i64,
+        reply: oneshot::Sender<StoreResult<EventIngestOutcome>>,
+    },
+    RecoverEventCursorGap {
+        gap: EventCursorGap,
+        catalog: AgentCatalog,
+        reply: oneshot::Sender<StoreResult<PromotionStatus>>,
     },
     Compact {
         before_ms: i64,
@@ -415,6 +472,25 @@ impl StoreHandle {
             .await
     }
 
+    pub async fn pending_inbox(&self) -> StoreResult<Vec<InboxItem>> {
+        self.request(|reply| Command::PendingInbox { reply }).await
+    }
+
+    pub async fn save_inbox(
+        &self,
+        item: InboxItem,
+        expected_state: impl Into<String>,
+        route_preference: Option<(RouteId, ChannelKind)>,
+    ) -> StoreResult<()> {
+        self.request(|reply| Command::SaveInbox {
+            item,
+            expected_state: expected_state.into(),
+            route_preference,
+            reply,
+        })
+        .await
+    }
+
     pub async fn set_metadata(&self, key: String, value: String) -> StoreResult<()> {
         self.request(|reply| Command::SetMetadata { key, value, reply })
             .await
@@ -443,10 +519,53 @@ impl StoreHandle {
         .await
     }
 
+    pub async fn operator_replay(
+        &self,
+        operation_id: Uuid,
+        intent: Value,
+    ) -> StoreResult<Option<OperatorOutcome>> {
+        self.request(|reply| Command::OperatorReplay {
+            operation_id,
+            intent,
+            reply,
+        })
+        .await
+    }
+
     pub async fn advance_event_cursor(&self, expected: u64, next: u64) -> StoreResult<()> {
         self.request(|reply| Command::AdvanceEventCursor {
             expected,
             next,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn ingest_agent_events(
+        &self,
+        expected: u64,
+        next: u64,
+        events: Vec<EventRecord>,
+        now_ms: i64,
+    ) -> StoreResult<EventIngestOutcome> {
+        self.request(|reply| Command::IngestAgentEvents {
+            expected,
+            next,
+            events,
+            now_ms,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn recover_event_cursor_gap(
+        &self,
+        gap: EventCursorGap,
+        catalog: AgentCatalog,
+    ) -> StoreResult<PromotionStatus> {
+        self.request(|reply| Command::RecoverEventCursorGap {
+            gap,
+            catalog,
             reply,
         })
         .await
@@ -549,6 +668,16 @@ fn handle_command(connection: &mut Connection, command: Command) {
         } => send_reply(reply, save_outbox(connection, &item, now_ms)),
         Command::PendingOutbox { reply } => send_reply(reply, pending_outbox(connection)),
         Command::AcceptInbox { item, reply } => send_reply(reply, accept_inbox(connection, &item)),
+        Command::PendingInbox { reply } => send_reply(reply, pending_inbox(connection)),
+        Command::SaveInbox {
+            item,
+            expected_state,
+            route_preference,
+            reply,
+        } => send_reply(
+            reply,
+            save_inbox(connection, &item, &expected_state, route_preference),
+        ),
         Command::SetMetadata { key, value, reply } => {
             send_reply(reply, set_metadata(connection, &key, &value))
         }
@@ -562,11 +691,31 @@ fn handle_command(connection: &mut Connection, command: Command) {
             reply,
             apply_operator_mutation(connection, &mutation, now_ms),
         ),
+        Command::OperatorReplay {
+            operation_id,
+            intent,
+            reply,
+        } => send_reply(reply, operator_replay(connection, operation_id, &intent)),
         Command::AdvanceEventCursor {
             expected,
             next,
             reply,
         } => send_reply(reply, advance_event_cursor(connection, expected, next)),
+        Command::IngestAgentEvents {
+            expected,
+            next,
+            events,
+            now_ms,
+            reply,
+        } => send_reply(
+            reply,
+            ingest_agent_events(connection, expected, next, &events, now_ms),
+        ),
+        Command::RecoverEventCursorGap {
+            gap,
+            catalog,
+            reply,
+        } => send_reply(reply, recover_event_cursor_gap(connection, &gap, &catalog)),
         Command::Compact { before_ms, reply } => send_reply(reply, compact(connection, before_ms)),
         Command::Status { reply } => send_reply(reply, status(connection)),
         Command::Shutdown { reply } => send_reply(reply, Ok(())),
@@ -736,7 +885,22 @@ pub(crate) fn migrate_schema(connection: &mut Connection) -> StoreResult<()> {
                  outcome_json TEXT NOT NULL,
                  created_at_ms INTEGER NOT NULL
              );
-             PRAGMA user_version = 4;",
+             CREATE TABLE agent_events (
+                 sequence INTEGER PRIMARY KEY,
+                 event_id TEXT NOT NULL,
+                 agent_id TEXT NOT NULL,
+                 incarnation_id TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 route_id TEXT,
+                 state TEXT NOT NULL,
+                 record_json TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 UNIQUE(event_id, incarnation_id)
+             );
+             CREATE INDEX agent_events_state ON agent_events(state, sequence);
+             CREATE INDEX agent_events_agent
+                 ON agent_events(agent_id, incarnation_id, sequence);
+             PRAGMA user_version = 5;",
         )?;
         transaction.commit()?;
     }
@@ -794,6 +958,7 @@ pub(crate) fn migrate_schema(connection: &mut Connection) -> StoreResult<()> {
              PRAGMA user_version = 3;",
         )?;
         transaction.execute_batch(PHASE5_SCHEMA_SQL)?;
+        transaction.execute_batch(EVENT_SCHEMA_SQL)?;
         transaction.commit()?;
     }
     if version == 2 {
@@ -821,11 +986,18 @@ pub(crate) fn migrate_schema(connection: &mut Connection) -> StoreResult<()> {
              PRAGMA user_version = 3;",
         )?;
         transaction.execute_batch(PHASE5_SCHEMA_SQL)?;
+        transaction.execute_batch(EVENT_SCHEMA_SQL)?;
         transaction.commit()?;
     }
     if version == 3 {
         let transaction = connection.transaction()?;
         transaction.execute_batch(PHASE5_SCHEMA_SQL)?;
+        transaction.execute_batch(EVENT_SCHEMA_SQL)?;
+        transaction.commit()?;
+    }
+    if version == 4 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(EVENT_SCHEMA_SQL)?;
         transaction.commit()?;
     }
     Ok(())
@@ -856,6 +1028,12 @@ fn recover(connection: &mut Connection) -> StoreResult<()> {
         "UPDATE outbox SET state = 'pending',
              record_json = json_set(record_json, '$.state', 'pending')
          WHERE state = 'delivering'",
+        [],
+    )?;
+    connection.execute(
+        "UPDATE inbox SET state = 'indeterminate',
+             record_json = json_set(record_json, '$.state', 'indeterminate')
+         WHERE state = 'admission_prepared'",
         [],
     )?;
     Ok(())
@@ -1068,6 +1246,16 @@ fn promotion_status(connection: &Connection) -> StoreResult<PromotionStatus> {
     Ok(PromotionStatus {
         delivery_hold,
         event_cursor,
+        event_cursor_gap: get_metadata(connection, "wakterm_event_cursor_gap_v1")?
+            .map(|value| serde_json::from_str(&value).map_err(StoreError::from))
+            .transpose()?,
+        telegram_update_offset: get_metadata(connection, "telegram_update_offset")?
+            .map(|value| {
+                value.parse::<u64>().map_err(|_| {
+                    StoreError::Conflict("stored Telegram update offset is invalid".into())
+                })
+            })
+            .transpose()?,
         enabled_routes,
         operator_actions: count(connection, "SELECT COUNT(*) FROM operator_actions")?,
         unresolved_legacy_controls: count(
@@ -1145,6 +1333,32 @@ fn apply_operator_mutation(
     Ok(outcome)
 }
 
+fn operator_replay(
+    connection: &Connection,
+    operation_id: Uuid,
+    intent: &Value,
+) -> StoreResult<Option<OperatorOutcome>> {
+    let Some((action_json, outcome_json)) = connection
+        .query_row(
+            "SELECT action_json, outcome_json FROM operator_actions WHERE operation_id = ?1",
+            params![operation_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let stored: OperatorMutation = serde_json::from_str(&action_json)?;
+    if stored.intent.as_ref() != Some(intent) {
+        return Err(StoreError::Conflict(format!(
+            "operator operation {operation_id} was already used with different content"
+        )));
+    }
+    let mut outcome: OperatorOutcome = serde_json::from_str(&outcome_json)?;
+    outcome.replayed = true;
+    Ok(Some(outcome))
+}
+
 fn apply_operator_action(
     transaction: &rusqlite::Transaction<'_>,
     mutation: &OperatorMutation,
@@ -1163,6 +1377,12 @@ fn apply_operator_action(
                 if cursor.is_none() || enabled == 0 {
                     return Err(StoreError::Conflict(
                         "delivery cannot be released before an event cursor and canary route are set"
+                            .into(),
+                    ));
+                }
+                if get_metadata(transaction, "wakterm_event_cursor_gap_v1")?.is_some() {
+                    return Err(StoreError::Conflict(
+                        "delivery cannot be released until the Wakterm event cursor gap is acknowledged"
                             .into(),
                     ));
                 }
@@ -1226,7 +1446,64 @@ fn apply_operator_action(
             )?;
             Ok((format!("event cursor initialized at {sequence}"), None))
         }
-        OperatorAction::ReconcileRoute { route_id, binding } => {
+        OperatorAction::AcknowledgeEventCursorGap {
+            requested_after_sequence,
+            evidence,
+        } => {
+            if evidence.trim().is_empty() {
+                return Err(StoreError::Conflict(
+                    "cursor-gap acknowledgement requires evidence".into(),
+                ));
+            }
+            let stored =
+                get_metadata(transaction, "wakterm_event_cursor_gap_v1")?.ok_or_else(|| {
+                    StoreError::Conflict("there is no event cursor gap to acknowledge".into())
+                })?;
+            let gap: EventCursorGap = serde_json::from_str(&stored)?;
+            if gap.requested_after_sequence != *requested_after_sequence {
+                return Err(StoreError::Conflict(format!(
+                    "event cursor gap began at {}, not {requested_after_sequence}",
+                    gap.requested_after_sequence
+                )));
+            }
+            transaction.execute(
+                "DELETE FROM metadata WHERE key = 'wakterm_event_cursor_gap_v1'",
+                [],
+            )?;
+            Ok((
+                format!(
+                    "event cursor gap at {requested_after_sequence} acknowledged with evidence: {}",
+                    evidence.trim()
+                ),
+                None,
+            ))
+        }
+        OperatorAction::InitializeInboundCursor { channel, cursor } => {
+            if *channel != ChannelKind::Telegram {
+                return Err(StoreError::Conflict(
+                    "only Telegram has a caller-initialized inbound cursor".into(),
+                ));
+            }
+            let key = "telegram_update_offset";
+            if let Some(existing) = get_metadata(transaction, key)? {
+                if existing != cursor.to_string() {
+                    return Err(StoreError::Conflict(format!(
+                        "Telegram update offset is already initialized at {existing}"
+                    )));
+                }
+            } else {
+                set_metadata(transaction, key, &cursor.to_string())?;
+            }
+            Ok((
+                format!("Telegram update offset initialized at {cursor}"),
+                None,
+            ))
+        }
+        OperatorAction::ReconcileRoute {
+            route_id,
+            binding,
+            replace_identity,
+        } => {
             if binding.pane_id.is_none() {
                 return Err(StoreError::Conflict(
                     "route reconciliation requires the fresh ephemeral pane locator".into(),
@@ -1235,6 +1512,14 @@ fn apply_operator_action(
             let mut route = get_route(transaction, *route_id)?
                 .ok_or_else(|| StoreError::Conflict(format!("route {route_id} does not exist")))?;
             let decision = route.reconcile(Some(binding.clone()));
+            let decision =
+                if decision == ReconcileDecision::ReconciliationRequired && *replace_identity {
+                    route.agent = Some(binding.clone());
+                    route.status = crate::domain::RouteStatus::Available;
+                    ReconcileDecision::Rebound
+                } else {
+                    decision
+                };
             save_route(transaction, &route, now_ms)?;
             let detail = match decision {
                 ReconcileDecision::Unchanged => "route identity was already current",
@@ -1503,6 +1788,324 @@ fn advance_event_cursor(connection: &Connection, expected: u64, next: u64) -> St
     Ok(())
 }
 
+fn ingest_agent_events(
+    connection: &mut Connection,
+    expected: u64,
+    next: u64,
+    events: &[EventRecord],
+    now_ms: i64,
+) -> StoreResult<EventIngestOutcome> {
+    if next < expected
+        || events.last().is_some_and(|event| event.sequence != next)
+        || events
+            .windows(2)
+            .any(|pair| pair[0].sequence >= pair[1].sequence)
+        || events
+            .first()
+            .is_some_and(|event| event.sequence <= expected)
+    {
+        return Err(StoreError::Conflict(
+            "Wakterm event page cursor and event order are inconsistent".into(),
+        ));
+    }
+    let transaction = connection.transaction()?;
+    let current: Option<u64> = transaction.query_row(
+        "SELECT event_cursor FROM promotion_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    if current != Some(expected) {
+        return Err(StoreError::Conflict(format!(
+            "event cursor was not at expected sequence {expected}"
+        )));
+    }
+    let routes = list_routes(&transaction)?;
+    let preferences = route_preferences(&transaction)?;
+    let mut outcome = EventIngestOutcome {
+        next_after_sequence: next,
+        ..EventIngestOutcome::default()
+    };
+
+    for event in events {
+        let record_json = serde_json::to_string(event)?;
+        if let Some((stored_id, stored_json)) = transaction
+            .query_row(
+                "SELECT event_id, record_json FROM agent_events WHERE sequence = ?1",
+                params![event.sequence],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            if stored_id != event.event_id || stored_json != record_json {
+                return Err(StoreError::Conflict(format!(
+                    "Wakterm event sequence {} changed content",
+                    event.sequence
+                )));
+            }
+            continue;
+        }
+        if transaction
+            .query_row(
+                "SELECT 1 FROM agent_events WHERE event_id = ?1 AND incarnation_id = ?2",
+                params![event.event_id, event.incarnation_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Err(StoreError::Conflict(format!(
+                "Wakterm event ID {:?} appeared at another sequence",
+                event.event_id
+            )));
+        }
+
+        let matching = routes
+            .iter()
+            .filter(|route| {
+                route.agent.as_ref().is_some_and(|binding| {
+                    binding.agent_id == event.agent_id
+                        && binding.incarnation_id == event.incarnation_id
+                })
+            })
+            .collect::<Vec<_>>();
+        if matching.len() > 1 {
+            return Err(StoreError::Conflict(format!(
+                "Wakterm event {:?} matches more than one durable route",
+                event.event_id
+            )));
+        }
+        let route = matching.first().copied();
+        if event.kind == "agent_lifecycle" {
+            if let Some(route) = route {
+                let mut route = route.clone();
+                route.status = match event.fields.get("lifecycle").and_then(Value::as_str) {
+                    Some("available") => crate::domain::RouteStatus::Available,
+                    Some("unavailable") => crate::domain::RouteStatus::Unavailable,
+                    _ => {
+                        return Err(StoreError::Conflict(
+                            "agent lifecycle event has an invalid lifecycle".into(),
+                        ));
+                    }
+                };
+                save_route(&transaction, &route, now_ms)?;
+            }
+        }
+
+        let mut state = "recorded";
+        let route_id = route.map(|route| route.id);
+        if matches!(event.kind.as_str(), "assistant_message" | "plan") {
+            let Some(route) = route else {
+                state = "unrouted";
+                outcome.unrouted += 1;
+                insert_agent_event(&transaction, event, None, state, &record_json, now_ms)?;
+                outcome.recorded += 1;
+                continue;
+            };
+            let Some((kind, destination)) = output_destination(
+                route,
+                preferences.get(&route.id.to_string()).map(String::as_str),
+            ) else {
+                state = "unrouted";
+                outcome.unrouted += 1;
+                insert_agent_event(
+                    &transaction,
+                    event,
+                    Some(route.id),
+                    state,
+                    &record_json,
+                    now_ms,
+                )?;
+                outcome.recorded += 1;
+                continue;
+            };
+            let text = event
+                .fields
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| StoreError::Conflict("visible Wakterm event has no text".into()))?;
+            let body = if event.kind == "plan" {
+                format!("Plan:\n{text}")
+            } else {
+                text.to_owned()
+            };
+            let namespace = Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                b"https://panetone.dev/wakterm/events/v1",
+            );
+            let item = OutboxItem {
+                id: EffectId::new(Uuid::new_v5(
+                    &namespace,
+                    format!("{}\0{}", event.incarnation_id, event.event_id).as_bytes(),
+                )),
+                route_id: Some(route.id),
+                sender_harness: route.agent.as_ref().map(|agent| agent.harness.clone()),
+                kind,
+                destination,
+                body,
+                state: OutboxState::Pending,
+                attempts: 0,
+                last_error: None,
+                external_receipt: None,
+            };
+            enqueue_outbox(&transaction, None, &item, now_ms)?;
+            state = "projected";
+            outcome.visible_outputs += 1;
+        }
+        insert_agent_event(&transaction, event, route_id, state, &record_json, now_ms)?;
+        outcome.recorded += 1;
+    }
+    let changed = transaction.execute(
+        "UPDATE promotion_state SET event_cursor = ?2, updated_at_ms = ?3
+         WHERE singleton = 1 AND event_cursor = ?1",
+        params![expected, next, now_ms],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::Conflict(format!(
+            "event cursor was not at expected sequence {expected}"
+        )));
+    }
+    transaction.commit()?;
+    Ok(outcome)
+}
+
+fn recover_event_cursor_gap(
+    connection: &mut Connection,
+    gap: &EventCursorGap,
+    catalog: &AgentCatalog,
+) -> StoreResult<PromotionStatus> {
+    if catalog.schema != "wakterm.agent-api.v1" {
+        return Err(StoreError::Conflict(
+            "cursor-gap recovery requires a v1 Wakterm catalog".into(),
+        ));
+    }
+    if gap.fresh_catalog_as_of_sequence != catalog.as_of_event_sequence
+        || gap.fresh_catalog_as_of_sequence.saturating_add(1) < gap.oldest_available_sequence
+    {
+        return Err(StoreError::Conflict(
+            "fresh catalog does not establish a usable event recovery cursor".into(),
+        ));
+    }
+    let transaction = connection.transaction()?;
+    let current: Option<u64> = transaction.query_row(
+        "SELECT event_cursor FROM promotion_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    if current != Some(gap.requested_after_sequence) {
+        return Err(StoreError::Conflict(format!(
+            "event cursor was not at gap sequence {}",
+            gap.requested_after_sequence
+        )));
+    }
+    if get_metadata(&transaction, "wakterm_event_cursor_gap_v1")?.is_some() {
+        return Err(StoreError::Conflict(
+            "an event cursor gap is already awaiting acknowledgement".into(),
+        ));
+    }
+
+    let mut routes = list_routes(&transaction)?;
+    for route in &mut routes {
+        let Some(binding) = route.agent.as_ref() else {
+            continue;
+        };
+        let live = catalog.agents.iter().any(|agent| {
+            agent.agent_id == binding.agent_id
+                && agent.incarnation_id.as_deref() == Some(binding.incarnation_id.as_str())
+                && agent.alive
+        });
+        route.status = if live {
+            crate::domain::RouteStatus::Available
+        } else {
+            crate::domain::RouteStatus::Unavailable
+        };
+        save_route(&transaction, route, gap.recorded_at_ms)?;
+    }
+    set_metadata(
+        &transaction,
+        "wakterm_event_cursor_gap_v1",
+        &serde_json::to_string(gap)?,
+    )?;
+    transaction.execute(
+        "UPDATE promotion_state
+         SET delivery_hold = 1, event_cursor = ?1, updated_at_ms = ?2
+         WHERE singleton = 1",
+        params![gap.fresh_catalog_as_of_sequence, gap.recorded_at_ms],
+    )?;
+    transaction.commit()?;
+    promotion_status(connection)
+}
+
+fn insert_agent_event(
+    connection: &Connection,
+    event: &EventRecord,
+    route_id: Option<RouteId>,
+    state: &str,
+    record_json: &str,
+    now_ms: i64,
+) -> StoreResult<()> {
+    connection.execute(
+        "INSERT INTO agent_events(
+             sequence, event_id, agent_id, incarnation_id, kind, route_id,
+             state, record_json, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            event.sequence,
+            event.event_id,
+            event.agent_id,
+            event.incarnation_id,
+            event.kind,
+            route_id.map(|id| id.to_string()),
+            state,
+            record_json,
+            now_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+fn route_preferences(
+    connection: &Connection,
+) -> StoreResult<std::collections::BTreeMap<String, String>> {
+    let value = get_metadata(connection, "migrated_route_preferences_v1")?;
+    value
+        .map(|value| serde_json::from_str(&value).map_err(StoreError::from))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+fn output_destination(route: &Route, preference: Option<&str>) -> Option<(ChannelKind, String)> {
+    let preferred = match preference {
+        Some("tg") => Some(ChannelKind::Telegram),
+        Some("sig") => Some(ChannelKind::Signal),
+        Some("slack") => Some(ChannelKind::Slack),
+        _ => None,
+    };
+    let telegram_topic = route.channels.iter().find_map(|binding| match binding {
+        crate::domain::ChannelBinding::Telegram { topic_id } => Some(*topic_id),
+        _ => None,
+    });
+    let signal_group = route.channels.iter().find_map(|binding| match binding {
+        crate::domain::ChannelBinding::Signal { group_id } => Some(group_id.as_str()),
+        _ => None,
+    });
+    let slack_channel = route.channels.iter().find_map(|binding| match binding {
+        crate::domain::ChannelBinding::Slack { channel_id } => Some(channel_id.as_str()),
+        _ => None,
+    });
+    crate::domain::select_channel(
+        preferred,
+        &route.title,
+        &crate::domain::ChannelAvailability {
+            telegram_topic,
+            signal_enabled: signal_group.is_some(),
+            signal_group,
+            slack_enabled: slack_channel.is_some(),
+            slack_channel,
+        },
+    )
+    .map(|selection| (selection.kind, selection.destination))
+}
+
 fn register_return(connection: &Connection, record: &ReturnDelivery) -> StoreResult<()> {
     let changed = connection.execute(
         "INSERT OR IGNORE INTO return_deliveries(
@@ -1673,6 +2276,62 @@ fn accept_inbox(connection: &Connection, item: &InboxItem) -> StoreResult<bool> 
     Ok(changed == 1)
 }
 
+fn pending_inbox(connection: &Connection) -> StoreResult<Vec<InboxItem>> {
+    let mut statement = connection
+        .prepare("SELECT record_json FROM inbox WHERE state = 'pending' ORDER BY created_at_ms")?;
+    let records = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    records
+        .into_iter()
+        .map(|record| serde_json::from_str(&record).map_err(StoreError::from))
+        .collect()
+}
+
+fn save_inbox(
+    connection: &mut Connection,
+    item: &InboxItem,
+    expected_state: &str,
+    route_preference: Option<(RouteId, ChannelKind)>,
+) -> StoreResult<()> {
+    let transaction = connection.transaction()?;
+    let changed = transaction.execute(
+        "UPDATE inbox SET state = ?2, record_json = ?3
+         WHERE effect_id = ?1 AND state = ?4",
+        params![
+            item.id.to_string(),
+            item.state,
+            serde_json::to_string(item)?,
+            expected_state,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::Conflict(format!(
+            "inbox item {} was not in {expected_state}",
+            item.id
+        )));
+    }
+    if let Some((route_id, channel)) = route_preference {
+        let mut preferences = route_preferences(&transaction)?;
+        preferences.insert(
+            route_id.to_string(),
+            match channel {
+                ChannelKind::Telegram => "tg",
+                ChannelKind::Signal => "sig",
+                ChannelKind::Slack => "slack",
+            }
+            .into(),
+        );
+        set_metadata(
+            &transaction,
+            "migrated_route_preferences_v1",
+            &serde_json::to_string(&preferences)?,
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 fn set_metadata(connection: &Connection, key: &str, value: &str) -> StoreResult<()> {
     connection.execute(
         "INSERT INTO metadata(key, value) VALUES (?1, ?2)
@@ -1772,6 +2431,14 @@ fn status(connection: &Connection) -> StoreResult<StoreStatus> {
         legacy_unresolved_returns: promotion.unresolved_legacy_returns,
         legacy_debate_outbox: promotion.held_legacy_debate,
         signal_messages: count(connection, "SELECT COUNT(*) FROM signal_messages")?,
+        unrouted_agent_events: count(
+            connection,
+            "SELECT COUNT(*) FROM agent_events WHERE state = 'unrouted'",
+        )?,
+        observer_failure_events: count(
+            connection,
+            "SELECT COUNT(*) FROM agent_events WHERE kind = 'observer_failure'",
+        )?,
         promotion,
     })
 }

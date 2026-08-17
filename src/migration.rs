@@ -931,6 +931,7 @@ fn import_signal(
                     channel: ChannelKind::Signal,
                     external_id,
                     destination: group_id,
+                    sender_id: Some(sender_number.clone()),
                     sender: Some(if sender_id.is_empty() {
                         sender_number
                     } else {
@@ -988,6 +989,7 @@ fn import_signal(
                     channel: ChannelKind::Signal,
                     external_id,
                     destination: group_id.clone(),
+                    sender_id: None,
                     sender: None,
                     body: message.to_owned(),
                     state: "pending".into(),

@@ -75,13 +75,14 @@ loading and isolates the mux socket, saved session, cache, config, and data belo
 the Panetone development worktree. It runs in the foreground and never manages
 or restarts the production mux. Stop it with Ctrl-C when the test is complete.
 
-Panetone negotiates the Wakterm Agent API once during startup. Return mode
+The installed Python bridge negotiates the Wakterm Agent API during startup.
+The Phase 5A Rust candidate also checks capabilities on every Agent API
+operation because each CLI invocation opens a new mux connection. Return mode
 requires catalog, prompt-admission, and durable return-stream capabilities so a
 callback can be queued while its exact source agent is busy instead of steering
-an active turn. When the installed Wakterm lacks that boundary, ordinary
-one-way sends remain enabled but `--return-final` fails before Telegram or
-prompt delivery. A compatible Wakterm installation takes effect after a
-deliberate Panetone restart.
+an active turn. The Rust output consumer additionally requires
+`event_stream.v1`. See [the Phase 5A contract](docs/rust-phase5a.md) and
+[production runbook](docs/production-operations.md).
 
 ## Signal Setup (optional)
 
@@ -177,9 +178,11 @@ control. It does not change the original request into a synchronous exchange.
 Every request has a UUID idempotency key. The CLI generates one by default and
 returns it in the response. Use `--id UUID` when retrying after a lost response.
 The same ID and content return the stored receipt without redelivery. Different
-content with the same ID returns `idempotency_conflict` during the 30-day
-completed-request retention window. Pending and indeterminate IDs do not expire.
-Panetone never retries a request left uncertain across a process failure.
+content with the same ID returns `idempotency_conflict`. The installed Python
+bridge retains completed IDs for 30 days. The Rust candidate keeps permanent
+UUID tombstones, so a completed ID never becomes a new request. Pending and
+indeterminate IDs do not expire in either implementation. Panetone never
+retries a request left uncertain across a process failure.
 
 The Panetone control socket defaults to
 `$XDG_RUNTIME_DIR/panetone/control.sock`. It is separate from the Wakterm mux

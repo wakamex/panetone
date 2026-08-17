@@ -721,7 +721,7 @@ async fn fixture_event_cursor_advances_only_after_a_valid_future_page() {
 }
 
 #[tokio::test]
-async fn current_profile_never_creates_a_general_event_cursor() {
+async fn current_live_profile_exposes_the_general_event_cursor_contract() {
     let directory = tempdir().unwrap();
     let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
     let service = OfflineService::new(
@@ -729,16 +729,16 @@ async fn current_profile_never_creates_a_general_event_cursor() {
         FakeWakterm::new(contract()),
         RecordingChannels::default(),
     );
-    assert_eq!(
-        service.consume_fixture_events(0).await.unwrap(),
-        EventRead::Unsupported
-    );
+    assert!(matches!(
+        service.consume_fixture_events(100).await.unwrap(),
+        EventRead::Events { .. }
+    ));
     assert_eq!(
         store
             .get_metadata("wakterm_event_cursor".into())
             .await
             .unwrap(),
-        None
+        Some("108".into())
     );
     drop(service);
     store.shutdown().await.unwrap();
