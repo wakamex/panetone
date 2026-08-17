@@ -1,0 +1,52 @@
+{
+  "schema": "panetone.route-resolution.v1",
+  "cases": [
+    {
+      "name": "exact_case_insensitive_match",
+      "lookup": "ALPHA",
+      "tabs": [
+        {"tab_id": 1, "title": "Alpha", "topic_id": 101, "pane_id": 11, "harness": "codex"}
+      ],
+      "expected": {
+        "title": "Alpha",
+        "tab_id": 1,
+        "pane_id": 11,
+        "harness": "codex",
+        "topic_id": 101
+      }
+    },
+    {
+      "name": "missing_title",
+      "lookup": "missing",
+      "tabs": [
+        {"tab_id": 1, "title": "Alpha", "topic_id": 101, "pane_id": 11, "harness": "codex"}
+      ],
+      "error": "route_not_found"
+    },
+    {
+      "name": "duplicate_casefolded_title",
+      "lookup": "alpha",
+      "tabs": [
+        {"tab_id": 1, "title": "Alpha", "topic_id": 101, "pane_id": 11, "harness": "codex"},
+        {"tab_id": 2, "title": "ALPHA", "topic_id": 102, "pane_id": 12, "harness": "claude"}
+      ],
+      "error": "route_ambiguous"
+    },
+    {
+      "name": "route_without_agent",
+      "lookup": "alpha",
+      "tabs": [
+        {"tab_id": 1, "title": "Alpha", "topic_id": 101, "pane_id": 11, "harness": null}
+      ],
+      "error": "route_unavailable"
+    },
+    {
+      "name": "route_without_topic",
+      "lookup": "alpha",
+      "tabs": [
+        {"tab_id": 1, "title": "Alpha", "topic_id": null, "pane_id": 11, "harness": "codex"}
+      ],
+      "error": "route_unavailable"
+    }
+  ]
+}
