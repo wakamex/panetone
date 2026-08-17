@@ -85,7 +85,7 @@ async fn store_is_private_and_rejects_newer_schemas() {
         StoreHandle::open(&path),
         Err(StoreError::NewerSchema {
             found: 99,
-            supported: 1
+            supported: 2
         })
     ));
 }

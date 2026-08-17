@@ -13,6 +13,7 @@ pub use route::{
     AgentBinding, LiveRoute, ReconcileDecision, Route, RouteError, RouteStatus, resolve_live_route,
 };
 pub use workflow::{
-    AdmissionReceipt, AdmissionStatus, CallbackDelivery, DeliveryState, SendCommand, Workflow,
-    WorkflowError, WorkflowState, semantic_request_hash,
+    AdmissionReceipt, AdmissionStatus, CallbackDelivery, DeliveryState, PYTHON_CONTROL_HASH_KIND,
+    SEMANTIC_HASH_KIND, SendCommand, Workflow, WorkflowError, WorkflowState,
+    legacy_python_request_hashes, semantic_request_hash, stored_request_hash_matches,
 };

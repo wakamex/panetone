@@ -11,10 +11,11 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::domain::{
     AgentBinding, CallbackDelivery, ChannelKind, DeliveryState, EffectId, OutboxItem, OutboxState,
-    Route, RouteId, SendCommand, Workflow, WorkflowId, WorkflowState, semantic_request_hash,
+    Route, RouteId, SEMANTIC_HASH_KIND, SendCommand, Workflow, WorkflowId, WorkflowState,
+    semantic_request_hash, stored_request_hash_matches,
 };
 
-const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 const COMMAND_CAPACITY: usize = 128;
 
 #[derive(Debug, Error)]
@@ -103,6 +104,10 @@ pub struct StoreStatus {
     pub indeterminate_outbox: u64,
     pub pending_inbox: u64,
     pub tombstones: u64,
+    pub legacy_control_requests: u64,
+    pub legacy_indeterminate_requests: u64,
+    pub legacy_unresolved_returns: u64,
+    pub signal_messages: u64,
 }
 
 #[derive(Clone)]
@@ -492,11 +497,11 @@ fn open_database(path: &Path) -> StoreResult<Connection> {
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
-    migrate(&mut connection)?;
+    migrate_schema(&mut connection)?;
     Ok(connection)
 }
 
-fn migrate(connection: &mut Connection) -> StoreResult<()> {
+pub(crate) fn migrate_schema(connection: &mut Connection) -> StoreResult<()> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version > SCHEMA_VERSION {
         return Err(StoreError::NewerSchema {
@@ -515,6 +520,7 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
              CREATE TABLE idempotency_tombstones (
                  request_id TEXT PRIMARY KEY,
                  semantic_hash TEXT NOT NULL,
+                 hash_kind TEXT NOT NULL DEFAULT 'semantic_v1',
                  terminal_state TEXT NOT NULL,
                  created_at_ms INTEGER NOT NULL,
                  completed_at_ms INTEGER
@@ -562,7 +568,70 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
                  key TEXT PRIMARY KEY,
                  value TEXT NOT NULL
              );
-             PRAGMA user_version = 1;",
+             CREATE TABLE legacy_control_requests (
+                 request_id TEXT PRIMARY KEY REFERENCES idempotency_tombstones(request_id),
+                 state TEXT NOT NULL,
+                 source TEXT NOT NULL,
+                 target TEXT NOT NULL,
+                 record_json TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE legacy_return_deliveries (
+                 request_id TEXT PRIMARY KEY REFERENCES idempotency_tombstones(request_id),
+                 state TEXT NOT NULL,
+                 agent_state TEXT NOT NULL,
+                 mirror_state TEXT NOT NULL,
+                 record_json TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE signal_messages (
+                 legacy_id TEXT PRIMARY KEY,
+                 group_id TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 record_json TEXT NOT NULL,
+                 received_at_ms INTEGER NOT NULL
+             );
+             CREATE INDEX signal_messages_state
+                 ON signal_messages(state, received_at_ms);
+             PRAGMA user_version = 2;",
+        )?;
+        transaction.commit()?;
+    }
+    if version == 1 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "ALTER TABLE idempotency_tombstones
+                 ADD COLUMN hash_kind TEXT NOT NULL DEFAULT 'semantic_v1';
+             CREATE TABLE legacy_control_requests (
+                 request_id TEXT PRIMARY KEY REFERENCES idempotency_tombstones(request_id),
+                 state TEXT NOT NULL,
+                 source TEXT NOT NULL,
+                 target TEXT NOT NULL,
+                 record_json TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE legacy_return_deliveries (
+                 request_id TEXT PRIMARY KEY REFERENCES idempotency_tombstones(request_id),
+                 state TEXT NOT NULL,
+                 agent_state TEXT NOT NULL,
+                 mirror_state TEXT NOT NULL,
+                 record_json TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE signal_messages (
+                 legacy_id TEXT PRIMARY KEY,
+                 group_id TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 record_json TEXT NOT NULL,
+                 received_at_ms INTEGER NOT NULL
+             );
+             CREATE INDEX signal_messages_state
+                 ON signal_messages(state, received_at_ms);
+             PRAGMA user_version = 2;",
         )?;
         transaction.commit()?;
     }
@@ -619,17 +688,23 @@ fn claim(
             }
         });
     }
-    if let Some((stored_hash, state)) = connection
+    if let Some((stored_hash, hash_kind, state)) = connection
         .query_row(
-            "SELECT semantic_hash, terminal_state FROM idempotency_tombstones
+            "SELECT semantic_hash, hash_kind, terminal_state FROM idempotency_tombstones
              WHERE request_id = ?1",
             params![request_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()?
     {
         return Ok(ClaimResult::Tombstone {
-            same_content: stored_hash == semantic_hash,
+            same_content: stored_request_hash_matches(&hash_kind, &stored_hash, &command),
             state,
         });
     }
@@ -654,9 +729,9 @@ fn claim(
     let transaction = connection.transaction()?;
     transaction.execute(
         "INSERT INTO idempotency_tombstones(
-             request_id, semantic_hash, terminal_state, created_at_ms, completed_at_ms
-         ) VALUES (?1, ?2, 'claimed', ?3, NULL)",
-        params![request_id, semantic_hash, now_ms],
+             request_id, semantic_hash, hash_kind, terminal_state, created_at_ms, completed_at_ms
+         ) VALUES (?1, ?2, ?3, 'claimed', ?4, NULL)",
+        params![request_id, semantic_hash, SEMANTIC_HASH_KIND, now_ms],
     )?;
     transaction.execute(
         "INSERT INTO workflows(
@@ -1027,6 +1102,17 @@ fn status(connection: &Connection) -> StoreResult<StoreStatus> {
             "SELECT COUNT(*) FROM inbox WHERE state = 'pending'",
         )?,
         tombstones: count(connection, "SELECT COUNT(*) FROM idempotency_tombstones")?,
+        legacy_control_requests: count(connection, "SELECT COUNT(*) FROM legacy_control_requests")?,
+        legacy_indeterminate_requests: count(
+            connection,
+            "SELECT COUNT(*) FROM legacy_control_requests WHERE state = 'indeterminate'",
+        )?,
+        legacy_unresolved_returns: count(
+            connection,
+            "SELECT COUNT(*) FROM legacy_return_deliveries
+             WHERE agent_state != 'delivered' OR mirror_state != 'delivered'",
+        )?,
+        signal_messages: count(connection, "SELECT COUNT(*) FROM signal_messages")?,
     })
 }
 

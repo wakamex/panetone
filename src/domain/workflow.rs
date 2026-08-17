@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -35,6 +36,57 @@ pub fn semantic_request_hash(command: &SendCommand) -> String {
     }
     digest.update(command.timeout_ms.to_string().as_bytes());
     format!("{:x}", digest.finalize())
+}
+
+pub const SEMANTIC_HASH_KIND: &str = "semantic_v1";
+pub const PYTHON_CONTROL_HASH_KIND: &str = "python_control_v1";
+
+pub fn legacy_python_request_hashes(command: &SendCommand) -> Vec<String> {
+    let return_options: &[Option<bool>] = if command.return_final {
+        &[Some(true)]
+    } else {
+        &[None, Some(false)]
+    };
+    let timeout_options: &[Option<u64>] = if command.timeout_ms == 0 {
+        &[None, Some(0)]
+    } else {
+        &[Some(command.timeout_ms)]
+    };
+    let mut hashes = Vec::new();
+    for return_final in return_options {
+        for timeout_ms in timeout_options {
+            let mut params = Map::new();
+            params.insert("from".into(), Value::String(command.source.clone()));
+            params.insert("message".into(), Value::String(command.message.clone()));
+            if let Some(value) = return_final {
+                params.insert("return_final".into(), Value::Bool(*value));
+            }
+            if let Some(value) = timeout_ms {
+                params.insert("timeout_ms".into(), Value::from(*value));
+            }
+            params.insert("to".into(), Value::String(command.target.clone()));
+            let content = serde_json::json!({
+                "schema": "panetone.control.v1",
+                "method": "send",
+                "params": params,
+            });
+            let encoded = serde_json::to_vec(&content).expect("control request JSON serializes");
+            hashes.push(format!("{:x}", Sha256::digest(encoded)));
+        }
+    }
+    hashes.sort();
+    hashes.dedup();
+    hashes
+}
+
+pub fn stored_request_hash_matches(kind: &str, stored: &str, command: &SendCommand) -> bool {
+    match kind {
+        SEMANTIC_HASH_KIND => semantic_request_hash(command) == stored,
+        PYTHON_CONTROL_HASH_KIND => legacy_python_request_hashes(command)
+            .iter()
+            .any(|candidate| candidate == stored),
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -361,5 +413,27 @@ mod tests {
         };
         delivery.recover_after_restart();
         assert_eq!(delivery.state, DeliveryState::Indeterminate);
+    }
+
+    #[test]
+    fn legacy_python_hashes_cover_only_semantically_equivalent_defaults() {
+        let command = SendCommand {
+            id: WorkflowId::new(uuid::Uuid::nil()),
+            source: "café".into(),
+            target: "target".into(),
+            message: "hello".into(),
+            return_final: false,
+            timeout_ms: 0,
+        };
+        let hashes = legacy_python_request_hashes(&command);
+        assert_eq!(hashes.len(), 4);
+        assert!(hashes.iter().all(|hash| hash.len() == 64));
+        let mut changed = command.clone();
+        changed.message = "different".into();
+        assert!(
+            legacy_python_request_hashes(&changed)
+                .iter()
+                .all(|hash| !hashes.contains(hash))
+        );
     }
 }

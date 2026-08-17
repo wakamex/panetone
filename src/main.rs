@@ -279,6 +279,8 @@ async fn run_doctor(args: DoctorArgs) -> Result<()> {
             Ok(status) => {
                 let degraded = status.failed_workflows > 0
                     || status.indeterminate_workflows > 0
+                    || status.legacy_indeterminate_requests > 0
+                    || status.legacy_unresolved_returns > 0
                     || status.failed_outbox > 0
                     || status.indeterminate_outbox > 0
                     || status.unresolved_returns > 0;
