@@ -43,7 +43,7 @@ from the committed `bridge.py.lock`; refresh it deliberately with
 
 Production does not watch source files or reload itself. Develop in a separate
 Git worktree, run the test suite there, stop the service, promote the tested
-commit into `/code/msger`, and start the service once. The current deployment
+commit into `/code/panetone`, and start the service once. The current deployment
 is an enabled user service with lingering enabled. It runs the locked script
 through `~/.local/bin/uv` and shares the user service manager with Wakterm, so
 their startup ordering is explicit and neither service requires an interactive
@@ -55,7 +55,7 @@ Panetone and its Wakterm dependency into a compatible system-service deployment
 before using this alternative. The rollback-safe Panetone installer is:
 
 ```sh
-sudo /bin/bash /code/msger/deploy/install-system-service.sh
+sudo /bin/bash /code/panetone/deploy/install-system-service.sh
 ```
 
 The installer checks the committed lock before stopping the current service and

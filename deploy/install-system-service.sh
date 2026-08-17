@@ -1,7 +1,7 @@
 #!/bin/bash
 set -eu
 
-repo=/code/msger
+repo=/code/panetone
 service_user=mihai
 service_uid=1000
 user_runtime=/run/user/$service_uid

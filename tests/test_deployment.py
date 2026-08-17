@@ -40,7 +40,7 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertEqual(service["Restart"], "on-failure")
         self.assertEqual(
             service["ExecStart"],
-            "/usr/local/bin/uv --no-config run --locked --script /code/msger/bridge.py",
+            "/usr/local/bin/uv --no-config run --locked --script /code/panetone/bridge.py",
         )
 
     def test_poll_loop_cannot_reexecute_the_process(self):
