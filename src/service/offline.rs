@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 
-use crate::channels::RecordingChannels;
+use crate::channels::{RealChannels, RecordingChannels};
 use crate::domain::{
     AgentBinding, CallbackDelivery, ChannelBinding, ChannelKind, DeliveryState, EffectId,
     OutboxItem, OutboxState, Route, RouteStatus, SendCommand, WorkflowId, WorkflowState,
@@ -12,7 +12,7 @@ use crate::domain::{
 use crate::store::{
     ClaimResult, DestinationDelivery, ReturnDelivery, StoreError, StoreHandle, StoredWorkflow,
 };
-use crate::wakterm::{ContractError, EventRead, FakeWakterm, TerminalResult};
+use crate::wakterm::{ContractError, EventRead, FakeWakterm, TerminalResult, WaktermCli};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ServiceAck {
@@ -82,6 +82,8 @@ pub enum ServiceError {
     AuditFailed(String),
     #[error("target admission failed in state {0:?}")]
     AdmissionFailed(WorkflowState),
+    #[error("adapter operation became uncertain: {0}")]
+    Adapter(String),
     #[error("terminal result does not match the persisted workflow identity")]
     TerminalIdentity,
     #[error("the workflow is missing or not awaiting this operation")]
@@ -100,17 +102,61 @@ pub enum ServiceError {
 
 pub struct OfflineService {
     store: StoreHandle,
-    wakterm: FakeWakterm,
-    channels: RecordingChannels,
+    wakterm: WaktermBackend,
+    channels: ChannelBackend,
     faults: Arc<FaultInjector>,
+}
+
+enum WaktermBackend {
+    Fake(FakeWakterm),
+    Real(WaktermCli),
+}
+
+enum ChannelBackend {
+    Fake(RecordingChannels),
+    Real(RealChannels),
+}
+
+impl WaktermBackend {
+    async fn admit(
+        &self,
+        request_id: EffectId,
+        binding: &AgentBinding,
+        prompt: String,
+        return_final: bool,
+        timeout_ms: u64,
+    ) -> Result<crate::domain::AdmissionReceipt, ServiceError> {
+        match self {
+            Self::Fake(wakterm) => Ok(wakterm.admit(request_id, binding, prompt, return_final)),
+            Self::Real(wakterm) => wakterm
+                .admit(request_id, binding, &prompt, return_final, timeout_ms)
+                .await
+                .map_err(|error| ServiceError::Adapter(error.to_string())),
+        }
+    }
+}
+
+impl ChannelBackend {
+    async fn send(&self, item: &OutboxItem) -> Result<String, ServiceError> {
+        match self {
+            Self::Fake(channels) => channels
+                .send(item)
+                .map_err(|error| ServiceError::Adapter(error.to_string())),
+            Self::Real(channels) => channels
+                .send(item)
+                .await
+                .map(|receipt| receipt.external_id)
+                .map_err(|error| ServiceError::Adapter(error.to_string())),
+        }
+    }
 }
 
 impl OfflineService {
     pub fn new(store: StoreHandle, wakterm: FakeWakterm, channels: RecordingChannels) -> Self {
         Self {
             store,
-            wakterm,
-            channels,
+            wakterm: WaktermBackend::Fake(wakterm),
+            channels: ChannelBackend::Fake(channels),
             faults: Arc::new(FaultInjector::default()),
         }
     }
@@ -123,25 +169,43 @@ impl OfflineService {
     ) -> Self {
         Self {
             store,
-            wakterm,
-            channels,
+            wakterm: WaktermBackend::Fake(wakterm),
+            channels: ChannelBackend::Fake(channels),
             faults,
         }
     }
 
+    pub fn new_real(store: StoreHandle, wakterm: WaktermCli, channels: RealChannels) -> Self {
+        Self {
+            store,
+            wakterm: WaktermBackend::Real(wakterm),
+            channels: ChannelBackend::Real(channels),
+            faults: Arc::new(FaultInjector::default()),
+        }
+    }
+
     pub fn wakterm(&self) -> &FakeWakterm {
-        &self.wakterm
+        match &self.wakterm {
+            WaktermBackend::Fake(wakterm) => wakterm,
+            WaktermBackend::Real(_) => panic!("real service has no recording Wakterm adapter"),
+        }
     }
 
     pub fn channels(&self) -> &RecordingChannels {
-        &self.channels
+        match &self.channels {
+            ChannelBackend::Fake(channels) => channels,
+            ChannelBackend::Real(_) => panic!("real service has no recording channel adapter"),
+        }
     }
 
     pub async fn consume_fixture_events(
         &self,
         after_sequence: u64,
     ) -> Result<EventRead, ServiceError> {
-        let page = self.wakterm.read_events(after_sequence)?;
+        let page = match &self.wakterm {
+            WaktermBackend::Fake(wakterm) => wakterm.read_events(after_sequence)?,
+            WaktermBackend::Real(_) => EventRead::Unsupported,
+        };
         if let EventRead::Events {
             next_after_sequence,
             ..
@@ -265,7 +329,7 @@ impl OfflineService {
         audit.state = OutboxState::Delivering;
         audit.attempts += 1;
         self.store.save_outbox(audit.clone(), now_ms).await?;
-        match self.channels.send(&audit) {
+        match self.channels.send(&audit).await {
             Ok(receipt) => {
                 self.faults.hit(FaultPoint::AfterAuditEffect)?;
                 audit.state = OutboxState::Delivered;
@@ -334,12 +398,37 @@ impl OfflineService {
             &record.workflow.observed_source.harness,
             &target.harness,
         );
-        let receipt = self.wakterm.admit(
-            record.workflow.target_effect_id,
-            &target,
-            prompt,
-            record.command.return_final,
-        );
+        let receipt = match self
+            .wakterm
+            .admit(
+                record.workflow.target_effect_id,
+                &target,
+                prompt,
+                record.command.return_final,
+                record.command.timeout_ms,
+            )
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                transition(
+                    &self.store,
+                    &mut record,
+                    WorkflowState::Indeterminate,
+                    now_ms,
+                )
+                .await?;
+                self.post_target_status(
+                    &record,
+                    target_channel,
+                    "delivery-failed",
+                    "DELIVERY INDETERMINATE; see durable request state",
+                    now_ms,
+                )
+                .await?;
+                return Err(error);
+            }
+        };
         self.faults.hit(FaultPoint::AfterPromptEffect)?;
         let expected = record.workflow.state;
         let state = record.workflow.apply_target_receipt(&receipt, &target)?;
@@ -433,7 +522,7 @@ impl OfflineService {
         item.state = OutboxState::Delivering;
         item.attempts = 1;
         self.store.save_outbox(item.clone(), now_ms).await?;
-        match self.channels.send(&item) {
+        match self.channels.send(&item).await {
             Ok(receipt) => {
                 item.state = OutboxState::Delivered;
                 item.external_receipt = Some(receipt);
@@ -539,7 +628,7 @@ impl OfflineService {
             self.store.save_outbox(mirror.clone(), now_ms).await?;
             returned.mirror.state = DeliveryState::Pending;
             returned.mirror.attempts += 1;
-            match self.channels.send(&mirror) {
+            match self.channels.send(&mirror).await {
                 Ok(receipt) => {
                     self.faults.hit(FaultPoint::AfterMirrorEffect)?;
                     mirror.state = OutboxState::Delivered;
@@ -600,12 +689,26 @@ impl OfflineService {
         returned.updated_at_ms = now_ms;
         self.store.save_return(returned.clone()).await?;
         self.faults.hit(FaultPoint::AfterCallbackPrepared)?;
-        let receipt = self.wakterm.admit(
-            returned.agent.effect_id,
-            &returned.agent.source,
-            callback_envelope_from_value(&workflow, &returned),
-            false,
-        );
+        let receipt = match self
+            .wakterm
+            .admit(
+                returned.agent.effect_id,
+                &returned.agent.source,
+                callback_envelope_from_value(&workflow, &returned),
+                false,
+                0,
+            )
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                returned.agent.state = DeliveryState::Indeterminate;
+                returned.agent.last_error = Some(error.to_string());
+                returned.updated_at_ms = now_ms;
+                self.store.save_return(returned).await?;
+                return Err(error);
+            }
+        };
         self.faults.hit(FaultPoint::AfterCallbackEffect)?;
         returned.agent.apply_receipt(&receipt)?;
         returned.updated_at_ms = now_ms;
