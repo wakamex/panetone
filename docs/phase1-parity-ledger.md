@@ -137,9 +137,9 @@ The following are not parity failures when backed by their migration or compatib
 
 - [x] Architecture authority, route, delivery, storage, and shutdown decisions are recorded.
 - [x] Every production state source is inventoried.
-- [ ] Control v1 golden fixtures reproduce Python behavior.
-- [ ] Provider and routing fixtures reproduce current normalized observations.
-- [ ] A black-box harness runs the same control cases against a replaceable backend command.
+- [x] Control v1 golden fixtures reproduce Python behavior.
+- [x] Provider and routing fixtures reproduce current normalized observations.
+- [x] A black-box harness runs the same control cases against a replaceable backend command.
 - [ ] Wakterm Agent API fixtures cover capability, catalog, receipt, events, cursor gaps, retention, lifecycle, and classified errors.
 - [ ] Independent protocol review has no unresolved material finding.
 - [ ] Codex recording-sink shadow comparison has zero unexplained normalized differences.
