@@ -151,9 +151,10 @@ it.
 Panetone performs these steps:
 
 1. Claim the UUID durably as `in_progress`.
-2. Refresh and resolve the live source and target routes. For return mode, join
-   their pane IDs to a fresh Wakterm catalog and persist exact agent and
-   incarnation identities.
+2. For return mode, read the Wakterm catalog before and after refreshing the
+   live source and target routes. Join by pane ID only when both catalogs have
+   the same exact agent and incarnation binding, then persist those identities.
+   A mux restart or pane reuse during resolution fails closed before the audit.
 3. Post `SOURCE → TARGET`, the UUID marked `[pending]`, and the message in the
    target Telegram topic.
 4. Persist the Telegram receipt as `audit_posted`.

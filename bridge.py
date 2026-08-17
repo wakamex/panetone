@@ -360,6 +360,17 @@ def _bind_route_agent(route, agents):
     }
 
 
+def _bind_stable_route_agent(route, before_agents, after_agents):
+    before = _bind_route_agent(route, before_agents)
+    after = _bind_route_agent(route, after_agents)
+    identity_fields = ("agent_id", "incarnation_id", "pane_id", "harness")
+    if any(before[field] != after[field] for field in identity_fields):
+        raise RuntimeError(
+            f"route {route['title']!r} changed Wakterm binding during resolution"
+        )
+    return after
+
+
 def _return_callback_request_id(request_id):
     return str(uuid.uuid5(RETURN_CALLBACK_NAMESPACE, request_id))
 
@@ -3154,14 +3165,25 @@ async def _handle_control_send(request, transition, journal=None):
             "Wakterm does not support durable return requests; no delivery was attempted",
             details={"reason": _wakterm_return_unavailable_reason},
         )
+    before_agents = None
+    if return_final:
+        try:
+            before_agents = await asyncio.to_thread(_wakterm_agent_catalog_sync)
+        except Exception as error:
+            raise RequestFailure(
+                "return_final_unavailable",
+                "Wakterm could not establish a stable live-agent snapshot; "
+                "no delivery was attempted",
+                details={"reason": str(error)},
+            ) from error
     await _refresh_telegram_routes()
     source = _control_route(params["from"])
     target = _control_route(params["to"])
     if return_final:
         try:
-            agents = await asyncio.to_thread(_wakterm_agent_catalog_sync)
-            source = _bind_route_agent(source, agents)
-            target = _bind_route_agent(target, agents)
+            after_agents = await asyncio.to_thread(_wakterm_agent_catalog_sync)
+            source = _bind_stable_route_agent(source, before_agents, after_agents)
+            target = _bind_stable_route_agent(target, before_agents, after_agents)
         except Exception as error:
             raise RequestFailure(
                 "return_final_unavailable",

@@ -709,6 +709,42 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
         refresh.assert_not_awaited()
         send.assert_not_awaited()
 
+    async def test_return_final_fails_closed_when_route_binding_changes(self):
+        order = []
+        bot = FakeControlBot(order)
+        self._configure_control(bot)
+        before = self._agent_catalog()
+        after = json.loads(json.dumps(before))
+        after[0]["agent_id"] = "replacement-source"
+        after[0]["incarnation_id"] = "replacement-incarnation"
+        send = AsyncMock()
+        request = {
+            "id": "00000000-0000-4000-8000-000000000012",
+            "params": {
+                "from": "Source",
+                "to": "Target",
+                "message": "do work",
+                "return_final": True,
+            },
+        }
+
+        with (
+            patch.object(bridge, "_refresh_telegram_routes", AsyncMock()),
+            patch.object(
+                bridge,
+                "_wakterm_agent_catalog_sync",
+                side_effect=[before, after],
+            ),
+            patch.object(bridge, "agent_send", send),
+            self.assertRaises(bridge.RequestFailure) as raised,
+        ):
+            await bridge._handle_control_send(request, AsyncMock())
+
+        self.assertEqual(raised.exception.code, "return_final_unavailable")
+        self.assertFalse(raised.exception.indeterminate)
+        self.assertEqual(bot.sent, [])
+        send.assert_not_awaited()
+
     async def test_return_final_registers_route_before_wakterm_submission(self):
         order = []
         bot = FakeControlBot(order)
