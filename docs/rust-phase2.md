@@ -15,7 +15,7 @@ panetone daemon --socket PATH --journal PATH --effect-log PATH \
 panetone send --socket PATH --from SOURCE --to TARGET [--id UUID] MESSAGE
 panetone status --socket PATH --json
 panetone doctor --socket PATH --journal PATH --wakterm-fixture PATH
-panetone migrate --journal PATH
+panetone migrate --help
 ```
 
 `daemon` is deliberately limited to offline fake operation in Phase 2. The
@@ -34,6 +34,10 @@ write. Choosing a one-way fallback remains a caller decision.
 The hidden `conformance-backend` command implements the replaceable backend
 interface used by `tests/run_control_conformance.py`. It is not an operator
 interface.
+
+The Phase 2 `migrate` placeholder has been replaced by the copy-only Phase 4
+bundle command. See [the Phase 4 migration interface](rust-phase4.md) for its
+required source paths, refusal rules, output layout, and restore procedure.
 
 ## Durable behavior
 

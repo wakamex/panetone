@@ -1,6 +1,6 @@
 # ADR 0004: Durable storage, migrations, and shutdown
 
-Status: accepted for Phase 1
+Status: accepted and implemented through Phase 4
 
 ## Context
 
@@ -12,7 +12,20 @@ Rust Panetone owns one SQLite database with an explicit monotonic schema version
 
 Startup applies migrations before accepting control requests or inbound channel work. Each migration is transactional and idempotent when possible. The daemon refuses a database with a newer unsupported schema. Migration logs and manifests contain schema versions, row counts, and hashes but no message bodies or credentials.
 
-Legacy migration is offline and copy-first. It reads the JSON state, pending output, Signal database, and control journal without modifying them, writes the new database in one transaction, and validates counts, identities, cursors, payload hashes, and delivery states. Ambiguity is an error, not a guessed mapping.
+Legacy migration is offline and copy-first. It reads the JSON state, pending
+output, Signal database, and control journal without modifying them. One atomic
+private output bundle contains exact JSON copies, consistent SQLite backups,
+the new database written in one transaction, and a deterministic manifest.
+Rerunning against the same output verifies source, snapshot, and target hashes.
+A conflicting canonical route is an error. State that has only ephemeral legacy
+identity is retained as explicitly rollback-only or reconciliation-required
+data rather than guessed into a live route, agent, cursor, or callback.
+
+Imported Python control hashes retain a distinct provenance marker. The target
+accepts only the finite omitted or explicit default encodings that were
+semantically equivalent in the Python protocol. It never converts a provider
+file cursor into a Wakterm event cursor, and every nonterminal external control
+operation is migrated as indeterminate.
 
 One supervisor owns every long-running task. It records handles, propagates fatal failures into health, and coordinates cancellation. Shutdown follows this order:
 
