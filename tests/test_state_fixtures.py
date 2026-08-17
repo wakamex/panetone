@@ -146,6 +146,45 @@ class RouteResolutionFixtureTests(unittest.TestCase):
                         bridge._control_route(case["lookup"]), case["expected"]
                     )
 
+    def test_route_lifecycle_cases_preserve_durable_identity(self):
+        cases = {
+            case["name"]: case for case in self.fixture["lifecycle_cases"]
+        }
+        self.assertEqual(
+            set(cases),
+            {
+                "disappearing_agent_preserves_route_and_channel",
+                "incarnation_change_requires_reconciliation",
+                "same_incarnation_rebinds_ephemeral_pane",
+            },
+        )
+        for case in cases.values():
+            with self.subTest(case=case["name"]):
+                self.assertRegex(
+                    case["route_id"],
+                    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$",
+                )
+                self.assertEqual(case["channel_binding"]["kind"], "telegram")
+                self.assertIsInstance(case["channel_binding"]["topic_id"], int)
+
+        disappeared = cases["disappearing_agent_preserves_route_and_channel"]
+        self.assertIsNone(disappeared["after"])
+        self.assertEqual(disappeared["expected"], "route_unavailable")
+
+        changed = cases["incarnation_change_requires_reconciliation"]
+        self.assertEqual(changed["before"]["agent_id"], changed["after"]["agent_id"])
+        self.assertNotEqual(
+            changed["before"]["incarnation"], changed["after"]["incarnation"]
+        )
+        self.assertEqual(changed["expected"], "reconciliation_required")
+
+        rebound = cases["same_incarnation_rebinds_ephemeral_pane"]
+        self.assertEqual(
+            rebound["before"]["incarnation"], rebound["after"]["incarnation"]
+        )
+        self.assertNotEqual(rebound["before"]["pane_id"], rebound["after"]["pane_id"])
+        self.assertEqual(rebound["expected"], "rebound")
+
 
 if __name__ == "__main__":
     unittest.main()

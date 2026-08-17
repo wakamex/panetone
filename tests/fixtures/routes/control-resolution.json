@@ -48,5 +48,31 @@
       ],
       "error": "route_unavailable"
     }
+  ],
+  "lifecycle_cases": [
+    {
+      "name": "disappearing_agent_preserves_route_and_channel",
+      "route_id": "00000000-0000-4000-8000-000000000101",
+      "channel_binding": {"kind": "telegram", "topic_id": 101},
+      "before": {"agent_id": "agent-alpha", "incarnation": "process-1"},
+      "after": null,
+      "expected": "route_unavailable"
+    },
+    {
+      "name": "incarnation_change_requires_reconciliation",
+      "route_id": "00000000-0000-4000-8000-000000000102",
+      "channel_binding": {"kind": "telegram", "topic_id": 102},
+      "before": {"agent_id": "agent-beta", "incarnation": "process-1"},
+      "after": {"agent_id": "agent-beta", "incarnation": "process-2"},
+      "expected": "reconciliation_required"
+    },
+    {
+      "name": "same_incarnation_rebinds_ephemeral_pane",
+      "route_id": "00000000-0000-4000-8000-000000000103",
+      "channel_binding": {"kind": "telegram", "topic_id": 103},
+      "before": {"agent_id": "agent-gamma", "incarnation": "process-1", "pane_id": 11},
+      "after": {"agent_id": "agent-gamma", "incarnation": "process-1", "pane_id": 44},
+      "expected": "rebound"
+    }
   ]
 }
