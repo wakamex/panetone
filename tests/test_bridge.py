@@ -639,6 +639,7 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
             "prompt_written": True,
             "agent_id": "source-agent",
             "incarnation_id": "source-incarnation",
+            "return_final": False,
         }
 
         with patch.object(
@@ -675,6 +676,7 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
             "prompt_written": False,
             "agent_id": "source-agent",
             "incarnation_id": "source-incarnation",
+            "return_final": False,
         }
 
         with (
@@ -762,9 +764,10 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
         async def transition(_state, _progress=None):
             return None
 
-        async def agent_send(pid, text, **kwargs):
+        async def agent_admit(route, text, **kwargs):
             order.append(("wakterm", text))
-            self.assertEqual(pid, 22)
+            self.assertEqual(route["agent_id"], "target-agent")
+            self.assertEqual(route["incarnation_id"], "target-incarnation")
             self.assertEqual(
                 text,
                 "[Panetone cross-agent message]\n"
@@ -779,8 +782,9 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
                 kwargs["request_id"], "00000000-0000-4000-8000-000000000004"
             )
             return {
-                "request_id": kwargs["request_id"],
-                "reply_pending": True,
+                "status": "accepted",
+                "definitive": True,
+                "prompt_written": True,
             }
 
         request = {
@@ -800,7 +804,7 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
                 "_wakterm_agent_catalog_sync",
                 return_value=self._agent_catalog(),
             ),
-            patch.object(bridge, "agent_send", AsyncMock(side_effect=agent_send)),
+            patch.object(bridge, "agent_admit", AsyncMock(side_effect=agent_admit)),
         ):
             result = await bridge._handle_control_send(request, transition, journal)
 
@@ -808,6 +812,55 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(kinds.index("registered"), kinds.index("wakterm"))
         self.assertEqual(result["reply_mode"], "return_final")
         self.assertTrue(result["reply_pending"])
+
+    async def test_busy_target_is_definitive_and_discards_unused_return_route(self):
+        order = []
+        bot = FakeControlBot(order)
+        self._configure_control(bot)
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.ControlJournal(Path(tmp) / "journal.sqlite3")
+            journal.initialize()
+            request_id = "00000000-0000-4000-8000-000000000013"
+            request = {
+                "id": request_id,
+                "params": {
+                    "from": "Source",
+                    "to": "Target",
+                    "message": "do work",
+                    "return_final": True,
+                },
+            }
+            admit = AsyncMock(
+                return_value={
+                    "status": "busy",
+                    "definitive": True,
+                    "prompt_written": False,
+                    "detail": "target is busy",
+                }
+            )
+
+            with (
+                patch.object(bridge, "_refresh_telegram_routes", AsyncMock()),
+                patch.object(
+                    bridge,
+                    "_wakterm_agent_catalog_sync",
+                    return_value=self._agent_catalog(),
+                ),
+                patch.object(bridge, "agent_admit", admit),
+                self.assertRaises(bridge.RequestFailure) as raised,
+            ):
+                await bridge._handle_control_send(request, AsyncMock(), journal)
+
+            self.assertEqual(raised.exception.code, "wakterm_delivery_rejected")
+            self.assertFalse(raised.exception.indeterminate)
+            self.assertIsNone(journal.get_return(request_id))
+            self.assertEqual(len(bot.sent), 2)
+            self.assertIn("no prompt was written", bot.sent[1][1])
+            admitted_route = admit.await_args.args[0]
+            self.assertEqual(admitted_route["agent_id"], "target-agent")
+            self.assertEqual(
+                admitted_route["incarnation_id"], "target-incarnation"
+            )
 
     async def test_terminal_return_event_delivers_each_destination_once(self):
         order = []

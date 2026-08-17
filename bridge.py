@@ -375,8 +375,10 @@ def _return_callback_request_id(request_id):
     return str(uuid.uuid5(RETURN_CALLBACK_NAMESPACE, request_id))
 
 
-def _agent_admit_sync(route, text, *, request_id):
-    command = (
+def _agent_admit_sync(
+    route, text, *, request_id, return_final=False, timeout_ms=0
+):
+    command = [
         "admit",
         route["agent_id"],
         "--exact-agent-id",
@@ -384,7 +386,11 @@ def _agent_admit_sync(route, text, *, request_id):
         route["incarnation_id"],
         "--request-id",
         request_id,
-    )
+    ]
+    if return_final:
+        command.append("--return-final")
+        if timeout_ms:
+            command.extend(["--final-timeout-ms", str(timeout_ms)])
     receipt = _wakterm_json_sync(*command, input_text=text, timeout=10)
     if receipt.get("schema") != WAKTERM_AGENT_API_SCHEMA:
         raise RuntimeError("Wakterm admission receipt has an incompatible schema")
@@ -394,6 +400,8 @@ def _agent_admit_sync(route, text, *, request_id):
         "incarnation_id"
     ) != route["incarnation_id"]:
         raise RuntimeError("Wakterm admission receipt has the wrong agent identity")
+    if receipt.get("return_final") is not return_final:
+        raise RuntimeError("Wakterm admission receipt has the wrong return mode")
     status = receipt.get("status")
     definitive = receipt.get("definitive")
     prompt_written = receipt.get("prompt_written")
@@ -425,9 +433,16 @@ async def agent_send(pid, text, **kwargs):
     return await asyncio.to_thread(_agent_send_sync, pid, text, **kwargs)
 
 
-async def agent_admit(route, text, *, request_id):
+async def agent_admit(
+    route, text, *, request_id, return_final=False, timeout_ms=0
+):
     return await asyncio.to_thread(
-        _agent_admit_sync, route, text, request_id=request_id
+        _agent_admit_sync,
+        route,
+        text,
+        request_id=request_id,
+        return_final=return_final,
+        timeout_ms=timeout_ms,
     )
 
 
@@ -3313,11 +3328,11 @@ async def _handle_control_send(request, transition, journal=None):
 
     try:
         if return_final:
-            wakterm_receipt = await agent_send(
-                target["pane_id"],
+            wakterm_receipt = await agent_admit(
+                target,
                 delivered_prompt,
-                return_final=True,
                 request_id=request_id,
+                return_final=True,
                 timeout_ms=params.get("timeout_ms", 0),
             )
         else:
@@ -3358,6 +3373,53 @@ async def _handle_control_send(request, transition, journal=None):
             },
             indeterminate=True,
         ) from error
+
+    if return_final and wakterm_receipt["status"] != "accepted":
+        status = wakterm_receipt["status"]
+        detail = wakterm_receipt.get("detail") or f"Wakterm admission returned {status}"
+        annotation = await _control_failure_annotation(
+            bot,
+            target["topic_id"],
+            audit_ids[0],
+            first_text,
+            request_id,
+            (
+                f"Wakterm target admission returned {status}; no prompt was written."
+                if wakterm_receipt["definitive"]
+                else "Wakterm target admission became indeterminate."
+            ),
+            target["pane_id"],
+        )
+        if wakterm_receipt["definitive"]:
+            await asyncio.to_thread(journal.discard_unsubmitted_return, request_id)
+            raise RequestFailure(
+                "wakterm_delivery_rejected",
+                f"Wakterm definitively rejected target delivery: {detail}",
+                details={
+                    "status": status,
+                    "prompt_written": False,
+                    "failure_annotation": annotation,
+                },
+            )
+        terminal = {
+            "request_id": request_id,
+            "state": "indeterminate",
+            "final_message": None,
+            "detail": detail,
+            "terminal_event_sequence": None,
+        }
+        await asyncio.to_thread(journal.record_return_result, request_id, terminal)
+        await _deliver_return(request_id, journal)
+        raise RequestFailure(
+            "wakterm_delivery_indeterminate",
+            "Wakterm target delivery became indeterminate",
+            details={
+                "status": status,
+                "prompt_written": None,
+                "failure_annotation": annotation,
+            },
+            indeterminate=True,
+        )
 
     status_annotation = await _control_success_annotation(
         bot,

@@ -111,15 +111,19 @@ routing attribution, not cryptographic authentication of the calling pane.
       }
     },
     "wakterm": {
-      "agent_id": "detected-pane-8",
-      "agent_name": "wakterm",
-      "pane_id": 8,
-      "submitted": true,
-      "acknowledgement": {
-        "kind": "session_observer",
-        "acknowledged": true,
-        "latency_ms": 41
-      }
+      "schema": "wakterm.agent-api.v1",
+      "request_id": "fe57dc90-994e-4e73-b09c-fac483d9f05b",
+      "status": "accepted",
+      "definitive": true,
+      "prompt_written": true,
+      "agent_id": "agent-wakterm",
+      "incarnation_id": "incarnation-wakterm-5",
+      "return_final": true,
+      "request": {
+        "request_id": "fe57dc90-994e-4e73-b09c-fac483d9f05b",
+        "state": "submitted"
+      },
+      "detail": null
     },
     "reply_mode": "return_final",
     "reply_pending": true
@@ -161,7 +165,8 @@ Panetone performs these steps:
 5. Switch the target's response route to Telegram.
 6. Persist `delivering` before invoking Wakterm.
 7. Add the Panetone source, target, request, and reply-mode envelope. For return
-   mode, persist the source return route and run `wakterm cli agent send
+   mode, persist the source return route and submit through `wakterm cli agent
+   admit TARGET_AGENT_ID --exact-agent-id --incarnation TARGET_INCARNATION
    --return-final --request-id UUID` outside the asyncio event loop.
 8. Edit the audit to `[submitted]`, or add a linked submitted marker if editing
    fails.
@@ -192,6 +197,13 @@ message. The request becomes `indeterminate` because a PTY write and a database
 commit cannot be one transaction. Panetone never retries it automatically.
 An unclean restart can leave an audit marked `[pending]`, but it cannot leave an
 unconfirmed arrow presented as a successful submission.
+
+A structured definitive target rejection such as `busy`, `unavailable`, or
+`stale_incarnation` guarantees `prompt_written: false`. Panetone marks the
+audit as failed, removes the unused return route, and returns
+`wakterm_delivery_rejected` without claiming an indeterminate write. Durable
+busy-target queuing remains an intended Rust-core semantic and is not partially
+implemented in the temporary Python bridge.
 
 Errors use this shape:
 

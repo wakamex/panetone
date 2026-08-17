@@ -386,6 +386,21 @@ class ControlJournal:
                 "SELECT * FROM return_delivery WHERE request_id = ?", (request_id,)
             ).fetchone()
 
+    def discard_unsubmitted_return(self, request_id):
+        with self._connect() as db:
+            changed = db.execute(
+                """
+                DELETE FROM return_delivery
+                WHERE request_id = ? AND state = 'pending' AND result_json IS NULL
+                  AND agent_state = 'pending' AND telegram_state = 'pending'
+                """,
+                (request_id,),
+            ).rowcount
+        if changed != 1:
+            raise RuntimeError(
+                f"cannot discard submitted or partially delivered return {request_id}"
+            )
+
     def record_return_result(self, request_id, result):
         encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
         with self._connect() as db:
