@@ -14,8 +14,10 @@ dev/phase5b-wakterm-preflight
 ```
 
 The script requires exact Wakterm commit
-`01eb38255ff8a18202e2b16163a3d0e1a399d6ad`. It builds the debug Wakterm CLI
-and mux from a disposable detached worktree, so a newer or locally dirty main
+`0f99a3e839d3b18ca0f4cc19c388fe93285af247`. It includes the provider event
+hardening and the notification-backlog disconnect fix. The script builds the
+debug Wakterm CLI and mux from a disposable detached worktree, so a newer or
+locally dirty main
 checkout cannot change the candidate. It starts a fresh mux with private runtime
 and state roots, verifies the v1 capability, catalog, and event-page contracts,
 and runs Panetone's real CLI adapter test. It saves mode-`0600` JSON evidence

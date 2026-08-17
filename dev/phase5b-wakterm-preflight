@@ -4,7 +4,7 @@ set -euo pipefail
 
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 wakterm_repo=${PANETONE_WAKTERM_REPOSITORY:-/code/wakterm}
-required_commit=01eb38255ff8a18202e2b16163a3d0e1a399d6ad
+required_commit=0f99a3e839d3b18ca0f4cc19c388fe93285af247
 evidence=${1:-}
 
 usage() {
