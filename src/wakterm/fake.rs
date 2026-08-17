@@ -7,7 +7,7 @@ use crate::domain::{
     AdmissionReceipt, AdmissionStatus, AgentBinding, EffectId, SendCommand, WorkflowId,
 };
 
-use super::{AgentCatalog, WaktermContract};
+use super::{AgentCatalog, ContractError, EventRead, WaktermContract};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdmissionCall {
@@ -53,6 +53,10 @@ impl FakeWakterm {
 
     pub fn general_event_consumer_enabled(&self) -> bool {
         self.contract.general_event_consumer_enabled()
+    }
+
+    pub fn read_events(&self, after_sequence: u64) -> Result<EventRead, ContractError> {
+        self.contract.read_events(after_sequence)
     }
 
     pub fn script_receipts(&self, receipts: impl IntoIterator<Item = AdmissionStatus>) {

@@ -107,6 +107,7 @@ pub struct Workflow {
     pub source_route_id: RouteId,
     pub target_route_id: RouteId,
     pub target_effect_id: EffectId,
+    pub observed_source: AgentBinding,
     pub observed_target: AgentBinding,
     pub submitted_target: Option<AgentBinding>,
     pub state: WorkflowState,
@@ -130,6 +131,7 @@ impl Workflow {
         let allowed = matches!(
             (self.state, to),
             (WorkflowState::Claimed, WorkflowState::AuditPosted)
+                | (WorkflowState::Claimed, WorkflowState::Failed)
                 | (WorkflowState::AuditPosted, WorkflowState::AdmissionPrepared)
                 | (
                     WorkflowState::AwaitingTargetIdle,
@@ -268,6 +270,7 @@ mod tests {
             source_route_id: RouteId::new(Uuid::nil()),
             target_route_id: RouteId::new(Uuid::max()),
             target_effect_id: EffectId::target_admission(id),
+            observed_source: binding(),
             observed_target: binding(),
             submitted_target: None,
             state: WorkflowState::AdmissionPrepared,

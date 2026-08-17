@@ -44,16 +44,21 @@ id_type!(WorkflowId);
 id_type!(EffectId);
 
 impl EffectId {
+    pub fn named(workflow_id: WorkflowId, purpose: &str) -> Self {
+        let namespace = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            b"https://panetone.dev/control/v1/effect",
+        );
+        let name = format!("{}:{purpose}", workflow_id.0);
+        Self(Uuid::new_v5(&namespace, name.as_bytes()))
+    }
+
     pub fn target_admission(workflow_id: WorkflowId) -> Self {
         Self(workflow_id.0)
     }
 
     pub fn callback_admission(workflow_id: WorkflowId) -> Self {
-        let namespace = Uuid::new_v5(
-            &Uuid::NAMESPACE_URL,
-            b"https://panetone.dev/control/v1/return-agent-callback",
-        );
-        Self(Uuid::new_v5(&namespace, workflow_id.0.as_bytes()))
+        Self::named(workflow_id, "return-agent-callback")
     }
 }
 
@@ -76,6 +81,10 @@ mod tests {
         assert_ne!(
             EffectId::target_admission(workflow),
             EffectId::callback_admission(workflow)
+        );
+        assert_ne!(
+            EffectId::named(workflow, "audit"),
+            EffectId::named(workflow, "return-mirror")
         );
     }
 }

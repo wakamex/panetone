@@ -61,6 +61,21 @@ fn incompatible_versions_and_unknown_future_events_fail_closed() {
 }
 
 #[test]
+fn observer_not_ready_is_a_definitive_no_write_failure() {
+    let fixture: Value = serde_json::from_str(&golden()).unwrap();
+    let receipt = &fixture["admission_receipts"]["observer_failure"];
+    assert_eq!(receipt["status"], "observer_failure");
+    assert_eq!(receipt["definitive"], true);
+    assert_eq!(receipt["prompt_written"], false);
+    assert!(
+        receipt["detail"]
+            .as_str()
+            .unwrap()
+            .contains("observer cursor")
+    );
+}
+
+#[test]
 fn pane_is_only_a_fresh_catalog_join_and_names_are_not_identity() {
     let contract = WaktermContract::from_golden_json(&golden(), ProfileKind::Current).unwrap();
     let before = contract.catalog.clone();

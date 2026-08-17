@@ -47,6 +47,7 @@ async fn claim_new(store: &StoreHandle, request_id: WorkflowId) -> panetone::sto
             command(request_id, "hello"),
             route_id(1),
             route_id(2),
+            binding("source"),
             binding("target"),
             100,
         )
@@ -103,6 +104,7 @@ async fn idempotency_survives_compaction_as_a_permanent_tombstone() {
                 command(request_id, "hello"),
                 route_id(1),
                 route_id(2),
+                binding("source"),
                 binding("target"),
                 101
             )
@@ -116,6 +118,7 @@ async fn idempotency_survives_compaction_as_a_permanent_tombstone() {
                 command(request_id, "different"),
                 route_id(1),
                 route_id(2),
+                binding("source"),
                 binding("target"),
                 101
             )
@@ -142,6 +145,7 @@ async fn idempotency_survives_compaction_as_a_permanent_tombstone() {
                 command(request_id, "hello"),
                 route_id(1),
                 route_id(2),
+                binding("source"),
                 binding("target"),
                 2_000
             )
@@ -158,6 +162,7 @@ async fn idempotency_survives_compaction_as_a_permanent_tombstone() {
                 command(request_id, "different"),
                 route_id(1),
                 route_id(2),
+                binding("source"),
                 binding("target"),
                 2_000
             )

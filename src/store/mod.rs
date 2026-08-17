@@ -87,12 +87,15 @@ pub struct InboxItem {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct StoreStatus {
+    pub schema_version: u64,
     pub workflows: u64,
     pub awaiting_target_idle: u64,
     pub indeterminate_workflows: u64,
     pub pending_returns: u64,
     pub unresolved_returns: u64,
     pub pending_outbox: u64,
+    pub failed_outbox: u64,
+    pub indeterminate_outbox: u64,
     pub pending_inbox: u64,
     pub tombstones: u64,
 }
@@ -108,6 +111,7 @@ enum Command {
         command: SendCommand,
         source_route_id: RouteId,
         target_route_id: RouteId,
+        source: AgentBinding,
         target: AgentBinding,
         now_ms: i64,
         reply: oneshot::Sender<StoreResult<ClaimResult>>,
@@ -136,6 +140,10 @@ enum Command {
     RegisterReturn {
         record: ReturnDelivery,
         reply: oneshot::Sender<StoreResult<()>>,
+    },
+    GetReturn {
+        workflow_id: WorkflowId,
+        reply: oneshot::Sender<StoreResult<Option<ReturnDelivery>>>,
     },
     SaveReturn {
         record: ReturnDelivery,
@@ -233,6 +241,7 @@ impl StoreHandle {
         command: SendCommand,
         source_route_id: RouteId,
         target_route_id: RouteId,
+        source: AgentBinding,
         target: AgentBinding,
         now_ms: i64,
     ) -> StoreResult<ClaimResult> {
@@ -240,6 +249,7 @@ impl StoreHandle {
             command,
             source_route_id,
             target_route_id,
+            source,
             target,
             now_ms,
             reply,
@@ -285,6 +295,11 @@ impl StoreHandle {
 
     pub async fn register_return(&self, record: ReturnDelivery) -> StoreResult<()> {
         self.request(|reply| Command::RegisterReturn { record, reply })
+            .await
+    }
+
+    pub async fn get_return(&self, workflow_id: WorkflowId) -> StoreResult<Option<ReturnDelivery>> {
+        self.request(|reply| Command::GetReturn { workflow_id, reply })
             .await
     }
 
@@ -379,6 +394,7 @@ fn handle_command(connection: &mut Connection, command: Command) {
             command,
             source_route_id,
             target_route_id,
+            source,
             target,
             now_ms,
             reply,
@@ -389,6 +405,7 @@ fn handle_command(connection: &mut Connection, command: Command) {
                 command,
                 source_route_id,
                 target_route_id,
+                source,
                 target,
                 now_ms,
             ),
@@ -411,6 +428,9 @@ fn handle_command(connection: &mut Connection, command: Command) {
         Command::GetRoute { id, reply } => send_reply(reply, get_route(connection, id)),
         Command::RegisterReturn { record, reply } => {
             send_reply(reply, register_return(connection, &record))
+        }
+        Command::GetReturn { workflow_id, reply } => {
+            send_reply(reply, get_return(connection, workflow_id))
         }
         Command::SaveReturn { record, reply } => {
             send_reply(reply, save_return(connection, &record))
@@ -579,6 +599,7 @@ fn claim(
     command: SendCommand,
     source_route_id: RouteId,
     target_route_id: RouteId,
+    source: AgentBinding,
     target: AgentBinding,
     now_ms: i64,
 ) -> StoreResult<ClaimResult> {
@@ -613,6 +634,7 @@ fn claim(
         source_route_id,
         target_route_id,
         target_effect_id: EffectId::target_admission(command.id),
+        observed_source: source,
         observed_target: target,
         submitted_target: None,
         state: WorkflowState::Claimed,
@@ -767,6 +789,21 @@ fn register_return(connection: &Connection, record: &ReturnDelivery) -> StoreRes
     Ok(())
 }
 
+fn get_return(
+    connection: &Connection,
+    workflow_id: WorkflowId,
+) -> StoreResult<Option<ReturnDelivery>> {
+    let json = connection
+        .query_row(
+            "SELECT record_json FROM return_deliveries WHERE request_id = ?1",
+            params![workflow_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    json.map(|value| serde_json::from_str(&value).map_err(StoreError::from))
+        .transpose()
+}
+
 fn save_return(connection: &Connection, record: &ReturnDelivery) -> StoreResult<()> {
     let changed = connection.execute(
         "UPDATE return_deliveries SET agent_state = ?2, mirror_state = ?3,
@@ -829,7 +866,12 @@ fn enqueue_outbox(
             params![item.id.to_string()],
             |row| row.get::<_, String>(0),
         )?;
-        if existing != serde_json::to_string(item)? {
+        let existing: OutboxItem = serde_json::from_str(&existing)?;
+        if existing.id != item.id
+            || existing.kind != item.kind
+            || existing.destination != item.destination
+            || existing.body != item.body
+        {
             return Err(StoreError::Conflict(format!(
                 "outbox effect {} already differs",
                 item.id
@@ -938,6 +980,7 @@ fn compact(connection: &mut Connection, before_ms: i64) -> StoreResult<u64> {
 
 fn status(connection: &Connection) -> StoreResult<StoreStatus> {
     Ok(StoreStatus {
+        schema_version: SCHEMA_VERSION as u64,
         workflows: count(connection, "SELECT COUNT(*) FROM workflows")?,
         awaiting_target_idle: count(
             connection,
@@ -961,6 +1004,14 @@ fn status(connection: &Connection) -> StoreResult<StoreStatus> {
         pending_outbox: count(
             connection,
             "SELECT COUNT(*) FROM outbox WHERE state = 'pending'",
+        )?,
+        failed_outbox: count(
+            connection,
+            "SELECT COUNT(*) FROM outbox WHERE state = 'failed'",
+        )?,
+        indeterminate_outbox: count(
+            connection,
+            "SELECT COUNT(*) FROM outbox WHERE state = 'indeterminate'",
         )?,
         pending_inbox: count(
             connection,

@@ -3,6 +3,7 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use serde_json::{Value, json};
 
@@ -12,11 +13,17 @@ use crate::control::{
 };
 use crate::domain::{AgentBinding, WorkflowState};
 use crate::store::{ClaimResult, StoreHandle, StoredWorkflow};
+use crate::supervisor::SupervisorHandle;
 
 pub struct ConformanceService {
     store: StoreHandle,
     effect_log: PathBuf,
     effect_lock: Mutex<()>,
+    health: Option<SupervisorHandle>,
+    wakterm_profile: String,
+    wakterm_capabilities: Vec<String>,
+    control_socket: Option<PathBuf>,
+    started_at: Instant,
 }
 
 impl ConformanceService {
@@ -25,7 +32,26 @@ impl ConformanceService {
             store,
             effect_log,
             effect_lock: Mutex::new(()),
+            health: None,
+            wakterm_profile: "current".into(),
+            wakterm_capabilities: Vec::new(),
+            control_socket: None,
+            started_at: Instant::now(),
         }
+    }
+
+    pub fn with_runtime_status(
+        mut self,
+        health: SupervisorHandle,
+        wakterm_profile: impl Into<String>,
+        capabilities: Vec<String>,
+        control_socket: PathBuf,
+    ) -> Self {
+        self.health = Some(health);
+        self.wakterm_profile = wakterm_profile.into();
+        self.wakterm_capabilities = capabilities;
+        self.control_socket = Some(control_socket);
+        self
     }
 
     async fn send(&self, request: ControlRequest, params: SendParams) -> ControlResponse {
@@ -37,6 +63,12 @@ impl ConformanceService {
                 command,
                 crate::domain::RouteId::new(uuid::Uuid::from_u128(1)),
                 crate::domain::RouteId::new(uuid::Uuid::from_u128(2)),
+                AgentBinding {
+                    agent_id: "agent-source".into(),
+                    incarnation_id: "incarnation-source-1".into(),
+                    harness: "codex".into(),
+                    pane_id: Some(1),
+                },
                 AgentBinding {
                     agent_id: "agent-target".into(),
                     incarnation_id: "incarnation-target-1".into(),
@@ -170,7 +202,25 @@ impl ControlHandler for ConformanceService {
                         json!({
                             "version": env!("CARGO_PKG_VERSION"),
                             "mode": "offline_fake",
-                            "store": status
+                            "uptime_ms": self.started_at.elapsed().as_millis() as u64,
+                            "store": status,
+                            "wakterm": {
+                                "profile": self.wakterm_profile,
+                                "capabilities": self.wakterm_capabilities,
+                                "general_event_consumer": self.wakterm_capabilities.iter().any(|value| value == "event_stream.v1"),
+                                "connection": "fake_ready"
+                            },
+                            "control": {
+                                "path": self.control_socket,
+                                "same_uid_required": cfg!(target_os = "linux")
+                            },
+                            "channels": {
+                                "telegram": "fake_ready",
+                                "signal": "fake_ready",
+                                "slack": "fake_ready",
+                                "debate": "fake_ready"
+                            },
+                            "tasks": self.health.as_ref().map(SupervisorHandle::snapshot).unwrap_or_default()
                         }),
                     ),
                     Err(error) => error_response(
