@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use panetone::control::{CONTROL_SCHEMA, ControlRequest, ControlServer, SendParams, request};
+use panetone::migration::{MigrationOptions, migrate};
 use panetone::service::ConformanceService;
 use panetone::store::StoreHandle;
 use panetone::supervisor::{Supervisor, TaskPolicy};
@@ -30,7 +31,7 @@ enum Command {
     /// Check local paths and the offline store without sending messages.
     Doctor(DoctorArgs),
     /// Create or upgrade the offline database schema explicitly.
-    Migrate(StoreArgs),
+    Migrate(MigrationArgs),
     #[command(hide = true)]
     ConformanceBackend(DaemonArgs),
 }
@@ -110,9 +111,19 @@ struct DoctorArgs {
 }
 
 #[derive(Args)]
-struct StoreArgs {
-    #[arg(long, alias = "database")]
-    journal: PathBuf,
+struct MigrationArgs {
+    #[arg(long)]
+    state: PathBuf,
+    #[arg(long)]
+    pending: PathBuf,
+    #[arg(long)]
+    control_journal: PathBuf,
+    #[arg(long)]
+    signal_database: Option<PathBuf>,
+    #[arg(long)]
+    legacy_control_socket: PathBuf,
+    #[arg(long)]
+    output: PathBuf,
 }
 
 #[tokio::main]
@@ -332,10 +343,30 @@ async fn run_doctor(args: DoctorArgs) -> Result<()> {
     }
 }
 
-async fn run_migrate(args: StoreArgs) -> Result<()> {
-    let store = StoreHandle::open(&args.journal)?;
-    store.shutdown().await?;
-    println!("{}", json!({"ok": true, "schema_version": 1}));
+async fn run_migrate(args: MigrationArgs) -> Result<()> {
+    let output = args.output.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        migrate(&MigrationOptions {
+            state: args.state,
+            pending: args.pending,
+            control_journal: args.control_journal,
+            signal_database: args.signal_database,
+            legacy_control_socket: args.legacy_control_socket,
+            output: args.output,
+        })
+    })
+    .await
+    .context("migration worker stopped")??;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "reused": outcome.reused,
+            "bundle": output,
+            "database": output.join("panetone.sqlite3"),
+            "manifest": outcome.manifest,
+        }))?
+    );
     Ok(())
 }
 
