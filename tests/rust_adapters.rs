@@ -150,6 +150,7 @@ fn fake_wakterm_uses_exact_identity_stable_ids_and_labeled_envelopes() {
 fn item(index: u128, kind: ChannelKind) -> OutboxItem {
     OutboxItem {
         id: EffectId::new(Uuid::from_u128(index)),
+        route_id: None,
         kind,
         destination: format!("destination-{index}"),
         body: format!("message-{index}"),

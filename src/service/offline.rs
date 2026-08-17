@@ -309,6 +309,7 @@ impl OfflineService {
         let (audit_kind, audit_destination) = channel_destination(target)?;
         let mut audit = OutboxItem {
             id: EffectId::named(record.command.id, "target-audit"),
+            route_id: Some(record.workflow.target_route_id),
             kind: audit_kind,
             destination: audit_destination,
             body: format!(
@@ -505,6 +506,7 @@ impl OfflineService {
     ) -> Result<(), ServiceError> {
         let mut item = OutboxItem {
             id: EffectId::named(record.command.id, &format!("target-{purpose}")),
+            route_id: Some(record.workflow.target_route_id),
             kind,
             destination,
             body: format!(
@@ -612,6 +614,7 @@ impl OfflineService {
         ) {
             let mut mirror = OutboxItem {
                 id: mirror_effect,
+                route_id: Some(workflow.workflow.source_route_id),
                 kind,
                 destination,
                 body: callback_envelope(&workflow, &terminal),

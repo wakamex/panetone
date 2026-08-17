@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use super::EffectId;
+use super::{EffectId, RouteId};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,6 +101,8 @@ pub enum OutboxState {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OutboxItem {
     pub id: EffectId,
+    #[serde(default)]
+    pub route_id: Option<RouteId>,
     pub kind: ChannelKind,
     pub destination: String,
     pub body: String,

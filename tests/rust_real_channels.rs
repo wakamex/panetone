@@ -70,6 +70,7 @@ async fn http_server(
 fn item(kind: ChannelKind, destination: &str) -> OutboxItem {
     OutboxItem {
         id: EffectId::new(Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap()),
+        route_id: None,
         kind,
         destination: destination.into(),
         body: "message café ✓".into(),

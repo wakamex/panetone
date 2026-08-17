@@ -333,6 +333,7 @@ async fn routes_outbox_inbox_and_metadata_are_durable_and_deduplicated() {
     let effect = EffectId::new(Uuid::from_u128(41));
     let mut outbox = OutboxItem {
         id: effect,
+        route_id: Some(route.id),
         kind: ChannelKind::Telegram,
         destination: "12".into(),
         body: "audit".into(),
