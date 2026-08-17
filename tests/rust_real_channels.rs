@@ -71,6 +71,7 @@ fn item(kind: ChannelKind, destination: &str) -> OutboxItem {
     OutboxItem {
         id: EffectId::new(Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap()),
         route_id: None,
+        sender_harness: None,
         kind,
         destination: destination.into(),
         body: "message café ✓".into(),
@@ -100,6 +101,27 @@ async fn telegram_sends_the_expected_stable_request() {
     assert_eq!(request.body["message_thread_id"], 77);
     assert_eq!(request.body["text"], "message café ✓");
     assert!(request.headers.contains("x-panetone-delivery-id: 11111111"));
+}
+
+#[tokio::test]
+async fn telegram_uses_the_originating_harness_bot_when_configured() {
+    let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 39\r\n\r\n{\"ok\":true,\"result\":{\"message_id\":402}}";
+    let (base, request) = http_server(response, Duration::ZERO).await;
+    let telegram =
+        TelegramClient::new(&base, "codex-token", -1001, Duration::from_secs(2)).unwrap();
+    let mut channels = RealChannels::default();
+    channels
+        .telegram_by_harness
+        .insert("codex".into(), telegram);
+    let mut message = item(ChannelKind::Telegram, "77");
+    message.sender_harness = Some("CoDeX".into());
+
+    let receipt = channels.send(&message).await.unwrap();
+    assert_eq!(receipt.external_id, "402");
+    assert_eq!(
+        request.await.unwrap().request_line,
+        "POST /botcodex-token/sendMessage HTTP/1.1"
+    );
 }
 
 #[tokio::test]

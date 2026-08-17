@@ -175,6 +175,7 @@ fn retry_selection_is_fair_per_destination() {
         .map(|(index, item)| OutboxItem {
             id: EffectId::new(Uuid::from_u128(index as u128 + 1)),
             route_id: None,
+            sender_harness: item[4].as_str().map(str::to_owned),
             kind: match item[0].as_str().unwrap() {
                 "tg" => ChannelKind::Telegram,
                 "sig" => ChannelKind::Signal,

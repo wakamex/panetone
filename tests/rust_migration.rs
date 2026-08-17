@@ -258,7 +258,7 @@ async fn migration_is_copy_only_idempotent_and_preserves_conservative_state() {
     let original_pending = fs::read(&sources.options.pending).unwrap();
     let first = migrate(&sources.options).unwrap();
     assert!(!first.reused);
-    assert_eq!(first.manifest.target_schema_version, 3);
+    assert_eq!(first.manifest.target_schema_version, 4);
     assert_eq!(first.manifest.counts["routes"], 3);
     assert_eq!(first.manifest.counts["pending_outbox"], 3);
     assert_eq!(first.manifest.counts["legacy_debate_outbox_held"], 1);

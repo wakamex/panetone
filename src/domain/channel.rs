@@ -91,6 +91,8 @@ pub struct OutboxItem {
     pub id: EffectId,
     #[serde(default)]
     pub route_id: Option<RouteId>,
+    #[serde(default)]
+    pub sender_harness: Option<String>,
     pub kind: ChannelKind,
     pub destination: String,
     pub body: String,

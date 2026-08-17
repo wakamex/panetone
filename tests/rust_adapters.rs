@@ -151,6 +151,7 @@ fn item(index: u128, kind: ChannelKind) -> OutboxItem {
     OutboxItem {
         id: EffectId::new(Uuid::from_u128(index)),
         route_id: None,
+        sender_harness: None,
         kind,
         destination: format!("destination-{index}"),
         body: format!("message-{index}"),

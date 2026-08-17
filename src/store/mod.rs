@@ -8,15 +8,52 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
+use uuid::Uuid;
 
 use crate::domain::{
     AgentBinding, CallbackDelivery, ChannelKind, DeliveryState, EffectId, OutboxItem, OutboxState,
-    Route, RouteId, SEMANTIC_HASH_KIND, SendCommand, Workflow, WorkflowId, WorkflowState,
-    semantic_request_hash, stored_request_hash_matches,
+    ReconcileDecision, Route, RouteId, SEMANTIC_HASH_KIND, SendCommand, Workflow, WorkflowId,
+    WorkflowState, semantic_request_hash, stored_request_hash_matches,
+};
+use crate::promotion::{
+    LegacyDecision, LegacyRecordKind, OperatorAction, OperatorMutation, OperatorOutcome,
+    PromotionStatus,
 };
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 const COMMAND_CAPACITY: usize = 128;
+const PHASE5_SCHEMA_SQL: &str = "
+    CREATE TABLE promotion_state (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        delivery_hold INTEGER NOT NULL CHECK(delivery_hold IN (0, 1)),
+        event_cursor INTEGER,
+        updated_at_ms INTEGER NOT NULL
+    );
+    INSERT INTO promotion_state(singleton, delivery_hold, event_cursor, updated_at_ms)
+    VALUES (1, 1, NULL, 0);
+    CREATE TABLE route_delivery_policy (
+        route_id TEXT PRIMARY KEY REFERENCES routes(route_id),
+        enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+        updated_at_ms INTEGER NOT NULL
+    );
+    CREATE TABLE legacy_dispositions (
+        record_kind TEXT NOT NULL,
+        record_id TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        evidence TEXT NOT NULL,
+        operation_id TEXT NOT NULL UNIQUE,
+        record_json TEXT NOT NULL,
+        resolved_at_ms INTEGER NOT NULL,
+        PRIMARY KEY(record_kind, record_id)
+    );
+    CREATE TABLE operator_actions (
+        operation_id TEXT PRIMARY KEY,
+        action_json TEXT NOT NULL,
+        outcome_json TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL
+    );
+    PRAGMA user_version = 4;
+";
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -109,6 +146,7 @@ pub struct StoreStatus {
     pub legacy_unresolved_returns: u64,
     pub legacy_debate_outbox: u64,
     pub signal_messages: u64,
+    pub promotion: PromotionStatus,
 }
 
 #[derive(Clone)]
@@ -147,6 +185,9 @@ enum Command {
     GetRoute {
         id: RouteId,
         reply: oneshot::Sender<StoreResult<Option<Route>>>,
+    },
+    ListRoutes {
+        reply: oneshot::Sender<StoreResult<Vec<Route>>>,
     },
     RegisterReturn {
         record: ReturnDelivery,
@@ -189,6 +230,19 @@ enum Command {
     GetMetadata {
         key: String,
         reply: oneshot::Sender<StoreResult<Option<String>>>,
+    },
+    PromotionStatus {
+        reply: oneshot::Sender<StoreResult<PromotionStatus>>,
+    },
+    ApplyOperatorMutation {
+        mutation: OperatorMutation,
+        now_ms: i64,
+        reply: oneshot::Sender<StoreResult<OperatorOutcome>>,
+    },
+    AdvanceEventCursor {
+        expected: u64,
+        next: u64,
+        reply: oneshot::Sender<StoreResult<()>>,
     },
     Compact {
         before_ms: i64,
@@ -304,6 +358,10 @@ impl StoreHandle {
         self.request(|reply| Command::GetRoute { id, reply }).await
     }
 
+    pub async fn list_routes(&self) -> StoreResult<Vec<Route>> {
+        self.request(|reply| Command::ListRoutes { reply }).await
+    }
+
     pub async fn register_return(&self, record: ReturnDelivery) -> StoreResult<()> {
         self.request(|reply| Command::RegisterReturn { record, reply })
             .await
@@ -365,6 +423,33 @@ impl StoreHandle {
     pub async fn get_metadata(&self, key: String) -> StoreResult<Option<String>> {
         self.request(|reply| Command::GetMetadata { key, reply })
             .await
+    }
+
+    pub async fn promotion_status(&self) -> StoreResult<PromotionStatus> {
+        self.request(|reply| Command::PromotionStatus { reply })
+            .await
+    }
+
+    pub async fn apply_operator_mutation(
+        &self,
+        mutation: OperatorMutation,
+        now_ms: i64,
+    ) -> StoreResult<OperatorOutcome> {
+        self.request(|reply| Command::ApplyOperatorMutation {
+            mutation,
+            now_ms,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn advance_event_cursor(&self, expected: u64, next: u64) -> StoreResult<()> {
+        self.request(|reply| Command::AdvanceEventCursor {
+            expected,
+            next,
+            reply,
+        })
+        .await
     }
 
     pub async fn compact(&self, before_ms: i64) -> StoreResult<u64> {
@@ -437,6 +522,7 @@ fn handle_command(connection: &mut Connection, command: Command) {
             reply,
         } => send_reply(reply, save_route(connection, &route, now_ms)),
         Command::GetRoute { id, reply } => send_reply(reply, get_route(connection, id)),
+        Command::ListRoutes { reply } => send_reply(reply, list_routes(connection)),
         Command::RegisterReturn { record, reply } => {
             send_reply(reply, register_return(connection, &record))
         }
@@ -467,6 +553,20 @@ fn handle_command(connection: &mut Connection, command: Command) {
             send_reply(reply, set_metadata(connection, &key, &value))
         }
         Command::GetMetadata { key, reply } => send_reply(reply, get_metadata(connection, &key)),
+        Command::PromotionStatus { reply } => send_reply(reply, promotion_status(connection)),
+        Command::ApplyOperatorMutation {
+            mutation,
+            now_ms,
+            reply,
+        } => send_reply(
+            reply,
+            apply_operator_mutation(connection, &mutation, now_ms),
+        ),
+        Command::AdvanceEventCursor {
+            expected,
+            next,
+            reply,
+        } => send_reply(reply, advance_event_cursor(connection, expected, next)),
         Command::Compact { before_ms, reply } => send_reply(reply, compact(connection, before_ms)),
         Command::Status { reply } => send_reply(reply, status(connection)),
         Command::Shutdown { reply } => send_reply(reply, Ok(())),
@@ -607,7 +707,36 @@ pub(crate) fn migrate_schema(connection: &mut Connection) -> StoreResult<()> {
              );
              CREATE INDEX legacy_debate_resolution
                  ON legacy_debate_outbox(resolution_state, created_at_ms);
-             PRAGMA user_version = 3;",
+             CREATE TABLE promotion_state (
+                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                 delivery_hold INTEGER NOT NULL CHECK(delivery_hold IN (0, 1)),
+                 event_cursor INTEGER,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             INSERT INTO promotion_state(singleton, delivery_hold, event_cursor, updated_at_ms)
+             VALUES (1, 1, NULL, 0);
+             CREATE TABLE route_delivery_policy (
+                 route_id TEXT PRIMARY KEY REFERENCES routes(route_id),
+                 enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+                 updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE legacy_dispositions (
+                 record_kind TEXT NOT NULL,
+                 record_id TEXT NOT NULL,
+                 decision TEXT NOT NULL,
+                 evidence TEXT NOT NULL,
+                 operation_id TEXT NOT NULL UNIQUE,
+                 record_json TEXT NOT NULL,
+                 resolved_at_ms INTEGER NOT NULL,
+                 PRIMARY KEY(record_kind, record_id)
+             );
+             CREATE TABLE operator_actions (
+                 operation_id TEXT PRIMARY KEY,
+                 action_json TEXT NOT NULL,
+                 outcome_json TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL
+             );
+             PRAGMA user_version = 4;",
         )?;
         transaction.commit()?;
     }
@@ -664,6 +793,7 @@ pub(crate) fn migrate_schema(connection: &mut Connection) -> StoreResult<()> {
              DELETE FROM outbox WHERE channel = 'debate';
              PRAGMA user_version = 3;",
         )?;
+        transaction.execute_batch(PHASE5_SCHEMA_SQL)?;
         transaction.commit()?;
     }
     if version == 2 {
@@ -690,6 +820,12 @@ pub(crate) fn migrate_schema(connection: &mut Connection) -> StoreResult<()> {
              DELETE FROM outbox WHERE channel = 'debate';
              PRAGMA user_version = 3;",
         )?;
+        transaction.execute_batch(PHASE5_SCHEMA_SQL)?;
+        transaction.commit()?;
+    }
+    if version == 3 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(PHASE5_SCHEMA_SQL)?;
         transaction.commit()?;
     }
     Ok(())
@@ -894,6 +1030,477 @@ fn get_route(connection: &Connection, id: RouteId) -> StoreResult<Option<Route>>
         .optional()?;
     json.map(|value| serde_json::from_str(&value).map_err(StoreError::from))
         .transpose()
+}
+
+fn list_routes(connection: &Connection) -> StoreResult<Vec<Route>> {
+    let mut statement =
+        connection.prepare("SELECT route_json FROM routes ORDER BY lower(json_extract(route_json, '$.title')), route_id")?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|value| serde_json::from_str(&value).map_err(StoreError::from))
+        .collect()
+}
+
+fn promotion_status(connection: &Connection) -> StoreResult<PromotionStatus> {
+    let (delivery_hold, event_cursor) = connection.query_row(
+        "SELECT delivery_hold, event_cursor FROM promotion_state WHERE singleton = 1",
+        [],
+        |row| Ok((row.get::<_, bool>(0)?, row.get::<_, Option<u64>>(1)?)),
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT route_id FROM route_delivery_policy WHERE enabled = 1 ORDER BY route_id",
+    )?;
+    let enabled_routes = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .map(|value| {
+            let value = value?;
+            Uuid::parse_str(&value).map(RouteId::new).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(PromotionStatus {
+        delivery_hold,
+        event_cursor,
+        enabled_routes,
+        operator_actions: count(connection, "SELECT COUNT(*) FROM operator_actions")?,
+        unresolved_legacy_controls: count(
+            connection,
+            "SELECT COUNT(*) FROM legacy_control_requests legacy
+             LEFT JOIN legacy_dispositions disposition
+               ON disposition.record_kind = 'control'
+              AND disposition.record_id = legacy.request_id
+             WHERE legacy.state = 'indeterminate' AND disposition.record_id IS NULL",
+        )?,
+        unresolved_legacy_returns: count(
+            connection,
+            "SELECT COUNT(*) FROM legacy_return_deliveries legacy
+             LEFT JOIN legacy_dispositions disposition
+               ON disposition.record_kind = 'return'
+              AND disposition.record_id = legacy.request_id
+             WHERE (legacy.agent_state != 'delivered' OR legacy.mirror_state != 'delivered')
+               AND disposition.record_id IS NULL",
+        )?,
+        held_legacy_debate: count(
+            connection,
+            "SELECT COUNT(*) FROM legacy_debate_outbox WHERE resolution_state = 'held'",
+        )?,
+    })
+}
+
+fn apply_operator_mutation(
+    connection: &mut Connection,
+    mutation: &OperatorMutation,
+    now_ms: i64,
+) -> StoreResult<OperatorOutcome> {
+    let operation_id = mutation.operation_id.to_string();
+    let action_json = serde_json::to_string(mutation)?;
+    if let Some((stored_action, outcome)) = connection
+        .query_row(
+            "SELECT action_json, outcome_json FROM operator_actions WHERE operation_id = ?1",
+            params![operation_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+    {
+        if stored_action != action_json {
+            return Err(StoreError::Conflict(format!(
+                "operator operation {} was already used with different content",
+                mutation.operation_id
+            )));
+        }
+        let mut outcome: OperatorOutcome = serde_json::from_str(&outcome)?;
+        outcome.replayed = true;
+        return Ok(outcome);
+    }
+
+    let transaction = connection.transaction()?;
+    let (detail, route) = apply_operator_action(&transaction, mutation, now_ms)?;
+    let mut promotion = promotion_status(&transaction)?;
+    promotion.operator_actions += 1;
+    let outcome = OperatorOutcome {
+        operation_id: mutation.operation_id,
+        replayed: false,
+        detail,
+        promotion,
+        route,
+    };
+    transaction.execute(
+        "INSERT INTO operator_actions(operation_id, action_json, outcome_json, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            operation_id,
+            action_json,
+            serde_json::to_string(&outcome)?,
+            now_ms,
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(outcome)
+}
+
+fn apply_operator_action(
+    transaction: &rusqlite::Transaction<'_>,
+    mutation: &OperatorMutation,
+    now_ms: i64,
+) -> StoreResult<(String, Option<Route>)> {
+    match &mutation.action {
+        OperatorAction::SetDeliveryHold { held } => {
+            if !held {
+                let (cursor, enabled): (Option<u64>, u64) = transaction.query_row(
+                    "SELECT event_cursor,
+                        (SELECT COUNT(*) FROM route_delivery_policy WHERE enabled = 1)
+                     FROM promotion_state WHERE singleton = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                if cursor.is_none() || enabled == 0 {
+                    return Err(StoreError::Conflict(
+                        "delivery cannot be released before an event cursor and canary route are set"
+                            .into(),
+                    ));
+                }
+            }
+            transaction.execute(
+                "UPDATE promotion_state SET delivery_hold = ?1, updated_at_ms = ?2
+                 WHERE singleton = 1",
+                params![held, now_ms],
+            )?;
+            Ok((
+                if *held {
+                    "global delivery hold is active"
+                } else {
+                    "global delivery hold is released for enabled routes"
+                }
+                .into(),
+                None,
+            ))
+        }
+        OperatorAction::SetRouteEnabled { route_id, enabled } => {
+            let route = get_route(transaction, *route_id)?
+                .ok_or_else(|| StoreError::Conflict(format!("route {route_id} does not exist")))?;
+            if *enabled && route.status != crate::domain::RouteStatus::Available {
+                return Err(StoreError::Conflict(format!(
+                    "route {:?} is not authoritatively available",
+                    route.title
+                )));
+            }
+            transaction.execute(
+                "INSERT INTO route_delivery_policy(route_id, enabled, updated_at_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(route_id) DO UPDATE SET
+                     enabled = excluded.enabled, updated_at_ms = excluded.updated_at_ms",
+                params![route_id.to_string(), enabled, now_ms],
+            )?;
+            Ok((
+                format!(
+                    "route {:?} delivery is {}",
+                    route.title,
+                    if *enabled { "enabled" } else { "held" }
+                ),
+                Some(route),
+            ))
+        }
+        OperatorAction::InitializeEventCursor { sequence } => {
+            let existing: Option<u64> = transaction.query_row(
+                "SELECT event_cursor FROM promotion_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            if existing.is_some_and(|value| value != *sequence) {
+                return Err(StoreError::Conflict(format!(
+                    "event cursor is already initialized at {}",
+                    existing.expect("existing cursor was checked")
+                )));
+            }
+            transaction.execute(
+                "UPDATE promotion_state SET event_cursor = ?1, updated_at_ms = ?2
+                 WHERE singleton = 1",
+                params![sequence, now_ms],
+            )?;
+            Ok((format!("event cursor initialized at {sequence}"), None))
+        }
+        OperatorAction::ReconcileRoute { route_id, binding } => {
+            if binding.pane_id.is_none() {
+                return Err(StoreError::Conflict(
+                    "route reconciliation requires the fresh ephemeral pane locator".into(),
+                ));
+            }
+            let mut route = get_route(transaction, *route_id)?
+                .ok_or_else(|| StoreError::Conflict(format!("route {route_id} does not exist")))?;
+            let decision = route.reconcile(Some(binding.clone()));
+            save_route(transaction, &route, now_ms)?;
+            let detail = match decision {
+                ReconcileDecision::Unchanged => "route identity was already current",
+                ReconcileDecision::Rebound => "route was bound to the fresh Wakterm identity",
+                ReconcileDecision::Unavailable => "route remains unavailable",
+                ReconcileDecision::ReconciliationRequired => {
+                    "route identity changed and requires explicit replacement review"
+                }
+            };
+            Ok((detail.into(), Some(route)))
+        }
+        OperatorAction::DisposeLegacy {
+            record_kind,
+            record_id,
+            decision,
+            evidence,
+        } => dispose_legacy(
+            transaction,
+            mutation.operation_id,
+            *record_kind,
+            record_id,
+            decision,
+            evidence,
+            now_ms,
+        ),
+    }
+}
+
+fn dispose_legacy(
+    transaction: &rusqlite::Transaction<'_>,
+    operation_id: Uuid,
+    record_kind: LegacyRecordKind,
+    record_id: &str,
+    decision: &LegacyDecision,
+    evidence: &str,
+    now_ms: i64,
+) -> StoreResult<(String, Option<Route>)> {
+    if record_id.trim().is_empty() || evidence.trim().is_empty() || evidence.len() > 4096 {
+        return Err(StoreError::Conflict(
+            "legacy disposition requires a record ID and concise evidence".into(),
+        ));
+    }
+    let kind = legacy_kind_name(record_kind);
+    if transaction
+        .query_row(
+            "SELECT 1 FROM legacy_dispositions WHERE record_kind = ?1 AND record_id = ?2",
+            params![kind, record_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some()
+    {
+        return Err(StoreError::Conflict(format!(
+            "legacy {kind} record {record_id:?} already has a disposition"
+        )));
+    }
+
+    let route = match record_kind {
+        LegacyRecordKind::Control => {
+            require_legacy_record(
+                transaction,
+                "legacy_control_requests",
+                "request_id",
+                record_id,
+            )?;
+            reject_debate_mapping(decision)?;
+            None
+        }
+        LegacyRecordKind::Return => {
+            require_legacy_record(
+                transaction,
+                "legacy_return_deliveries",
+                "request_id",
+                record_id,
+            )?;
+            reject_debate_mapping(decision)?;
+            None
+        }
+        LegacyRecordKind::Debate => {
+            dispose_legacy_debate(transaction, record_id, decision, now_ms)?
+        }
+    };
+    let record_json = serde_json::to_string(&serde_json::json!({
+        "record_kind": record_kind,
+        "record_id": record_id,
+        "decision": decision,
+        "evidence": evidence,
+    }))?;
+    transaction.execute(
+        "INSERT INTO legacy_dispositions(
+             record_kind, record_id, decision, evidence, operation_id,
+             record_json, resolved_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            kind,
+            record_id,
+            decision_name(decision),
+            evidence,
+            operation_id.to_string(),
+            record_json,
+            now_ms,
+        ],
+    )?;
+    Ok((
+        format!("legacy {kind} record {record_id:?} received an explicit disposition"),
+        route,
+    ))
+}
+
+fn dispose_legacy_debate(
+    transaction: &rusqlite::Transaction<'_>,
+    record_id: &str,
+    decision: &LegacyDecision,
+    now_ms: i64,
+) -> StoreResult<Option<Route>> {
+    let (destination, record_json): (String, String) = transaction
+        .query_row(
+            "SELECT destination, record_json FROM legacy_debate_outbox
+             WHERE effect_id = ?1 AND resolution_state = 'held'",
+            params![record_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StoreError::Conflict(format!(
+                "held legacy Debate record {record_id:?} is missing"
+            ))
+        })?;
+    match decision {
+        LegacyDecision::MapDebateToSignal {
+            route_id,
+            expected_legacy_destination,
+        } => {
+            if expected_legacy_destination != &destination {
+                return Err(StoreError::Conflict(
+                    "the asserted legacy Debate destination does not match durable state".into(),
+                ));
+            }
+            let route = get_route(transaction, *route_id)?
+                .ok_or_else(|| StoreError::Conflict(format!("route {route_id} does not exist")))?;
+            let signal_groups = route
+                .channels
+                .iter()
+                .filter_map(|binding| match binding {
+                    crate::domain::ChannelBinding::Signal { group_id } => Some(group_id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let [group_id] = signal_groups.as_slice() else {
+                return Err(StoreError::Conflict(
+                    "the selected route does not have exactly one Signal binding".into(),
+                ));
+            };
+            let legacy: Value = serde_json::from_str(&record_json)?;
+            let body = legacy["chunk"].as_str().ok_or_else(|| {
+                StoreError::Conflict("legacy Debate payload has no message body".into())
+            })?;
+            let sender_harness = legacy["harness"].as_str().ok_or_else(|| {
+                StoreError::Conflict("legacy Debate payload has no harness identity".into())
+            })?;
+            let effect_id = Uuid::parse_str(record_id)
+                .map(EffectId::new)
+                .map_err(|_| StoreError::Conflict("legacy Debate effect ID is invalid".into()))?;
+            let item = OutboxItem {
+                id: effect_id,
+                route_id: Some(route.id),
+                sender_harness: Some(sender_harness.to_owned()),
+                kind: ChannelKind::Signal,
+                destination: (*group_id).clone(),
+                body: body.to_owned(),
+                state: OutboxState::Pending,
+                attempts: 0,
+                last_error: None,
+                external_receipt: None,
+            };
+            enqueue_outbox(transaction, None, &item, now_ms)?;
+            transaction.execute(
+                "UPDATE legacy_debate_outbox
+                 SET resolution_state = 'mapped_to_signal', resolution_json = ?2,
+                     updated_at_ms = ?3 WHERE effect_id = ?1",
+                params![record_id, serde_json::to_string(&item)?, now_ms],
+            )?;
+            Ok(Some(route))
+        }
+        LegacyDecision::NoReplay | LegacyDecision::ExternallyVerified => {
+            transaction.execute(
+                "UPDATE legacy_debate_outbox
+                 SET resolution_state = 'no_replay', resolution_json = ?2,
+                     updated_at_ms = ?3 WHERE effect_id = ?1",
+                params![record_id, serde_json::to_string(decision)?, now_ms],
+            )?;
+            Ok(None)
+        }
+    }
+}
+
+fn require_legacy_record(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    record_id: &str,
+) -> StoreResult<()> {
+    let sql = format!(
+        "SELECT 1 FROM {} WHERE {} = ?1",
+        quote_identifier(table),
+        quote_identifier(column)
+    );
+    if connection
+        .query_row(&sql, params![record_id], |_| Ok(()))
+        .optional()?
+        .is_none()
+    {
+        return Err(StoreError::Conflict(format!(
+            "legacy record {record_id:?} is missing"
+        )));
+    }
+    Ok(())
+}
+
+fn quote_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn reject_debate_mapping(decision: &LegacyDecision) -> StoreResult<()> {
+    if matches!(decision, LegacyDecision::MapDebateToSignal { .. }) {
+        Err(StoreError::Conflict(
+            "only a held legacy Debate record can be mapped to Signal".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn legacy_kind_name(kind: LegacyRecordKind) -> &'static str {
+    match kind {
+        LegacyRecordKind::Control => "control",
+        LegacyRecordKind::Return => "return",
+        LegacyRecordKind::Debate => "debate",
+    }
+}
+
+fn decision_name(decision: &LegacyDecision) -> &'static str {
+    match decision {
+        LegacyDecision::NoReplay => "no_replay",
+        LegacyDecision::ExternallyVerified => "externally_verified",
+        LegacyDecision::MapDebateToSignal { .. } => "map_debate_to_signal",
+    }
+}
+
+fn advance_event_cursor(connection: &Connection, expected: u64, next: u64) -> StoreResult<()> {
+    if next < expected {
+        return Err(StoreError::Conflict(
+            "event cursor cannot move backwards".into(),
+        ));
+    }
+    let changed = connection.execute(
+        "UPDATE promotion_state SET event_cursor = ?2
+         WHERE singleton = 1 AND event_cursor = ?1",
+        params![expected, next],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::Conflict(format!(
+            "event cursor was not at expected sequence {expected}"
+        )));
+    }
+    Ok(())
 }
 
 fn register_return(connection: &Connection, record: &ReturnDelivery) -> StoreResult<()> {
@@ -1116,6 +1723,7 @@ fn compact(connection: &mut Connection, before_ms: i64) -> StoreResult<u64> {
 }
 
 fn status(connection: &Connection) -> StoreResult<StoreStatus> {
+    let promotion = promotion_status(connection)?;
     Ok(StoreStatus {
         schema_version: SCHEMA_VERSION as u64,
         workflows: count(connection, "SELECT COUNT(*) FROM workflows")?,
@@ -1160,20 +1768,11 @@ fn status(connection: &Connection) -> StoreResult<StoreStatus> {
         )?,
         tombstones: count(connection, "SELECT COUNT(*) FROM idempotency_tombstones")?,
         legacy_control_requests: count(connection, "SELECT COUNT(*) FROM legacy_control_requests")?,
-        legacy_indeterminate_requests: count(
-            connection,
-            "SELECT COUNT(*) FROM legacy_control_requests WHERE state = 'indeterminate'",
-        )?,
-        legacy_unresolved_returns: count(
-            connection,
-            "SELECT COUNT(*) FROM legacy_return_deliveries
-             WHERE agent_state != 'delivered' OR mirror_state != 'delivered'",
-        )?,
-        legacy_debate_outbox: count(
-            connection,
-            "SELECT COUNT(*) FROM legacy_debate_outbox WHERE resolution_state = 'held'",
-        )?,
+        legacy_indeterminate_requests: promotion.unresolved_legacy_controls,
+        legacy_unresolved_returns: promotion.unresolved_legacy_returns,
+        legacy_debate_outbox: promotion.held_legacy_debate,
         signal_messages: count(connection, "SELECT COUNT(*) FROM signal_messages")?,
+        promotion,
     })
 }
 

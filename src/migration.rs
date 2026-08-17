@@ -711,7 +711,7 @@ fn import_pending(
         item.get("pane_id")
             .and_then(Value::as_u64)
             .ok_or_else(|| MigrationError::Malformed("pending pane_id is invalid".into()))?;
-        required_string(item, "harness", "pending item")?;
+        let sender_harness = required_string(item, "harness", "pending item")?.to_owned();
         let effect_id = stable_effect_id("python-pending-output", legacy_id);
         let Some(kind) = kind else {
             transaction.execute(
@@ -741,6 +741,7 @@ fn import_pending(
         let record = OutboxItem {
             id: effect_id,
             route_id,
+            sender_harness: Some(sender_harness),
             kind,
             destination,
             body: body.to_owned(),

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -271,6 +272,7 @@ impl SignalClient {
 #[derive(Clone, Default)]
 pub struct RealChannels {
     pub telegram: Option<TelegramClient>,
+    pub telegram_by_harness: BTreeMap<String, TelegramClient>,
     pub signal: Option<SignalClient>,
     pub slack: Option<SlackClient>,
 }
@@ -279,8 +281,10 @@ impl RealChannels {
     pub async fn send(&self, item: &OutboxItem) -> Result<DeliveryReceipt, ChannelDeliveryError> {
         match item.kind {
             ChannelKind::Telegram => {
-                self.telegram
+                item.sender_harness
                     .as_ref()
+                    .and_then(|harness| self.telegram_by_harness.get(&harness.to_ascii_lowercase()))
+                    .or(self.telegram.as_ref())
                     .ok_or(ChannelDeliveryError::NotConfigured(item.kind))?
                     .send(item)
                     .await

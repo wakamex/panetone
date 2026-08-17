@@ -310,6 +310,7 @@ impl OfflineService {
         let mut audit = OutboxItem {
             id: EffectId::named(record.command.id, "target-audit"),
             route_id: Some(record.workflow.target_route_id),
+            sender_harness: Some(record.workflow.observed_source.harness.clone()),
             kind: audit_kind,
             destination: audit_destination,
             body: format!(
@@ -507,6 +508,7 @@ impl OfflineService {
         let mut item = OutboxItem {
             id: EffectId::named(record.command.id, &format!("target-{purpose}")),
             route_id: Some(record.workflow.target_route_id),
+            sender_harness: Some(record.workflow.observed_source.harness.clone()),
             kind,
             destination,
             body: format!(
@@ -615,6 +617,11 @@ impl OfflineService {
             let mut mirror = OutboxItem {
                 id: mirror_effect,
                 route_id: Some(workflow.workflow.source_route_id),
+                sender_harness: workflow
+                    .workflow
+                    .submitted_target
+                    .as_ref()
+                    .map(|binding| binding.harness.clone()),
                 kind,
                 destination,
                 body: callback_envelope(&workflow, &terminal),
