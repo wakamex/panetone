@@ -171,7 +171,9 @@ Panetone performs these steps:
 11. Persist the terminal result and mirror it to the source Telegram topic.
     Submit the agent callback through authoritative Wakterm admission using the
     persisted source incarnation and a stable callback request ID derived from
-    the original ID.
+    the original ID. Panetone uses Wakterm's exact-agent-ID mode so an agent
+    missing from the current catalog still receives a structured definitive
+    `unavailable` classification from the admission service.
 
 If the source is busy, a definitive `busy` receipt with `prompt_written: false`
 returns the agent destination to durable `pending` state. The retry loop reuses

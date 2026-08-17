@@ -652,6 +652,7 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
         command.assert_called_once_with(
             "admit",
             "source-agent",
+            "--exact-agent-id",
             "--incarnation",
             "source-incarnation",
             "--request-id",

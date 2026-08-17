@@ -379,6 +379,7 @@ def _agent_admit_sync(route, text, *, request_id):
     command = (
         "admit",
         route["agent_id"],
+        "--exact-agent-id",
         "--incarnation",
         route["incarnation_id"],
         "--request-id",

@@ -68,6 +68,7 @@ class WaktermAgentApiContractTests(unittest.TestCase):
         receipts = self.fixture["admission_receipts"]
         accepted = receipts["accepted"]
         busy = receipts["busy"]
+        unavailable = receipts["unavailable"]
         indeterminate = receipts["indeterminate"]
 
         self.assertEqual(
@@ -77,6 +78,14 @@ class WaktermAgentApiContractTests(unittest.TestCase):
         self.assertEqual(
             (busy["status"], busy["definitive"], busy["prompt_written"]),
             ("busy", True, False),
+        )
+        self.assertEqual(
+            (
+                unavailable["status"],
+                unavailable["definitive"],
+                unavailable["prompt_written"],
+            ),
+            ("unavailable", True, False),
         )
         self.assertEqual(
             (
