@@ -111,6 +111,17 @@ def parse_request(data):
             "route names must not have leading or trailing whitespace",
             request_id,
         )
+    has_control = any(
+        ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F
+        for value in (source, target)
+        for char in value
+    )
+    if has_control:
+        raise ProtocolError(
+            "invalid_params",
+            "route names must not contain control characters",
+            request_id,
+        )
     if len(source) > 128 or len(target) > 128:
         raise ProtocolError(
             "invalid_params", "route names must be at most 128 characters", request_id

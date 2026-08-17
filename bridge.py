@@ -2997,8 +2997,8 @@ def _control_prompt_envelope(request_id, source, target, message, return_final):
     reply_mode = "asynchronous final callback" if return_final else "one-way"
     return (
         "[Panetone cross-agent message]\n"
-        f"From route: {source['title']} ({source['harness']})\n"
-        f"To route: {target['title']} ({target['harness']})\n"
+        f"Source agent route: {source['title']} ({source['harness']})\n"
+        f"Target agent route: {target['title']} ({target['harness']})\n"
         f"Request ID: {request_id}\n"
         f"Reply mode: {reply_mode}\n\n"
         f"{message}"

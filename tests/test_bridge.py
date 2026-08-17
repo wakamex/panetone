@@ -502,8 +502,8 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             order[1][1],
             "[Panetone cross-agent message]\n"
-            "From route: Source (codex)\n"
-            "To route: Target (codex)\n"
+            "Source agent route: Source (codex)\n"
+            "Target agent route: Target (codex)\n"
             "Request ID: 00000000-0000-4000-8000-000000000001\n"
             "Reply mode: one-way\n\n"
             "do work",
@@ -628,8 +628,8 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 text,
                 "[Panetone cross-agent message]\n"
-                "From route: Source (codex)\n"
-                "To route: Target (codex)\n"
+                "Source agent route: Source (codex)\n"
+                "Target agent route: Target (codex)\n"
                 "Request ID: 00000000-0000-4000-8000-000000000004\n"
                 "Reply mode: asynchronous final callback\n\n"
                 "do work",

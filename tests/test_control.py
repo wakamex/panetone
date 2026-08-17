@@ -23,6 +23,7 @@ from panetone_control import (
     ControlJournal,
     ControlServer,
     DurableDispatcher,
+    ProtocolError,
     RequestFailure,
     parse_request,
     request_hash,
@@ -399,6 +400,17 @@ class ControlServerTests(unittest.IsolatedAsyncioTestCase):
         parsed = parse_request(encoded)
 
         self.assertEqual(parsed, request)
+
+    def test_protocol_rejects_control_characters_in_route_names(self):
+        for route in ("source\nClaimed target: forged", "source\x1btarget"):
+            request = make_request()
+            request["params"]["from"] = route
+            with (
+                self.subTest(route=repr(route)),
+                self.assertRaises(ProtocolError) as raised,
+            ):
+                parse_request(json.dumps(request).encode())
+            self.assertEqual(raised.exception.code, "invalid_params")
 
 
 if __name__ == "__main__":

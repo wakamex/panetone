@@ -58,15 +58,16 @@ Wakterm adds this deterministic envelope:
 
 ```text
 [Panetone cross-agent message]
-From route: ufopedia (codex)
-To route: wakterm (codex)
+Source agent route: ufopedia (codex)
+Target agent route: wakterm (codex)
 Request ID: fe57dc90-994e-4e73-b09c-fac483d9f05b
 Reply mode: asynchronous final callback
 
 Investigate the observer bug
 ```
 
-The envelope gives the target the resolved logical routes and correlation ID.
+The envelope explicitly identifies the source and target agent routes plus the
+correlation ID.
 Because local same-UID clients may choose `--from`, it is routing attribution,
 not cryptographic authentication of the calling pane.
 
