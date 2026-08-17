@@ -8,7 +8,7 @@ use panetone::domain::{
 use panetone::store::{
     ClaimResult, DestinationDelivery, InboxItem, ReturnDelivery, StoreError, StoreHandle,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use serde_json::json;
 use tempfile::tempdir;
 use uuid::Uuid;
@@ -88,6 +88,53 @@ async fn store_is_private_and_rejects_newer_schemas() {
             supported: 2
         })
     ));
+}
+
+#[tokio::test]
+async fn version_one_store_upgrades_without_changing_native_hash_semantics() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("state.sqlite3");
+    let store = StoreHandle::open(&path).unwrap();
+    store.shutdown().await.unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE signal_messages;
+             DROP TABLE legacy_return_deliveries;
+             DROP TABLE legacy_control_requests;
+             ALTER TABLE idempotency_tombstones DROP COLUMN hash_kind;
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let upgraded = StoreHandle::open(&path).unwrap();
+    assert_eq!(upgraded.status().await.unwrap().schema_version, 2);
+    let request = id(9);
+    assert!(matches!(
+        upgraded
+            .claim(
+                command(request, "hello"),
+                route_id(1),
+                route_id(2),
+                binding("source"),
+                binding("target"),
+                100,
+            )
+            .await
+            .unwrap(),
+        ClaimResult::New(_)
+    ));
+    upgraded.shutdown().await.unwrap();
+    let connection = Connection::open(&path).unwrap();
+    let hash_kind: String = connection
+        .query_row(
+            "SELECT hash_kind FROM idempotency_tombstones WHERE request_id = ?1",
+            params![request.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(hash_kind, "semantic_v1");
 }
 
 #[tokio::test]
