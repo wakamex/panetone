@@ -2,12 +2,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use panetone::control::{CONTROL_SCHEMA, ControlRequest, ControlServer, SendParams, request};
 use panetone::service::ConformanceService;
 use panetone::store::StoreHandle;
+use panetone::supervisor::{Supervisor, TaskPolicy};
+use panetone::wakterm::{ProfileKind, WaktermContract};
 use serde_json::{Value, json};
-use tokio::sync::watch;
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -41,6 +42,28 @@ struct DaemonArgs {
     journal: PathBuf,
     #[arg(long)]
     effect_log: PathBuf,
+    #[arg(
+        long,
+        default_value = "/code/wakterm/docs/agent-api/v1/golden-fixtures.json"
+    )]
+    wakterm_fixture: PathBuf,
+    #[arg(long, value_enum, default_value_t = ProfileArg::Current)]
+    profile: ProfileArg,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProfileArg {
+    Current,
+    FutureEvents,
+}
+
+impl From<ProfileArg> for ProfileKind {
+    fn from(value: ProfileArg) -> Self {
+        match value {
+            ProfileArg::Current => ProfileKind::Current,
+            ProfileArg::FutureEvents => ProfileKind::FutureEvents,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -74,6 +97,11 @@ struct DoctorArgs {
     socket: PathBuf,
     #[arg(long, alias = "database")]
     journal: PathBuf,
+    #[arg(
+        long,
+        default_value = "/code/wakterm/docs/agent-api/v1/golden-fixtures.json"
+    )]
+    wakterm_fixture: PathBuf,
 }
 
 #[derive(Args)]
@@ -98,18 +126,55 @@ async fn main() -> Result<()> {
 }
 
 async fn run_daemon(args: DaemonArgs) -> Result<()> {
+    let fixture = std::fs::read_to_string(&args.wakterm_fixture)
+        .context("read pinned Wakterm Agent API fixture")?;
+    let contract = WaktermContract::from_golden_json(&fixture, args.profile.into())
+        .context("validate Wakterm Agent API fake profile")?;
     let store = StoreHandle::open(&args.journal).context("open offline store")?;
-    let handler = Arc::new(ConformanceService::new(store.clone(), args.effect_log));
     let server = ControlServer::bind(&args.socket)
         .await
         .context("bind Panetone control socket")?;
-    let (shutdown_sender, shutdown_receiver) = watch::channel(false);
-    let task = tokio::spawn(server.run(handler, shutdown_receiver));
-    tokio::signal::ctrl_c().await.context("wait for shutdown")?;
-    let _ = shutdown_sender.send(true);
-    task.await.context("join control server")??;
+    let mut supervisor = Supervisor::new();
+    let handler = Arc::new(
+        ConformanceService::new(store.clone(), args.effect_log).with_runtime_status(
+            supervisor.handle(),
+            match args.profile {
+                ProfileArg::Current => "current",
+                ProfileArg::FutureEvents => "future_events",
+            },
+            contract.capabilities.iter().cloned().collect(),
+            args.socket.clone(),
+        ),
+    );
+    let shutdown = supervisor.shutdown_receiver();
+    supervisor.spawn("control", TaskPolicy::Critical, async move {
+        server
+            .run(handler, shutdown)
+            .await
+            .map_err(|error| error.to_string())
+    });
+    supervisor
+        .run_until(shutdown_signal())
+        .await
+        .context("supervise offline daemon")?;
     store.shutdown().await.context("stop store owner")?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 async fn run_send(args: SendArgs) -> Result<()> {
@@ -167,6 +232,23 @@ async fn run_doctor(args: DoctorArgs) -> Result<()> {
         .parent()
         .context("control socket requires a parent directory")?;
     let parent_check = private_directory_check(parent);
+    let wakterm_check = match std::fs::read_to_string(&args.wakterm_fixture) {
+        Ok(fixture) => match (
+            WaktermContract::from_golden_json(&fixture, ProfileKind::Current),
+            WaktermContract::from_golden_json(&fixture, ProfileKind::FutureEvents),
+        ) {
+            (Ok(current), Ok(future)) => json!({
+                "ok": !current.general_event_consumer_enabled() && future.general_event_consumer_enabled(),
+                "detail": "current and fixture-only future profiles are compatible",
+                "current_capabilities": current.capabilities,
+                "future_capabilities": future.capabilities
+            }),
+            (Err(error), _) | (_, Err(error)) => {
+                json!({"ok": false, "detail": error.to_string()})
+            }
+        },
+        Err(error) => json!({"ok": false, "detail": error.to_string()}),
+    };
     let store = StoreHandle::open(&args.journal);
     let (store_check, opened) = match store {
         Ok(store) => (
@@ -176,11 +258,12 @@ async fn run_doctor(args: DoctorArgs) -> Result<()> {
         Err(error) => (json!({"ok": false, "detail": error.to_string()}), None),
     };
     let report = json!({
-        "ok": parent_check["ok"] == true && store_check["ok"] == true,
+        "ok": parent_check["ok"] == true && store_check["ok"] == true && wakterm_check["ok"] == true,
         "mode": "offline_fake",
         "checks": {
             "runtime_directory": parent_check,
             "store": store_check,
+            "wakterm_contract": wakterm_check,
             "production_connections": {"ok": true, "detail": "disabled in Phase 2"}
         }
     });
