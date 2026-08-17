@@ -141,7 +141,7 @@ The following are not parity failures when backed by their migration or compatib
 - [x] Control v1 golden fixtures reproduce Python behavior.
 - [x] Provider and routing fixtures reproduce current normalized observations.
 - [x] A black-box harness runs the same control cases against a replaceable backend command.
-- [ ] Wakterm Agent API fixtures cover capability, catalog, receipt, events, cursor gaps, retention, lifecycle, and classified errors.
+- [x] Wakterm Agent API fixtures cover capability, catalog, receipt, events, cursor gaps, retention, lifecycle, and classified errors. Panetone consumes Wakterm's file directly in `tests/test_wakterm_agent_api.py`.
 - [ ] Independent protocol review has no unresolved material finding.
 - [x] Codex recording-sink shadow comparison has zero unexplained normalized differences. See `docs/phase1-codex-shadow-report.md`.
 
