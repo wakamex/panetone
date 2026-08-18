@@ -11,7 +11,7 @@ it. Phase 5B is the separate live cutover.
 - database: `/var/lib/panetone/panetone.sqlite3`, `mihai:mihai` mode `0600`
 - control socket: `/run/panetone/control.sock`, mode `0600` in a mode `0700`
   runtime directory
-- Wakterm socket: `/run/wakterm/sock`, separate from the Panetone socket
+- Wakterm socket: `/run/user/1000/wakterm/sock`, separate from the Panetone socket
 - installation evidence: `/var/lib/panetone/install-evidence.json`
 
 The unit runs as `mihai`, has no source checkout or hot reload in `ExecStart`,

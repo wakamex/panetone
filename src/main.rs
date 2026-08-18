@@ -192,6 +192,7 @@ enum LegacyKindArg {
     Control,
     Return,
     Debate,
+    Signal,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -711,6 +712,7 @@ async fn run_operator(args: OperatorArgs) -> Result<()> {
                     LegacyKindArg::Control => "control",
                     LegacyKindArg::Return => "return",
                     LegacyKindArg::Debate => "debate",
+                    LegacyKindArg::Signal => "signal",
                 },
                 "record_id": record_id,
                 "decision": match decision {

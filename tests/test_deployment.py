@@ -43,7 +43,7 @@ class DeploymentContractTests(unittest.TestCase):
             "/usr/local/bin/panetone daemon --socket /run/panetone/control.sock "
             "--database /var/lib/panetone/panetone.sqlite3 "
             "--wakterm-bin /usr/local/bin/wakterm "
-            "--wakterm-socket /run/wakterm/sock",
+            "--wakterm-socket /run/user/1000/wakterm/sock",
         )
         self.assertEqual(service["EnvironmentFile"], "/etc/panetone/panetone.env")
         self.assertEqual(service["RuntimeDirectoryMode"], "0700")

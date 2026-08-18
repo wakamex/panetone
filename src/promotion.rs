@@ -12,6 +12,7 @@ pub enum LegacyRecordKind {
     Control,
     Return,
     Debate,
+    Signal,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

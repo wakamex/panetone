@@ -306,3 +306,75 @@ async fn legacy_records_need_audited_dispositions_and_debate_maps_only_to_signal
     assert_eq!(outbox[0].state, OutboxState::Pending);
     store.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn signal_disposition_archives_pending_inbox_without_replay() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("state.sqlite3");
+    let store = StoreHandle::open(&path).unwrap();
+    store.shutdown().await.unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO signal_messages(
+                 legacy_id, group_id, state, record_json, received_at_ms
+             ) VALUES ('sqlite:667', 'signal-group', 'pending', '{}', 1)",
+            [],
+        )
+        .unwrap();
+    let item = panetone::store::InboxItem {
+        id: panetone::domain::EffectId::new(Uuid::from_u128(667)),
+        channel: ChannelKind::Signal,
+        external_id: "signal-group:+100:1:667".into(),
+        destination: "signal-group".into(),
+        sender_id: Some("+100".into()),
+        sender: Some("+100".into()),
+        body: "legacy message".into(),
+        state: "pending".into(),
+        created_at_ms: 1,
+    };
+    connection
+        .execute(
+            "INSERT INTO inbox(
+                 effect_id, channel, external_id, state, record_json, created_at_ms
+             ) VALUES (?1, 'signal', ?2, 'pending', ?3, 1)",
+            params![
+                item.id.to_string(),
+                item.external_id,
+                serde_json::to_string(&item).unwrap()
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = StoreHandle::open(&path).unwrap();
+    store
+        .apply_operator_mutation(
+            operation(
+                667,
+                OperatorAction::DisposeLegacy {
+                    record_kind: LegacyRecordKind::Signal,
+                    record_id: "sqlite:667".into(),
+                    decision: LegacyDecision::NoReplay,
+                    evidence: "legacy Signal message is no longer needed".into(),
+                },
+            ),
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.status().await.unwrap().pending_inbox, 0);
+    let connection = Connection::open(&path).unwrap();
+    let states: (String, String) = connection
+        .query_row(
+            "SELECT
+                 (SELECT state FROM signal_messages WHERE legacy_id = 'sqlite:667'),
+                 (SELECT state FROM inbox WHERE effect_id = ?1)",
+            params![item.id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(states, ("archived".into(), "archived".into()));
+    store.shutdown().await.unwrap();
+}

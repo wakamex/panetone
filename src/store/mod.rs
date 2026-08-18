@@ -1601,6 +1601,7 @@ fn dispose_legacy(
         LegacyRecordKind::Debate => {
             dispose_legacy_debate(transaction, record_id, decision, now_ms)?
         }
+        LegacyRecordKind::Signal => dispose_legacy_signal(transaction, record_id, decision)?,
     };
     let record_json = serde_json::to_string(&serde_json::json!({
         "record_kind": record_kind,
@@ -1716,6 +1717,75 @@ fn dispose_legacy_debate(
     }
 }
 
+fn dispose_legacy_signal(
+    transaction: &rusqlite::Transaction<'_>,
+    record_id: &str,
+    decision: &LegacyDecision,
+) -> StoreResult<Option<Route>> {
+    reject_debate_mapping(decision)?;
+    let state: String = transaction
+        .query_row(
+            "SELECT state FROM signal_messages WHERE legacy_id = ?1",
+            params![record_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StoreError::Conflict(format!("legacy Signal record {record_id:?} is missing"))
+        })?;
+
+    if state == "pending" {
+        let suffix = record_id.strip_prefix("sqlite:").ok_or_else(|| {
+            StoreError::Conflict(
+                "pending legacy Signal record must use the sqlite:<id> identifier".into(),
+            )
+        })?;
+        let external_suffix = format!("%:{suffix}");
+        let inbox_rows = transaction
+            .prepare(
+                "SELECT effect_id, record_json FROM inbox
+                 WHERE channel = 'signal' AND external_id LIKE ?1",
+            )?
+            .query_map(params![external_suffix], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let [(effect_id, record_json)] = inbox_rows.as_slice() else {
+            return Err(StoreError::Conflict(format!(
+                "pending legacy Signal record {record_id:?} has no unique inbox item"
+            )));
+        };
+        let mut item: InboxItem = serde_json::from_str(record_json)?;
+        if item.state != "pending" {
+            return Err(StoreError::Conflict(format!(
+                "legacy Signal inbox item {effect_id:?} is not pending"
+            )));
+        }
+        item.state = "archived".into();
+        let changed = transaction.execute(
+            "UPDATE inbox SET state = 'archived', record_json = ?2
+             WHERE effect_id = ?1 AND state = 'pending'",
+            params![effect_id, serde_json::to_string(&item)?],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "legacy Signal inbox item {effect_id:?} changed while being archived"
+            )));
+        }
+        transaction.execute(
+            "UPDATE signal_messages SET state = 'archived'
+             WHERE legacy_id = ?1 AND state = 'pending'",
+            params![record_id],
+        )?;
+    } else if state != "archived" {
+        return Err(StoreError::Conflict(format!(
+            "legacy Signal record {record_id:?} has unsupported state {state:?}"
+        )));
+    }
+
+    Ok(None)
+}
+
 fn require_legacy_record(
     connection: &Connection,
     table: &str,
@@ -1758,6 +1828,7 @@ fn legacy_kind_name(kind: LegacyRecordKind) -> &'static str {
         LegacyRecordKind::Control => "control",
         LegacyRecordKind::Return => "return",
         LegacyRecordKind::Debate => "debate",
+        LegacyRecordKind::Signal => "signal",
     }
 }
 

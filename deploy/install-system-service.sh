@@ -123,7 +123,7 @@ if ! systemctl is-active --quiet wakterm-mux-server.service; then
     printf '%s\n' 'the system Wakterm mux service must be active under the same manager' >&2
     exit 1
 fi
-test -S /run/wakterm/sock
+test -S /run/user/1000/wakterm/sock
 if [[ -e $system_database ]]; then
     printf '%s\n' "$system_database already exists; refusing to overwrite durable state" >&2
     exit 1
