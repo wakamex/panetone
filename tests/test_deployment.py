@@ -75,6 +75,7 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertIn("wakterm-mux-server.service", installer)
         self.assertIn("refusing to overwrite durable state", installer)
         self.assertIn("systemctl disable --now panetone.service", installer)
+        self.assertIn("runuser --user mihai", installer)
         self.assertIn('delivery_hold"] is True', installer)
 
     def test_wakterm_preflight_is_pinned_and_production_isolated(self):

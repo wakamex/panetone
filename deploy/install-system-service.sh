@@ -200,7 +200,8 @@ if ((start_held == 1)); then
         sleep 0.05
     done
     test -S /run/panetone/control.sock
-    status=$($system_binary status --socket /run/panetone/control.sock --json)
+    status=$(runuser --user mihai -- "$system_binary" status \
+        --socket /run/panetone/control.sock --json)
     python3 -c 'import json,sys; data=json.load(sys.stdin); assert data["result"]["store"]["promotion"]["delivery_hold"] is True' <<<"$status"
     python3 - "$binary_hash" "$unit_hash" "$commit" "$wakterm_version" > /var/lib/panetone/install-evidence.json <<'PY'
 import json
