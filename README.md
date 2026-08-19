@@ -18,6 +18,15 @@ Each wezterm tab gets its own Telegram forum topic and/or Signal group chat. Mul
 - **Session tailing** — reads `.claude` and `.codex` JSONL session files directly, no screen scraping
 - **Signal support** — optionally mirror output to Signal groups via signal-cli (no extra Python deps)
 
+## Removed transports
+
+Slack support was removed on 2026-08-17. Panetone no longer loads Slack
+credentials, opens Socket Mode, accepts Slack input, or sends Slack output.
+Legacy Slack output preferences are ignored and retained only as migration
+metadata. Migration refuses any pending Slack delivery so it cannot be
+silently replayed or discarded. Archive or explicitly dispose those legacy
+items before migration, then revoke the old Slack app and bot tokens.
+
 ## Telegram Setup
 
 1. Create a Telegram group with [Topics enabled](https://telegram.org/blog/topics-in-groups-collectible-usernames#topics-in-groups)
@@ -61,10 +70,39 @@ sudo /bin/bash /code/panetone/deploy/install-system-service.sh
 The installer checks the committed lock before stopping the current service and
 restores the user service automatically if system-service promotion fails.
 
-Panetone probes Wakterm durable-return support once during startup. When the
-installed Wakterm lacks that capability, ordinary one-way sends remain enabled
-but `--return-final` fails before Telegram or prompt delivery. A compatible
-Wakterm installation takes effect after a deliberate Panetone restart.
+For Wakterm adapter development, build and run the current `/code/wakterm`
+checkout behind a separate development mux:
+
+```sh
+dev/wakterm-dev build
+dev/wakterm-dev serve
+```
+
+Run development CLI probes from another terminal with, for example,
+`dev/wakterm-dev cli agent capabilities`. The launcher disables Wakterm config
+loading and isolates the mux socket, saved session, cache, config, and data below
+the Panetone development worktree. It runs in the foreground and never manages
+or restarts the production mux. Stop it with Ctrl-C when the test is complete.
+
+Before Phase 5B, run the pinned disposable integration preflight:
+
+```sh
+dev/phase5b-wakterm-preflight
+```
+
+It records private JSON evidence below `.dev/evidence/` and does not touch the
+production mux. See the [Wakterm promotion checklist](docs/wakterm-phase5b-promotion.md)
+before any real mux deployment or restart. Restoring terminal layout alone does
+not restore agent harnesses.
+
+The installed Python bridge negotiates the Wakterm Agent API during startup.
+The Phase 5A Rust candidate also checks capabilities on every Agent API
+operation because each CLI invocation opens a new mux connection. Return mode
+requires catalog, prompt-admission, and durable return-stream capabilities so a
+callback can be queued while its exact source agent is busy instead of steering
+an active turn. The Rust output consumer additionally requires
+`event_stream.v1`. See [the Phase 5A contract](docs/rust-phase5a.md) and
+[production runbook](docs/production-operations.md).
 
 ## Signal Setup (optional)
 
@@ -119,6 +157,10 @@ panetone send --from ufopedia --to wakterm "Investigate the observer bug"
 registered by the running bridge. Panetone posts an audit message in the target
 Telegram topic, switches that target's output route to Telegram, submits the
 message through `wakterm cli agent send`, and prints a structured JSON receipt.
+The prompt delivered to the target includes a Panetone envelope with the
+resolved source and target routes, harnesses, request ID, and reply mode. This
+lets the target distinguish routed work from direct user input. The source is a
+locally asserted route, not cryptographic authentication of the calling pane.
 
 Ordinary sends remain one-way. When the running Panetone bridge reports that
 Wakterm supports durable agent requests, add `--return-final` for durable
@@ -156,9 +198,11 @@ control. It does not change the original request into a synchronous exchange.
 Every request has a UUID idempotency key. The CLI generates one by default and
 returns it in the response. Use `--id UUID` when retrying after a lost response.
 The same ID and content return the stored receipt without redelivery. Different
-content with the same ID returns `idempotency_conflict` during the 30-day
-completed-request retention window. Pending and indeterminate IDs do not expire.
-Panetone never retries a request left uncertain across a process failure.
+content with the same ID returns `idempotency_conflict`. The installed Python
+bridge retains completed IDs for 30 days. The Rust candidate keeps permanent
+UUID tombstones, so a completed ID never becomes a new request. Pending and
+indeterminate IDs do not expire in either implementation. Panetone never
+retries a request left uncertain across a process failure.
 
 The Panetone control socket defaults to
 `$XDG_RUNTIME_DIR/panetone/control.sock`. It is separate from the Wakterm mux

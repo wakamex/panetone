@@ -23,6 +23,7 @@ from panetone_control import (
     ControlJournal,
     ControlServer,
     DurableDispatcher,
+    ProtocolError,
     RequestFailure,
     parse_request,
     request_hash,
@@ -229,6 +230,68 @@ class DurableDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["agent_state"], "indeterminate")
         self.assertEqual(row["telegram_state"], "pending")
 
+    def test_definitive_missing_source_keeps_callback_result_durable(self):
+        request = make_request()
+        self.assertTrue(self.journal.claim(request, request_hash(request)))
+        self.journal.register_return_route(
+            request["id"],
+            {"title": "Source", "agent_id": "gone"},
+            {"title": "Target"},
+        )
+        result = {"request_id": request["id"], "state": "completed"}
+        self.journal.record_return_result(request["id"], result)
+        self.journal.set_return_destination(
+            request["id"], "agent", "failed", "source process changed"
+        )
+        self.journal.set_return_destination(
+            request["id"], "telegram", "delivered"
+        )
+        self.journal.finish(
+            request["id"],
+            "succeeded",
+            {"schema": SCHEMA, "id": request["id"], "ok": True},
+        )
+        with self.journal._connect() as db:
+            db.execute("UPDATE control_request SET updated_at = 0")
+
+        removed = self.journal.prune_completed(now=COMPLETED_RETENTION_SECONDS + 1)
+
+        self.assertEqual(removed, 0)
+        row = self.journal.get_return(request["id"])
+        self.assertEqual(row["agent_state"], "failed")
+        self.assertEqual(json.loads(row["result_json"]), result)
+
+    def test_indeterminate_callback_destination_survives_pruning(self):
+        request = make_request()
+        self.assertTrue(self.journal.claim(request, request_hash(request)))
+        self.journal.register_return_route(
+            request["id"],
+            {"title": "Source"},
+            {"title": "Target"},
+        )
+        result = {"request_id": request["id"], "state": "completed"}
+        self.journal.record_return_result(request["id"], result)
+        self.journal.set_return_destination(
+            request["id"], "agent", "indeterminate", "receipt was lost"
+        )
+        self.journal.set_return_destination(
+            request["id"], "telegram", "delivered"
+        )
+        self.journal.finish(
+            request["id"],
+            "succeeded",
+            {"schema": SCHEMA, "id": request["id"], "ok": True},
+        )
+        with self.journal._connect() as db:
+            db.execute("UPDATE control_request SET updated_at = 0")
+
+        removed = self.journal.prune_completed(now=COMPLETED_RETENTION_SECONDS + 1)
+
+        self.assertEqual(removed, 0)
+        row = self.journal.get_return(request["id"])
+        self.assertEqual(row["agent_state"], "indeterminate")
+        self.assertEqual(json.loads(row["result_json"]), result)
+
     def test_pruning_expires_only_completed_success_and_failure(self):
         requests = {
             state: make_request()
@@ -362,7 +425,10 @@ class ControlServerTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_cli_receives_structured_acknowledgement(self):
+        observed = {}
+
         async def handler(request, _transition):
+            observed.update(request["params"])
             return {"echo": request["params"]["message"], "reply_mode": "one_way"}
 
         await self._start(handler)
@@ -391,6 +457,7 @@ class ControlServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response["ok"])
         self.assertEqual(response["result"]["echo"], "hello")
         self.assertEqual(response["result"]["reply_mode"], "one_way")
+        self.assertNotIn("timeout_ms", observed)
 
     def test_protocol_normalizes_uuid_and_preserves_one_way_params(self):
         request = make_request()
@@ -399,6 +466,27 @@ class ControlServerTests(unittest.IsolatedAsyncioTestCase):
         parsed = parse_request(encoded)
 
         self.assertEqual(parsed, request)
+
+    def test_protocol_rejects_control_characters_in_route_names(self):
+        for route in ("source\nClaimed target: forged", "source\x1btarget"):
+            request = make_request()
+            request["params"]["from"] = route
+            with (
+                self.subTest(route=repr(route)),
+                self.assertRaises(ProtocolError) as raised,
+            ):
+                parse_request(json.dumps(request).encode())
+            self.assertEqual(raised.exception.code, "invalid_params")
+
+    def test_protocol_rejects_async_callback_deadlines(self):
+        request = make_request()
+        request["params"].update({"return_final": True, "timeout_ms": 60_000})
+
+        with self.assertRaises(ProtocolError) as raised:
+            parse_request(json.dumps(request).encode())
+
+        self.assertEqual(raised.exception.code, "invalid_params")
+        self.assertIn("do not expire", str(raised.exception))
 
 
 if __name__ == "__main__":

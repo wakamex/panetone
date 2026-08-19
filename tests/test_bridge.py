@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.14"
-# dependencies = ["python-telegram-bot>=22.0", "slack-sdk>=3.0", "aiohttp"]
+# dependencies = ["python-telegram-bot>=22.0", "aiohttp"]
 # ///
 
 import asyncio
@@ -28,8 +28,6 @@ os.environ.update({
     "WEZ_SIG_ACCOUNT": "",
     "WEZ_SIG_OWNER": "",
     "WEZ_TG_DEBATE_CHAT": "0",
-    "WEZ_SLACK_BOT_TOKEN": "",
-    "WEZ_SLACK_APP_TOKEN": "",
 })
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -146,6 +144,19 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
         bridge._tg_stale_topics.clear()
         self.tmp.cleanup()
 
+    def test_removed_slack_configuration_fails_without_exposing_its_value(self):
+        with patch.dict(
+            os.environ,
+            {"WEZ_SLACK_BOT_TOKEN": "deprecated-secret"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Slack support was removed.*WEZ_SLACK_BOT_TOKEN",
+            ) as raised:
+                bridge._reject_removed_slack_configuration()
+        self.assertNotIn("deprecated-secret", str(raised.exception))
+
     def _configure_output(self, bot=None):
         bridge.pane_harness[9] = "codex"
         bridge.pane_tab[9] = 1
@@ -173,6 +184,27 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
             bot=bot,
             find_session=lambda _cwd: None,
         )
+
+    @staticmethod
+    def _agent_catalog():
+        return [
+            {
+                "pane_id": 11,
+                "agent_id": "source-agent",
+                "incarnation_id": "source-incarnation",
+                "name": "source_codex",
+                "harness": "codex",
+                "alive": True,
+            },
+            {
+                "pane_id": 22,
+                "agent_id": "target-agent",
+                "incarnation_id": "target-incarnation",
+                "name": "target_codex",
+                "harness": "codex",
+                "alive": True,
+            },
+        ]
 
     @staticmethod
     def _output_batch(messages, offset=200):
@@ -499,6 +531,15 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
             "Request: 00000000-0000-4000-8000-000000000001 [pending]\n"
             "do work",
         )
+        self.assertEqual(
+            order[1][1],
+            "[Panetone cross-agent message]\n"
+            "From: Source (codex)\n"
+            "To: Target (codex)\n"
+            "Request ID: 00000000-0000-4000-8000-000000000001\n"
+            "Reply mode: one-way\n\n"
+            "do work",
+        )
         self.assertEqual([state for state, _ in transitions], ["audit_posted", "delivering"])
         self.assertEqual(bridge.tab_last_source[2], "tg")
         self.assertEqual(result["reply_mode"], "one_way")
@@ -558,17 +599,102 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "telegram_audit_failed")
         send.assert_not_awaited()
 
-    def test_wakterm_return_capability_probe_reports_unsupported_command(self):
-        result = SimpleNamespace(
-            returncode=2,
-            stdout="",
-            stderr="error: unrecognized subcommand 'request'\n\nUsage: wakterm cli agent",
-        )
-        with patch.object(bridge.subprocess, "run", return_value=result):
+    def test_wakterm_return_capability_requires_safe_agent_api_boundary(self):
+        with patch.object(
+            bridge,
+            "_wakterm_json_sync",
+            return_value={
+                "schema": "wakterm.agent-api.v1",
+                "api_major": 1,
+                "capabilities": [
+                    "catalog.v1",
+                    "return_request_terminal_stream.v1",
+                ],
+            },
+        ):
             supported, reason = bridge._wakterm_return_capability_sync()
 
         self.assertFalse(supported)
-        self.assertEqual(reason, "error: unrecognized subcommand 'request'")
+        self.assertEqual(
+            reason, "missing Wakterm Agent API capabilities: prompt_admission.v1"
+        )
+
+    def test_route_binding_joins_fresh_catalog_by_ephemeral_pane(self):
+        route = {
+            "title": "Source",
+            "pane_id": 11,
+            "harness": "codex",
+            "topic_id": 41,
+        }
+
+        bound = bridge._bind_route_agent(route, self._agent_catalog())
+
+        self.assertEqual(bound["agent_id"], "source-agent")
+        self.assertEqual(bound["incarnation_id"], "source-incarnation")
+        self.assertEqual(bound["agent_name"], "source_codex")
+        self.assertEqual(bound["title"], "Source")
+
+    def test_agent_admission_uses_exact_identity_and_stable_request(self):
+        route = bridge._bind_route_agent(
+            {"title": "Source", "pane_id": 11, "harness": "codex"},
+            self._agent_catalog(),
+        )
+        request_id = bridge._return_callback_request_id(
+            "00000000-0000-4000-8000-000000000009"
+        )
+        response = {
+            "schema": "wakterm.agent-api.v1",
+            "request_id": request_id,
+            "status": "accepted",
+            "definitive": True,
+            "prompt_written": True,
+            "agent_id": "source-agent",
+            "incarnation_id": "source-incarnation",
+            "return_final": False,
+        }
+
+        with patch.object(
+            bridge, "_wakterm_json_sync", return_value=response
+        ) as command:
+            receipt = bridge._agent_admit_sync(
+                route, "callback", request_id=request_id
+            )
+
+        self.assertEqual(receipt, response)
+        command.assert_called_once_with(
+            "admit",
+            "source-agent",
+            "--exact-agent-id",
+            "--incarnation",
+            "source-incarnation",
+            "--request-id",
+            request_id,
+            input_text="callback",
+            timeout=10,
+        )
+
+    def test_agent_admission_rejects_unknown_receipt_status(self):
+        route = bridge._bind_route_agent(
+            {"title": "Source", "pane_id": 11, "harness": "codex"},
+            self._agent_catalog(),
+        )
+        request_id = "00000000-0000-4000-8000-000000000010"
+        response = {
+            "schema": "wakterm.agent-api.v1",
+            "request_id": request_id,
+            "status": "maybe",
+            "definitive": True,
+            "prompt_written": False,
+            "agent_id": "source-agent",
+            "incarnation_id": "source-incarnation",
+            "return_final": False,
+        }
+
+        with (
+            patch.object(bridge, "_wakterm_json_sync", return_value=response),
+            self.assertRaisesRegex(RuntimeError, "unknown status"),
+        ):
+            bridge._agent_admit_sync(route, "callback", request_id=request_id)
 
     async def test_return_final_fails_before_any_side_effect_when_unsupported(self):
         bridge._wakterm_return_supported = False
@@ -597,6 +723,42 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
         refresh.assert_not_awaited()
         send.assert_not_awaited()
 
+    async def test_return_final_fails_closed_when_route_binding_changes(self):
+        order = []
+        bot = FakeControlBot(order)
+        self._configure_control(bot)
+        before = self._agent_catalog()
+        after = json.loads(json.dumps(before))
+        after[0]["agent_id"] = "replacement-source"
+        after[0]["incarnation_id"] = "replacement-incarnation"
+        send = AsyncMock()
+        request = {
+            "id": "00000000-0000-4000-8000-000000000012",
+            "params": {
+                "from": "Source",
+                "to": "Target",
+                "message": "do work",
+                "return_final": True,
+            },
+        }
+
+        with (
+            patch.object(bridge, "_refresh_telegram_routes", AsyncMock()),
+            patch.object(
+                bridge,
+                "_wakterm_agent_catalog_sync",
+                side_effect=[before, after],
+            ),
+            patch.object(bridge, "agent_send", send),
+            self.assertRaises(bridge.RequestFailure) as raised,
+        ):
+            await bridge._handle_control_send(request, AsyncMock())
+
+        self.assertEqual(raised.exception.code, "return_final_unavailable")
+        self.assertFalse(raised.exception.indeterminate)
+        self.assertEqual(bot.sent, [])
+        send.assert_not_awaited()
+
     async def test_return_final_registers_route_before_wakterm_submission(self):
         order = []
         bot = FakeControlBot(order)
@@ -613,16 +775,27 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
         async def transition(_state, _progress=None):
             return None
 
-        async def agent_send(pid, text, **kwargs):
+        async def agent_admit(route, text, **kwargs):
             order.append(("wakterm", text))
-            self.assertEqual(pid, 22)
+            self.assertEqual(route["agent_id"], "target-agent")
+            self.assertEqual(route["incarnation_id"], "target-incarnation")
+            self.assertEqual(
+                text,
+                "[Panetone cross-agent message]\n"
+                "From: Source (codex)\n"
+                "To: Target (codex)\n"
+                "Request ID: 00000000-0000-4000-8000-000000000004\n"
+                "Reply mode: asynchronous final callback\n\n"
+                "do work",
+            )
             self.assertTrue(kwargs["return_final"])
             self.assertEqual(
                 kwargs["request_id"], "00000000-0000-4000-8000-000000000004"
             )
             return {
-                "request_id": kwargs["request_id"],
-                "reply_pending": True,
+                "status": "accepted",
+                "definitive": True,
+                "prompt_written": True,
             }
 
         request = {
@@ -632,12 +805,16 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
                 "to": "Target",
                 "message": "do work",
                 "return_final": True,
-                "timeout_ms": 5000,
             },
         }
         with (
             patch.object(bridge, "_refresh_telegram_routes", AsyncMock()),
-            patch.object(bridge, "agent_send", AsyncMock(side_effect=agent_send)),
+            patch.object(
+                bridge,
+                "_wakterm_agent_catalog_sync",
+                return_value=self._agent_catalog(),
+            ),
+            patch.object(bridge, "agent_admit", AsyncMock(side_effect=agent_admit)),
         ):
             result = await bridge._handle_control_send(request, transition, journal)
 
@@ -645,6 +822,55 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(kinds.index("registered"), kinds.index("wakterm"))
         self.assertEqual(result["reply_mode"], "return_final")
         self.assertTrue(result["reply_pending"])
+
+    async def test_busy_target_is_definitive_and_discards_unused_return_route(self):
+        order = []
+        bot = FakeControlBot(order)
+        self._configure_control(bot)
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.ControlJournal(Path(tmp) / "journal.sqlite3")
+            journal.initialize()
+            request_id = "00000000-0000-4000-8000-000000000013"
+            request = {
+                "id": request_id,
+                "params": {
+                    "from": "Source",
+                    "to": "Target",
+                    "message": "do work",
+                    "return_final": True,
+                },
+            }
+            admit = AsyncMock(
+                return_value={
+                    "status": "busy",
+                    "definitive": True,
+                    "prompt_written": False,
+                    "detail": "target is busy",
+                }
+            )
+
+            with (
+                patch.object(bridge, "_refresh_telegram_routes", AsyncMock()),
+                patch.object(
+                    bridge,
+                    "_wakterm_agent_catalog_sync",
+                    return_value=self._agent_catalog(),
+                ),
+                patch.object(bridge, "agent_admit", admit),
+                self.assertRaises(bridge.RequestFailure) as raised,
+            ):
+                await bridge._handle_control_send(request, AsyncMock(), journal)
+
+            self.assertEqual(raised.exception.code, "wakterm_delivery_rejected")
+            self.assertFalse(raised.exception.indeterminate)
+            self.assertIsNone(journal.get_return(request_id))
+            self.assertEqual(len(bot.sent), 2)
+            self.assertIn("no prompt was written", bot.sent[1][1])
+            admitted_route = admit.await_args.args[0]
+            self.assertEqual(admitted_route["agent_id"], "target-agent")
+            self.assertEqual(
+                admitted_route["incarnation_id"], "target-incarnation"
+            )
 
     async def test_terminal_return_event_delivers_each_destination_once(self):
         order = []
@@ -661,6 +887,8 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
                     "pane_id": 11,
                     "harness": "codex",
                     "topic_id": 101,
+                    "agent_id": "source-agent",
+                    "incarnation_id": "source-incarnation",
                 },
                 {
                     "title": "Target",
@@ -676,20 +904,189 @@ class BridgeStateTests(unittest.IsolatedAsyncioTestCase):
                 "terminal_event_sequence": 9,
             }
             bridge._return_delivery_lock = asyncio.Lock()
-            send = AsyncMock(return_value={"submitted": True})
-            with (
-                patch.object(bridge, "_refresh_telegram_routes", AsyncMock()),
-                patch.object(bridge, "agent_send", send),
-            ):
+            admit = AsyncMock(
+                return_value={
+                    "status": "accepted",
+                    "definitive": True,
+                    "prompt_written": True,
+                }
+            )
+            with patch.object(bridge, "agent_admit", admit):
                 await bridge._handle_wakterm_return_event(result, journal)
                 await bridge._handle_wakterm_return_event(result, journal)
 
-            send.assert_awaited_once()
+            admit.assert_awaited_once()
+            self.assertEqual(
+                admit.await_args.kwargs["request_id"],
+                bridge._return_callback_request_id(request_id),
+            )
             self.assertEqual(len(bot.sent), 1)
             self.assertIn("full final response", bot.sent[0][1])
             self.assertEqual(journal.event_cursor(), 9)
             row = journal.get_return(request_id)
             self.assertEqual(row["agent_state"], "delivered")
+            self.assertEqual(row["telegram_state"], "delivered")
+
+    async def test_busy_source_callback_stays_queued_with_stable_admission_id(self):
+        order = []
+        bot = FakeControlBot(order)
+        self._configure_control(bot)
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.ControlJournal(Path(tmp) / "journal.sqlite3")
+            journal.initialize()
+            request_id = "00000000-0000-4000-8000-000000000007"
+            source = {
+                "title": "Source",
+                "pane_id": 11,
+                "harness": "codex",
+                "topic_id": 101,
+                "agent_id": "source-agent",
+                "incarnation_id": "source-incarnation",
+            }
+            journal.register_return_route(
+                request_id,
+                source,
+                {"title": "Target", "harness": "codex"},
+            )
+            journal.record_return_result(
+                request_id,
+                {
+                    "request_id": request_id,
+                    "state": "completed",
+                    "final_message": "done",
+                },
+            )
+            bridge._return_delivery_lock = asyncio.Lock()
+            admit = AsyncMock(
+                side_effect=[
+                    {
+                        "status": "busy",
+                        "definitive": True,
+                        "prompt_written": False,
+                        "detail": "source is busy",
+                    },
+                    {
+                        "status": "accepted",
+                        "definitive": True,
+                        "prompt_written": True,
+                    },
+                ]
+            )
+
+            with patch.object(bridge, "agent_admit", admit):
+                await bridge._deliver_return(request_id, journal)
+                first = journal.get_return(request_id)
+                self.assertEqual(first["agent_state"], "pending")
+                self.assertEqual(first["telegram_state"], "delivered")
+                await bridge._deliver_return(request_id, journal)
+
+            self.assertEqual(admit.await_count, 2)
+            callback_ids = {
+                call.kwargs["request_id"] for call in admit.await_args_list
+            }
+            self.assertEqual(
+                callback_ids, {bridge._return_callback_request_id(request_id)}
+            )
+            row = journal.get_return(request_id)
+            self.assertEqual(row["agent_state"], "delivered")
+            self.assertEqual(len(bot.sent), 1)
+
+    async def test_stale_source_incarnation_is_not_rebound_by_title(self):
+        order = []
+        bot = FakeControlBot(order)
+        self._configure_control(bot)
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.ControlJournal(Path(tmp) / "journal.sqlite3")
+            journal.initialize()
+            request_id = "00000000-0000-4000-8000-000000000008"
+            journal.register_return_route(
+                request_id,
+                {
+                    "title": "Source",
+                    "pane_id": 11,
+                    "harness": "codex",
+                    "topic_id": 101,
+                    "agent_id": "source-agent",
+                    "incarnation_id": "source-incarnation",
+                },
+                {"title": "Target", "harness": "codex"},
+            )
+            journal.record_return_result(
+                request_id,
+                {
+                    "request_id": request_id,
+                    "state": "completed",
+                    "final_message": "durable result",
+                },
+            )
+            bridge._return_delivery_lock = asyncio.Lock()
+            admit = AsyncMock(
+                return_value={
+                    "status": "stale_incarnation",
+                    "definitive": True,
+                    "prompt_written": False,
+                    "detail": "source process changed",
+                }
+            )
+            refresh = AsyncMock()
+
+            with (
+                patch.object(bridge, "agent_admit", admit),
+                patch.object(bridge, "_refresh_telegram_routes", refresh),
+            ):
+                await bridge._deliver_return(request_id, journal)
+
+            refresh.assert_not_awaited()
+            row = journal.get_return(request_id)
+            self.assertEqual(row["agent_state"], "failed")
+            self.assertEqual(row["telegram_state"], "delivered")
+            self.assertIn("durable result", bot.sent[0][1])
+
+    async def test_indeterminate_callback_is_never_retried(self):
+        order = []
+        bot = FakeControlBot(order)
+        self._configure_control(bot)
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.ControlJournal(Path(tmp) / "journal.sqlite3")
+            journal.initialize()
+            request_id = "00000000-0000-4000-8000-000000000011"
+            journal.register_return_route(
+                request_id,
+                {
+                    "title": "Source",
+                    "pane_id": 11,
+                    "harness": "codex",
+                    "topic_id": 101,
+                    "agent_id": "source-agent",
+                    "incarnation_id": "source-incarnation",
+                },
+                {"title": "Target", "harness": "codex"},
+            )
+            journal.record_return_result(
+                request_id,
+                {
+                    "request_id": request_id,
+                    "state": "completed",
+                    "final_message": "durable result",
+                },
+            )
+            bridge._return_delivery_lock = asyncio.Lock()
+            admit = AsyncMock(
+                return_value={
+                    "status": "indeterminate",
+                    "definitive": False,
+                    "prompt_written": None,
+                    "detail": "prompt write receipt was lost",
+                }
+            )
+
+            with patch.object(bridge, "agent_admit", admit):
+                await bridge._deliver_return(request_id, journal)
+                await bridge._deliver_return(request_id, journal)
+
+            admit.assert_awaited_once()
+            row = journal.get_return(request_id)
+            self.assertEqual(row["agent_state"], "indeterminate")
             self.assertEqual(row["telegram_state"], "delivered")
 
     async def test_shutdown_cancels_owned_background_tasks(self):

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.14"
-# dependencies = ["python-telegram-bot>=22.0", "slack-sdk>=3.0", "aiohttp"]
+# dependencies = ["python-telegram-bot>=22.0", "aiohttp"]
 # ///
 """panetone: wakterm <> telegram/signal bridge for multiple AI coding agents
 
@@ -21,12 +21,6 @@ Env (Signal — all three required to enable):
   WEZ_SIG_SOCKET         - path to signal-cli UNIX socket
   WEZ_SIG_ACCOUNT        - signal-cli registered number (the "bot")
   WEZ_SIG_OWNER          - your personal Signal number (invited to groups)
-
-Env (Slack observer — all three required to enable):
-  WEZ_SLACK_BOT_TOKEN    - Slack bot user OAuth token (xoxb-...)
-  WEZ_SLACK_APP_TOKEN    - Slack app-level token for Socket Mode (xapp-...)
-  WEZ_SLACK_CHANNELS     - comma-separated Slack channel IDs to observe
-  WEZ_SLACK_TABS         - comma-separated tab name patterns to observe
 
 Env (local control interface):
   PANETONE_CONTROL_SOCKET  - Panetone-owned UNIX socket path
@@ -126,22 +120,27 @@ DEBATE_CHAT = int(os.environ.get("WEZ_TG_DEBATE_CHAT", "0"))
 DEBATE_TABS = [t.strip().lower() for t in os.environ.get("WEZ_TG_DEBATE_TABS", "").split(",") if t.strip()]
 DEBATE_ENABLED = bool(DEBATE_CHAT and DEBATE_TABS)
 
-SLACK_BOT_TOKEN = os.environ.get("WEZ_SLACK_BOT_TOKEN", "")
-SLACK_APP_TOKEN = os.environ.get("WEZ_SLACK_APP_TOKEN", "")
-SLACK_CHANNELS = {s.strip() for s in os.environ.get("WEZ_SLACK_CHANNELS", "").split(",") if s.strip()}
-SLACK_TABS = [t.strip().lower() for t in os.environ.get("WEZ_SLACK_TABS", "").split(",") if t.strip()]
-# direct channels: WEZ_SLACK_DIRECT=C0CHAN1:tab1,C0CHAN2:tab2
-SLACK_DIRECT = {}  # channel_id -> tab_pattern
-for _entry in os.environ.get("WEZ_SLACK_DIRECT", "").split(","):
-    if ":" in _entry:
-        _ch, _tab = _entry.strip().split(":", 1)
-        if _ch and _tab:
-            SLACK_DIRECT[_ch.strip()] = _tab.strip().lower()
-            SLACK_CHANNELS.add(_ch.strip())
-SLACK_ENABLED = bool(SLACK_BOT_TOKEN and SLACK_APP_TOKEN and (SLACK_CHANNELS or SLACK_DIRECT))
-
 MSG_TZ = os.environ.get("WEZ_MSG_TZ", "America/New_York")
 MSG_TIMESTAMPS = os.environ.get("WEZ_MSG_TIMESTAMPS", "1") != "0"
+
+REMOVED_SLACK_ENV = (
+    "WEZ_SLACK_BOT_TOKEN",
+    "WEZ_SLACK_APP_TOKEN",
+    "WEZ_SLACK_CHANNELS",
+    "WEZ_SLACK_TABS",
+    "WEZ_SLACK_DIRECT",
+    "PANETONE_SLACK_API_BASE",
+    "PANETONE_SLACK_SOCKET_URL",
+)
+
+
+def _reject_removed_slack_configuration():
+    configured = [name for name in REMOVED_SLACK_ENV if os.environ.get(name)]
+    if configured:
+        raise RuntimeError(
+            "Slack support was removed; delete the deprecated configuration: "
+            + ", ".join(configured)
+        )
 
 # --- wakterm cli -----------------------------------------------------------
 
@@ -170,6 +169,10 @@ def _find_wakterm():
 
 WAKTERM_BIN = _find_wakterm()
 WAKTERM_SOCKET = _get_terminal_env("WAKTERM_UNIX_SOCKET", "WEZTERM_UNIX_SOCKET")
+WAKTERM_AGENT_API_SCHEMA = "wakterm.agent-api.v1"
+RETURN_CALLBACK_NAMESPACE = uuid.uuid5(
+    uuid.NAMESPACE_URL, "https://panetone.dev/control/v1/return-agent-callback"
+)
 print(f"[wakterm] binary: {WAKTERM_BIN}, socket: {WAKTERM_SOCKET or '(auto)'}")
 
 
@@ -256,28 +259,190 @@ def _agent_send_sync(pid, text, *, return_final=False, request_id=None, timeout_
     return receipt
 
 
-def _wakterm_return_capability_sync():
-    """Probe return-request support once without creating a request."""
+def _wakterm_json_sync(*args, input_text=None, timeout=5):
+    """Run a Wakterm Agent API command and require one JSON object."""
     try:
         result = subprocess.run(
-            [WAKTERM_BIN, "cli", "agent", "request", "watch", "--help"],
+            [WAKTERM_BIN, "cli", "agent", *args],
+            input=input_text,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=timeout,
             check=False,
         )
-    except subprocess.TimeoutExpired:
-        return False, "capability probe timed out"
-    except FileNotFoundError:
-        return False, f"Wakterm binary not found: {WAKTERM_BIN}"
-    if result.returncode == 0:
-        return True, None
-    detail = result.stderr.strip() or result.stdout.strip() or "unsupported command"
-    return False, detail.splitlines()[0]
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"Wakterm agent {' '.join(args)} timed out") from error
+    except FileNotFoundError as error:
+        raise RuntimeError(f"Wakterm binary not found: {WAKTERM_BIN}") from error
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown Wakterm error"
+        raise RuntimeError(
+            f"Wakterm agent {' '.join(args)} failed (rc={result.returncode}): {detail}"
+        )
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            f"Wakterm agent {' '.join(args)} returned invalid JSON"
+        ) from error
+    if not isinstance(value, dict):
+        raise RuntimeError(f"Wakterm agent {' '.join(args)} returned a non-object")
+    return value
+
+
+def _wakterm_return_capability_sync():
+    """Negotiate the complete safe return-final capability set."""
+    try:
+        response = _wakterm_json_sync("capabilities")
+    except RuntimeError as error:
+        return False, str(error).splitlines()[0]
+    if (
+        response.get("schema") != WAKTERM_AGENT_API_SCHEMA
+        or response.get("api_major") != 1
+    ):
+        return False, "incompatible Wakterm Agent API schema"
+    capabilities = response.get("capabilities")
+    required = {
+        "catalog.v1",
+        "prompt_admission.v1",
+        "return_request_terminal_stream.v1",
+    }
+    available = (
+        set(capabilities)
+        if isinstance(capabilities, list)
+        and all(isinstance(capability, str) for capability in capabilities)
+        else set()
+    )
+    if not required.issubset(available):
+        missing = sorted(required.difference(available))
+        return False, f"missing Wakterm Agent API capabilities: {', '.join(missing)}"
+    return True, None
+
+
+def _wakterm_agent_catalog_sync():
+    catalog = _wakterm_json_sync("catalog")
+    if catalog.get("schema") != WAKTERM_AGENT_API_SCHEMA:
+        raise RuntimeError("Wakterm agent catalog has an incompatible schema")
+    agents = catalog.get("agents")
+    if not isinstance(agents, list):
+        raise RuntimeError("Wakterm agent catalog is missing agents")
+    return agents
+
+
+def _bind_route_agent(route, agents):
+    matches = [
+        agent
+        for agent in agents
+        if isinstance(agent, dict) and agent.get("pane_id") == route["pane_id"]
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"route {route['title']!r} pane {route['pane_id']} did not match exactly one "
+            "Wakterm catalog agent"
+        )
+    agent = matches[0]
+    agent_id = agent.get("agent_id")
+    incarnation_id = agent.get("incarnation_id")
+    if agent.get("harness") != route["harness"]:
+        raise RuntimeError(
+            f"route {route['title']!r} and Wakterm catalog disagree on harness"
+        )
+    if not agent.get("alive") or not isinstance(agent_id, str) or not isinstance(
+        incarnation_id, str
+    ):
+        raise RuntimeError(f"route {route['title']!r} has no live Wakterm incarnation")
+    return {
+        **route,
+        "agent_id": agent_id,
+        "incarnation_id": incarnation_id,
+        "agent_name": agent.get("name"),
+    }
+
+
+def _bind_stable_route_agent(route, before_agents, after_agents):
+    before = _bind_route_agent(route, before_agents)
+    after = _bind_route_agent(route, after_agents)
+    identity_fields = ("agent_id", "incarnation_id", "pane_id", "harness")
+    if any(before[field] != after[field] for field in identity_fields):
+        raise RuntimeError(
+            f"route {route['title']!r} changed Wakterm binding during resolution"
+        )
+    return after
+
+
+def _return_callback_request_id(request_id):
+    return str(uuid.uuid5(RETURN_CALLBACK_NAMESPACE, request_id))
+
+
+def _agent_admit_sync(
+    route, text, *, request_id, return_final=False, timeout_ms=0
+):
+    command = [
+        "admit",
+        route["agent_id"],
+        "--exact-agent-id",
+        "--incarnation",
+        route["incarnation_id"],
+        "--request-id",
+        request_id,
+    ]
+    if return_final:
+        command.append("--return-final")
+        if timeout_ms:
+            command.extend(["--final-timeout-ms", str(timeout_ms)])
+    receipt = _wakterm_json_sync(*command, input_text=text, timeout=10)
+    if receipt.get("schema") != WAKTERM_AGENT_API_SCHEMA:
+        raise RuntimeError("Wakterm admission receipt has an incompatible schema")
+    if receipt.get("request_id") != request_id:
+        raise RuntimeError("Wakterm admission receipt has the wrong request ID")
+    if receipt.get("agent_id") != route["agent_id"] or receipt.get(
+        "incarnation_id"
+    ) != route["incarnation_id"]:
+        raise RuntimeError("Wakterm admission receipt has the wrong agent identity")
+    if receipt.get("return_final") is not return_final:
+        raise RuntimeError("Wakterm admission receipt has the wrong return mode")
+    status = receipt.get("status")
+    definitive = receipt.get("definitive")
+    prompt_written = receipt.get("prompt_written")
+    known_statuses = {
+        "accepted",
+        "busy",
+        "unsupported",
+        "unavailable",
+        "stale_incarnation",
+        "invalid",
+        "observer_failure",
+        "internal_failure",
+        "indeterminate",
+    }
+    if status not in known_statuses:
+        raise RuntimeError(f"Wakterm admission receipt has unknown status {status!r}")
+    if status == "accepted":
+        valid = definitive is True and prompt_written is True
+    elif status == "indeterminate":
+        valid = definitive is False and prompt_written is None
+    else:
+        valid = definitive is True and prompt_written is False
+    if not valid:
+        raise RuntimeError("Wakterm admission receipt has inconsistent delivery fields")
+    return receipt
 
 
 async def agent_send(pid, text, **kwargs):
     return await asyncio.to_thread(_agent_send_sync, pid, text, **kwargs)
+
+
+async def agent_admit(
+    route, text, *, request_id, return_final=False, timeout_ms=0
+):
+    return await asyncio.to_thread(
+        _agent_admit_sync,
+        route,
+        text,
+        request_id=request_id,
+        return_final=return_final,
+        timeout_ms=timeout_ms,
+    )
 
 
 async def send_text(pid, text):
@@ -659,34 +824,6 @@ def _ts_from_millis(timestamp):
     return datetime.fromtimestamp(
         int(timestamp) / 1000, ZoneInfo(MSG_TZ)
     ).strftime("%H:%M")
-
-
-def _md_tables_to_slack(text):
-    """Convert markdown tables to monospace code blocks for Slack."""
-    lines = text.split("\n")
-    out, table, in_table = [], [], False
-    for line in lines:
-        stripped = line.strip()
-        if re.match(r"^\|.*\|$", stripped):
-            if re.match(r"^\|[-\s|:]+\|$", stripped):
-                continue  # skip separator row
-            cells = [c.strip() for c in stripped.strip("|").split("|")]
-            table.append(cells)
-            in_table = True
-        else:
-            if in_table:
-                # compute column widths and format
-                widths = [max(len(r[i]) for r in table) for i in range(len(table[0]))]
-                for row in table:
-                    out.append("  ".join(c.ljust(widths[i]) for i, c in enumerate(row)))
-                out.append("")
-                table, in_table = [], False
-            out.append(line)
-    if table:
-        widths = [max(len(r[i]) for r in table) for i in range(len(table[0]))]
-        for row in table:
-            out.append("  ".join(c.ljust(widths[i]) for i, c in enumerate(row)))
-    return "\n".join(out)
 
 
 def _chunkify(text, limit=4000):
@@ -1197,14 +1334,6 @@ _signal_client = None
 _signal_cmd_queue = []  # [(text, group_id, tab_id), ...]
 _signal_input_queue = []  # [(data, tab_id, group_id, is_mention), ...]
 
-# slack observer state
-_slack_msg_buffer = {}     # channel_id -> [(ts, user_id_or_None, text), ...]
-_slack_obs_queue = []      # [(extra_text, user_id, channel_id), ...] !obs triggers
-_slack_reply_channel = None  # set by !obs, cleared after agent responds
-_slack_direct_tab = {}     # tab_id -> channel_id (for direct channel output)
-_slack_direct_queue = []   # [(text, user_id, channel_id), ...] direct channel messages
-_slack_web_client = None   # AsyncWebClient, set in startup
-_slack_bot_user_id = None  # our own bot user id, to skip self-echo
 last_source_name = {}  # stable title_lower -> last output channel
 
 
@@ -1755,6 +1884,12 @@ def _pending_item(raw):
         or not h_name
     ):
         raise ValueError("incomplete pending-send item")
+    if kind == "slack":
+        raise ValueError(
+            f"pending Slack delivery {item_id!r} cannot be loaded because Slack support was removed"
+        )
+    if kind not in {"tg", "sig", "debate"}:
+        raise ValueError(f"unsupported pending-send channel {kind!r}")
     return (
         str(kind), target, chunk, int(pid), str(h_name),
         _telegram_topic_key(route), str(item_id),
@@ -1902,8 +2037,6 @@ async def _deliver(kind, target, chunk, pid, h_name, route_name="", _item_id=Non
         elif kind == "debate":
             sent = await bot.send_message(target, chunk)
             debate_msg_pane[sent.message_id] = pid
-        elif kind == "slack":
-            await _slack_web_client.chat_postMessage(channel=target, text=chunk)
         return True
     except Exception as e:
         if kind == "tg" and isinstance(e, RetryAfter):
@@ -2013,24 +2146,14 @@ def _pane_main_route(pid):
         return ("sig", gid, "") if gid else None
     if source == "debate" and DEBATE_ENABLED and _tab_match(title, DEBATE_TABS):
         return ("debate", DEBATE_CHAT, "")
-    if source == "slack" and SLACK_ENABLED and tab_id in _slack_direct_tab:
-        return ("slack", _slack_direct_tab[tab_id], "")
     return None
 
 
 def _pane_output_ready(pid):
-    if _pane_main_route(pid):
-        return True
-    tab_id = pane_tab.get(pid)
-    return bool(
-        SLACK_ENABLED
-        and _slack_reply_channel
-        and _tab_match(tab_topic_name.get(tab_id, ""), SLACK_TABS)
-    )
+    return bool(_pane_main_route(pid))
 
 
 async def check_output():
-    global _slack_reply_channel
     pids = [pid for pid in pane_harness if _pane_output_ready(pid)]
     cursor_snapshot = {
         key: dict(value) for key, value in _source_cursors.items()
@@ -2046,7 +2169,6 @@ async def check_output():
     new_items = []
     cursor_updates = {}
     collab_batches = []
-    slack_reply = _slack_reply_channel
     for result in results:
         if not result or isinstance(result, Exception):
             continue
@@ -2057,15 +2179,10 @@ async def check_output():
             continue
         tab_id = pane_tab.get(pid)
         main_route = _pane_main_route(pid)
-        slack_observer = bool(
-            SLACK_ENABLED
-            and slack_reply
-            and _tab_match(tab_topic_name.get(tab_id, ""), SLACK_TABS)
-        )
         # A route may disappear while the worker thread reads. In that case,
         # leave the cursor untouched so the batch is retried after routing is
         # restored.
-        if messages and not main_route and not slack_observer:
+        if messages and not main_route:
             continue
         source_key = result["source_key"]
         if cursor_snapshot.get(source_key) != result["cursor"]:
@@ -2079,8 +2196,6 @@ async def check_output():
                 outgoing = msg
                 if kind == "sig":
                     outgoing = f"{h.display_name}: {msg}"
-                elif kind == "slack":
-                    outgoing = _md_tables_to_slack(msg)
                 for chunk in _chunkify(outgoing):
                     new_items.append(_new_pending_item(
                         kind, target, chunk, pid, h.name, route_name,
@@ -2088,21 +2203,10 @@ async def check_output():
             if main_route and main_route[0] == "sig":
                 tab = tab_topic_name.get(tab_id, "?")
                 print(f"[check_output] sending to signal: {tab}/{h.name} msg={msg[:60]}")
-            # slack observer (reply to !obs, then clear)
-            if slack_observer and slack_reply:
-                slack_msg = _md_tables_to_slack(msg)
-                for chunk in _chunkify(slack_msg):
-                    new_items.append(_new_pending_item(
-                        "slack", slack_reply, chunk, pid, h.name,
-                    ))
-                slack_reply = None
-                slack_observer = False
             collab_batches.append((pid, h, tab_id, msg))
 
     if new_items or cursor_updates:
         _commit_delivery(new_items, cursor_updates)
-        if _slack_reply_channel and slack_reply is None:
-            _slack_reply_channel = None
     await _flush_pending()
 
     for pid, h, tab_id, msg in collab_batches:
@@ -2169,7 +2273,7 @@ clod_off_groups = set()  # stable Signal group_ids muted via /clodoff
 _legacy_clod_off_tabs = set()  # pre-migration tab_ids loaded from old state
 debate_msg_pane = {}  # msg_id -> pane_id (reply routing for debate chat)
 debate_crosspost = False  # auto-forward between harnesses in debate tabs (toggle with /crosspost)
-tab_last_source = {}  # tab_id -> "tg"|"sig"|"debate"|"slack" (last input channel)
+tab_last_source = {}  # tab_id -> "tg"|"sig"|"debate" (last input channel)
 
 
 def _other_panes(tab_id, src_pid):
@@ -2252,135 +2356,6 @@ async def _handle_debate_message(m, sender="?"):
 async def _debate_handle_command(m):
     """Handle /commands in the debate chat (currently none — just ignore)."""
     pass
-
-
-# --- slack observer -------------------------------------------------------
-
-async def _slack_receive_task():
-    from slack_sdk.socket_mode.aiohttp import SocketModeClient as SMClient
-    from slack_sdk.socket_mode.response import SocketModeResponse
-
-    sm = SMClient(app_token=SLACK_APP_TOKEN, web_client=_slack_web_client)
-
-    async def handler(client, req):
-        if req.type == "events_api":
-            event = req.payload.get("event", {})
-            subtype = event.get("subtype")
-            if (event.get("type") == "message"
-                    and subtype in (None, "bot_message")
-                    and event.get("channel") in SLACK_CHANNELS):
-                text = event.get("text", "")
-                user_id = event.get("user", "")
-                channel = event.get("channel")
-                bot_id = event.get("bot_id")
-                ts = float(event.get("ts", 0))
-                buf = _slack_msg_buffer.setdefault(channel, [])
-                if bot_id and bot_id == _slack_bot_user_id:
-                    pass  # skip our own output
-                elif channel in SLACK_DIRECT:
-                    if not bot_id:
-                        _slack_direct_queue.append((text, user_id, channel))
-                elif bot_id:
-                    buf.append((ts, None, text))
-                elif text.startswith("!obs"):
-                    _slack_obs_queue.append((text[4:].strip(), user_id, channel))
-                else:
-                    buf.append((ts, user_id, text))
-            await client.send_socket_mode_response(
-                SocketModeResponse(envelope_id=req.envelope_id))
-
-    sm.socket_mode_request_listeners.append(handler)
-    await sm.connect()
-    while True:
-        await asyncio.sleep(60)
-
-
-_slack_user_cache = {}     # user_id -> display_name
-_slack_channel_cache = {}  # channel_id -> #channel_name
-
-
-async def _resolve_slack_user(user_id):
-    if user_id not in _slack_user_cache:
-        try:
-            info = await _slack_web_client.users_info(user=user_id)
-            profile = info["user"]["profile"]
-            _slack_user_cache[user_id] = (
-                profile.get("display_name_normalized")
-                or profile.get("real_name_normalized")
-                or info["user"].get("real_name")
-                or user_id
-            )
-        except Exception as e:
-            print(f"[slack] users_info({user_id}) failed: {e}")
-            _slack_user_cache[user_id] = user_id
-    return _slack_user_cache[user_id]
-
-
-async def _resolve_slack_channel(channel_id):
-    if channel_id not in _slack_channel_cache:
-        try:
-            info = await _slack_web_client.conversations_info(channel=channel_id)
-            _slack_channel_cache[channel_id] = f"#{info['channel']['name']}"
-        except Exception:
-            _slack_channel_cache[channel_id] = f"#{channel_id}"
-    return _slack_channel_cache[channel_id]
-
-
-async def _process_slack_queue():
-    global _slack_reply_channel
-    while _slack_obs_queue:
-        extra, obs_user_id, channel = _slack_obs_queue.pop(0)
-        tab_id = _find_tab(SLACK_TABS)
-        if tab_id is None:
-            print("[slack] no matching tab for !obs")
-            continue
-        # flush Slack message buffer → pane
-        all_msgs = []
-        for ch_id in list(_slack_msg_buffer):
-            buf = _slack_msg_buffer.pop(ch_id)
-            for ts, uid, text in buf:
-                all_msgs.append((ts, ch_id, uid, text))
-        all_msgs.sort(key=lambda x: x[0])
-        parts = []
-        from datetime import datetime
-        for ts, ch_id, uid, text in all_msgs:
-            ch_name = await _resolve_slack_channel(ch_id)
-            t = datetime.fromtimestamp(ts).strftime("%H:%M") if ts else "??:??"
-            if uid:
-                name = await _resolve_slack_user(uid)
-                parts.append(f"[slack: {ch_name} {t}] {name}: {text}")
-            else:
-                parts.append(f"[slack: {ch_name} {t}] {text}")
-        if extra:
-            ch_name = await _resolve_slack_channel(channel)
-            name = await _resolve_slack_user(obs_user_id)
-            t = datetime.now().strftime("%H:%M")
-            parts.append(f"[slack: {ch_name} {t}] {name}: {extra}")
-        if parts:
-            payload = "\n".join(parts)
-            pid = _resolve_pid(tab_id)
-            await _route_to_pane(pid, tab_id, payload, "slack")
-            _slack_reply_channel = channel
-            print(f"[slack] flushed {len(parts)} input messages to pane ({channel})")
-
-
-async def _process_slack_direct():
-    while _slack_direct_queue:
-        text, user_id, channel = _slack_direct_queue.pop(0)
-        tab_pattern = SLACK_DIRECT.get(channel)
-        if not tab_pattern:
-            continue
-        tab_id = _find_tab([tab_pattern])
-        if tab_id is None:
-            print(f"[slack-direct] no tab matching '{tab_pattern}', dropped: '{text[:50]}'")
-            continue
-        name = await _resolve_slack_user(user_id)
-        ts = f" [{_now_ts()}]" if MSG_TIMESTAMPS else ""
-        prefixed = f"{name}{ts} says: {text}"
-        pid = _resolve_pid(tab_id)
-        _set_tab_last_source(tab_id, "slack")
-        _slack_direct_tab[tab_id] = channel
-        await _route_to_pane(pid, tab_id, prefixed, "slack-direct")
 
 
 async def on_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
@@ -2993,6 +2968,18 @@ async def _control_success_annotation(
             }
 
 
+def _control_prompt_envelope(request_id, source, target, message, return_final):
+    reply_mode = "asynchronous final callback" if return_final else "one-way"
+    return (
+        "[Panetone cross-agent message]\n"
+        f"From: {source['title']} ({source['harness']})\n"
+        f"To: {target['title']} ({target['harness']})\n"
+        f"Request ID: {request_id}\n"
+        f"Reply mode: {reply_mode}\n\n"
+        f"{message}"
+    )
+
+
 async def _handle_control_send(request, transition, journal=None):
     params = request["params"]
     request_id = request["id"]
@@ -3003,9 +2990,39 @@ async def _handle_control_send(request, transition, journal=None):
             "Wakterm does not support durable return requests; no delivery was attempted",
             details={"reason": _wakterm_return_unavailable_reason},
         )
+    before_agents = None
+    if return_final:
+        try:
+            before_agents = await asyncio.to_thread(_wakterm_agent_catalog_sync)
+        except Exception as error:
+            raise RequestFailure(
+                "return_final_unavailable",
+                "Wakterm could not establish a stable live-agent snapshot; "
+                "no delivery was attempted",
+                details={"reason": str(error)},
+            ) from error
     await _refresh_telegram_routes()
     source = _control_route(params["from"])
     target = _control_route(params["to"])
+    if return_final:
+        try:
+            after_agents = await asyncio.to_thread(_wakterm_agent_catalog_sync)
+            source = _bind_stable_route_agent(source, before_agents, after_agents)
+            target = _bind_stable_route_agent(target, before_agents, after_agents)
+        except Exception as error:
+            raise RequestFailure(
+                "return_final_unavailable",
+                "Wakterm could not bind the return request to exact live agents; "
+                "no delivery was attempted",
+                details={"reason": str(error)},
+            ) from error
+    delivered_prompt = _control_prompt_envelope(
+        request_id,
+        source,
+        target,
+        params["message"],
+        return_final,
+    )
     source_harness = harnesses.get(source["harness"])
     bot = source_harness.bot if source_harness else _primary_bot
     if not bot:
@@ -3120,15 +3137,15 @@ async def _handle_control_send(request, transition, journal=None):
 
     try:
         if return_final:
-            wakterm_receipt = await agent_send(
-                target["pane_id"],
-                params["message"],
-                return_final=True,
+            wakterm_receipt = await agent_admit(
+                target,
+                delivered_prompt,
                 request_id=request_id,
+                return_final=True,
                 timeout_ms=params.get("timeout_ms", 0),
             )
         else:
-            wakterm_receipt = await agent_send(target["pane_id"], params["message"])
+            wakterm_receipt = await agent_send(target["pane_id"], delivered_prompt)
     except Exception as error:
         annotation = await _control_failure_annotation(
             bot,
@@ -3165,6 +3182,53 @@ async def _handle_control_send(request, transition, journal=None):
             },
             indeterminate=True,
         ) from error
+
+    if return_final and wakterm_receipt["status"] != "accepted":
+        status = wakterm_receipt["status"]
+        detail = wakterm_receipt.get("detail") or f"Wakterm admission returned {status}"
+        annotation = await _control_failure_annotation(
+            bot,
+            target["topic_id"],
+            audit_ids[0],
+            first_text,
+            request_id,
+            (
+                f"Wakterm target admission returned {status}; no prompt was written."
+                if wakterm_receipt["definitive"]
+                else "Wakterm target admission became indeterminate."
+            ),
+            target["pane_id"],
+        )
+        if wakterm_receipt["definitive"]:
+            await asyncio.to_thread(journal.discard_unsubmitted_return, request_id)
+            raise RequestFailure(
+                "wakterm_delivery_rejected",
+                f"Wakterm definitively rejected target delivery: {detail}",
+                details={
+                    "status": status,
+                    "prompt_written": False,
+                    "failure_annotation": annotation,
+                },
+            )
+        terminal = {
+            "request_id": request_id,
+            "state": "indeterminate",
+            "final_message": None,
+            "detail": detail,
+            "terminal_event_sequence": None,
+        }
+        await asyncio.to_thread(journal.record_return_result, request_id, terminal)
+        await _deliver_return(request_id, journal)
+        raise RequestFailure(
+            "wakterm_delivery_indeterminate",
+            "Wakterm target delivery became indeterminate",
+            details={
+                "status": status,
+                "prompt_written": None,
+                "failure_annotation": annotation,
+            },
+            indeterminate=True,
+        )
 
     status_annotation = await _control_success_annotation(
         bot,
@@ -3219,6 +3283,7 @@ async def _deliver_return(request_id, journal):
         callback = _return_callback_text(result, source, target)
 
         if row["agent_state"] == "pending":
+            callback_request_id = _return_callback_request_id(request_id)
             await asyncio.to_thread(
                 journal.set_return_destination,
                 request_id,
@@ -3226,9 +3291,15 @@ async def _deliver_return(request_id, journal):
                 "delivering",
             )
             try:
-                await _refresh_telegram_routes()
-                live_source = _control_route(source["title"])
-                await agent_send(live_source["pane_id"], callback)
+                if not source.get("agent_id") or not source.get("incarnation_id"):
+                    raise RuntimeError(
+                        "the persisted source route lacks an exact Wakterm agent incarnation"
+                    )
+                receipt = await agent_admit(
+                    source,
+                    callback,
+                    request_id=callback_request_id,
+                )
             except Exception as error:
                 await asyncio.to_thread(
                     journal.set_return_destination,
@@ -3239,12 +3310,40 @@ async def _deliver_return(request_id, journal):
                 )
                 print(f"[control>{source['title']}] agent callback indeterminate: {error}")
             else:
-                await asyncio.to_thread(
-                    journal.set_return_destination,
-                    request_id,
-                    "agent",
-                    "delivered",
-                )
+                status = receipt["status"]
+                if status == "accepted":
+                    await asyncio.to_thread(
+                        journal.set_return_destination,
+                        request_id,
+                        "agent",
+                        "delivered",
+                    )
+                elif status == "busy":
+                    await asyncio.to_thread(
+                        journal.set_return_destination,
+                        request_id,
+                        "agent",
+                        "pending",
+                    )
+                    print(
+                        f"[control>{source['title']}] source busy; callback remains queued"
+                    )
+                elif status == "indeterminate":
+                    await asyncio.to_thread(
+                        journal.set_return_destination,
+                        request_id,
+                        "agent",
+                        "indeterminate",
+                        receipt.get("detail"),
+                    )
+                else:
+                    await asyncio.to_thread(
+                        journal.set_return_destination,
+                        request_id,
+                        "agent",
+                        "failed",
+                        receipt.get("detail") or f"Wakterm admission returned {status}",
+                    )
 
         row = await asyncio.to_thread(journal.get_return, request_id)
         if row["telegram_state"] == "pending":
@@ -3392,9 +3491,6 @@ async def poll_loop():
             if SIGNAL_ENABLED:
                 await sync_signal_groups(matched, unmatched)
                 await _process_signal_queues()
-            if SLACK_ENABLED:
-                await _process_slack_queue()
-                await _process_slack_direct()
             await check_output()
         except Exception as e:
             print(f"tick: {e}")
@@ -3404,6 +3500,7 @@ async def poll_loop():
 async def startup(app: Application):
     global _primary_bot, _control_server, _return_delivery_lock
     global _wakterm_return_supported, _wakterm_return_unavailable_reason
+    _reject_removed_slack_configuration()
     _init_harnesses()
     _signal_db_init()
     _primary_bot = harnesses["claude"].bot
@@ -3423,8 +3520,10 @@ async def startup(app: Application):
             tg_name_topic[key] = int(topic_id)
     for title, source in saved.get("last_sources", {}).items():
         key = _telegram_topic_key(title)
-        if key and source in {"tg", "sig", "debate", "slack"}:
+        if key and source in {"tg", "sig", "debate"}:
             last_source_name[key] = source
+        elif key and source == "slack":
+            print(f"[state] ignored removed Slack preference for {title!r}")
     for k, v in saved.get("collab", {}).items():
         collab_tabs[int(k)] = v
     for gid in saved.get("clod_off_groups", []):
@@ -3478,17 +3577,6 @@ async def startup(app: Application):
         except Exception as e:
             print(f"[signal] profile set error: {e}")
         _start_background_task(_signal_receive_task(), "signal-receive")
-
-    if SLACK_ENABLED:
-        from slack_sdk.web.async_client import AsyncWebClient
-        global _slack_web_client, _slack_bot_user_id
-        _slack_web_client = AsyncWebClient(token=SLACK_BOT_TOKEN)
-        try:
-            auth = await _slack_web_client.auth_test()
-            _slack_bot_user_id = auth["bot_id"]
-        except Exception as e:
-            print(f"[slack] auth_test failed: {e}")
-        _start_background_task(_slack_receive_task(), "slack-receive")
 
     matched, unmatched = await _refresh_telegram_routes()
     # Resolve routes before reading sources. Durable cursors resume exactly;
@@ -3573,8 +3661,7 @@ def main():
     names = ", ".join(harnesses.keys())
     sig = f" +signal({SIGNAL_ACCOUNT})" if SIGNAL_ENABLED else ""
     deb = f" +debate({DEBATE_CHAT})" if DEBATE_ENABLED else ""
-    slk = f" +slack({','.join(SLACK_CHANNELS)})" if SLACK_ENABLED else ""
-    print(f"panetone: [{names}] polling chat {CHAT} every {POLL}s{sig}{deb}{slk}")
+    print(f"panetone: [{names}] polling chat {CHAT} every {POLL}s{sig}{deb}")
     app.run_polling(drop_pending_updates=True)
 
 

@@ -1,0 +1,84 @@
+{
+  "schema": "panetone.channel-routing.v1",
+  "route_cases": [
+    {
+      "name": "telegram_is_default_without_signal_binding",
+      "source": null,
+      "telegram_topic": 101,
+      "signal_enabled": false,
+      "signal_group": null,
+      "debate_enabled": false,
+      "debate_tabs": [],
+      "expected": ["tg", 101, "Alpha"]
+    },
+    {
+      "name": "signal_is_default_when_bound",
+      "source": null,
+      "telegram_topic": 101,
+      "signal_enabled": true,
+      "signal_group": "signal-alpha",
+      "debate_enabled": false,
+      "debate_tabs": [],
+      "expected": ["sig", "signal-alpha", ""]
+    },
+    {
+      "name": "explicit_telegram_overrides_signal_default",
+      "source": "tg",
+      "telegram_topic": 101,
+      "signal_enabled": true,
+      "signal_group": "signal-alpha",
+      "debate_enabled": false,
+      "debate_tabs": [],
+      "expected": ["tg", 101, "Alpha"]
+    },
+    {
+      "name": "debate_requires_enabled_matching_tab",
+      "source": "debate",
+      "telegram_topic": 101,
+      "signal_enabled": false,
+      "signal_group": null,
+      "debate_enabled": true,
+      "debate_tabs": ["alpha"],
+      "debate_chat": -100123,
+      "expected": ["debate", -100123, ""]
+    },
+    {
+      "name": "unavailable_selected_destination_does_not_fall_back",
+      "source": "sig",
+      "telegram_topic": 101,
+      "signal_enabled": true,
+      "signal_group": null,
+      "debate_enabled": false,
+      "debate_tabs": [],
+      "expected": null
+    }
+  ],
+  "format_cases": {
+    "signal_group_ids": [
+      {"input": "group==", "expected": "group"},
+      {"input": " group= ", "expected": "group"},
+      {"input": "", "expected": ""},
+      {"input": null, "expected": ""}
+    ],
+    "line_chunks": {
+      "input": "one\ntwo\nthree",
+      "limit": 8,
+      "expected": ["one\ntwo", "three"]
+    },
+    "utf16_chunks": {
+      "input": "A😀BC",
+      "limit": 3,
+      "expected": ["A😀", "BC"]
+    }
+  },
+  "retry_fairness": {
+    "items": [
+      ["tg", 101, "tg-1", 11, "codex", "alpha", "item-1"],
+      ["tg", 101, "tg-2", 11, "codex", "alpha", "item-2"],
+      ["tg", 102, "tg-other", 12, "claude", "beta", "item-3"],
+      ["sig", "group-a", "sig-1", 11, "codex", "", "item-4"],
+      ["sig", "group-a", "sig-2", 11, "codex", "", "item-5"]
+    ],
+    "expected_attempt_ids": ["item-1", "item-4"]
+  }
+}

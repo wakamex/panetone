@@ -1,0 +1,45 @@
+{
+  "schema": "panetone.wakterm-consumer-requirements.v1",
+  "scope": "semantic requirements, not a proposed wire schema",
+  "identity": [
+    "Each event identifies one opaque Wakterm agent and process incarnation.",
+    "Turn-scoped events identify one provider turn without exposing a provider path or parser cursor.",
+    "Lifecycle replacement cannot make an old-incarnation event look current."
+  ],
+  "catalog": [
+    "A snapshot can enumerate active and recently unavailable agents with display metadata sufficient for conservative Panetone route binding.",
+    "Catalog and lifecycle observations have an ordering relationship with the event cursor.",
+    "Duplicate display titles remain distinguishable by opaque identity and produce an ambiguity at the Panetone locator boundary."
+  ],
+  "submission": [
+    "Prompt acceptance returns a durable request and agent-incarnation receipt.",
+    "Possible acceptance without a receipt is explicitly indeterminate and is never represented as safe to retry.",
+    "Unsupported capability, unavailable agent, stale incarnation, busy agent, invalid request, and internal observer failure are classified separately."
+  ],
+  "events": [
+    "Assistant text preserves provider-observed order and Unicode content.",
+    "Plans are distinguishable from ordinary assistant text while retaining a user-visible projection.",
+    "Turn start, transition, final, observer failure, and lifecycle change are distinguishable event kinds.",
+    "A final is bound to its exact agent incarnation and provider turn.",
+    "The existing return-request terminal event remains available while the general stream is additive."
+  ],
+  "cursor": [
+    "Every durable event has a strictly increasing sequence.",
+    "Reading after sequence N returns only later events in the same durable order.",
+    "Restart preserves committed events and sequence monotonicity.",
+    "A cursor older than retained history returns an explicit cursor_too_old error with recovery metadata instead of silently starting at the tail.",
+    "Retention cannot remove an event still needed by an advertised durable consumer cursor without surfacing the gap."
+  ],
+  "compatibility": [
+    "Capabilities and schema versions are negotiated before event consumption.",
+    "Unknown additive fields are tolerated.",
+    "Unknown semantic event kinds or incompatible major versions fail explicitly.",
+    "Golden request, receipt, catalog, event, cursor-gap, and classified-error fixtures are owned by Wakterm and consumed cross-repository."
+  ],
+  "shadow": [
+    "Panetone can resume from a saved sequence without producing outbound side effects.",
+    "A recording sink can compare ordered Codex user-visible projections with the legacy reader.",
+    "Every difference is classified as equivalent formatting, explained intended change, provider-reader defect, Agent API defect, or indeterminate correlation.",
+    "Discovery output is not production promotion evidence."
+  ]
+}

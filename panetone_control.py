@@ -111,6 +111,17 @@ def parse_request(data):
             "route names must not have leading or trailing whitespace",
             request_id,
         )
+    has_control = any(
+        ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F
+        for value in (source, target)
+        for char in value
+    )
+    if has_control:
+        raise ProtocolError(
+            "invalid_params",
+            "route names must not contain control characters",
+            request_id,
+        )
     if len(source) > 128 or len(target) > 128:
         raise ProtocolError(
             "invalid_params", "route names must be at most 128 characters", request_id
@@ -126,9 +137,11 @@ def parse_request(data):
         raise ProtocolError(
             "invalid_params", "params.timeout_ms must be a non-negative integer", request_id
         )
-    if timeout_ms and not return_final:
+    if timeout_ms:
         raise ProtocolError(
-            "invalid_params", "params.timeout_ms requires return_final", request_id
+            "invalid_params",
+            "asynchronous final callbacks do not expire; params.timeout_ms must be zero",
+            request_id,
         )
 
     normalized_params = {"from": source, "to": target, "message": message}
@@ -270,8 +283,8 @@ class ControlJournal:
                     SELECT request_id FROM control_request
                     WHERE state IN ('succeeded', 'failed') AND updated_at < ?
                 )
-                  AND agent_state IN ('delivered', 'indeterminate')
-                  AND telegram_state IN ('delivered', 'indeterminate')
+                  AND agent_state = 'delivered'
+                  AND telegram_state = 'delivered'
                 """,
                 (cutoff,),
             )
@@ -375,6 +388,21 @@ class ControlJournal:
                 "SELECT * FROM return_delivery WHERE request_id = ?", (request_id,)
             ).fetchone()
 
+    def discard_unsubmitted_return(self, request_id):
+        with self._connect() as db:
+            changed = db.execute(
+                """
+                DELETE FROM return_delivery
+                WHERE request_id = ? AND state = 'pending' AND result_json IS NULL
+                  AND agent_state = 'pending' AND telegram_state = 'pending'
+                """,
+                (request_id,),
+            ).rowcount
+        if changed != 1:
+            raise RuntimeError(
+                f"cannot discard submitted or partially delivered return {request_id}"
+            )
+
     def record_return_result(self, request_id, result):
         encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
         with self._connect() as db:
@@ -408,7 +436,13 @@ class ControlJournal:
     def set_return_destination(self, request_id, destination, state, error=None):
         if destination not in {"agent", "telegram"}:
             raise ValueError("invalid return destination")
-        if state not in {"pending", "delivering", "delivered", "indeterminate"}:
+        if state not in {
+            "pending",
+            "delivering",
+            "delivered",
+            "failed",
+            "indeterminate",
+        }:
             raise ValueError("invalid return destination state")
         column = f"{destination}_state"
         with self._connect() as db:

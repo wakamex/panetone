@@ -1,26 +1,37 @@
 [Unit]
-Description=Panetone bridge (Wakterm to messaging services)
+Description=Panetone durable Wakterm message router
+Documentation=file:/usr/share/doc/panetone/production-operations.md
 Wants=network-online.target
-After=network-online.target
+After=network-online.target wakterm-mux-server.service
+Requires=wakterm-mux-server.service
 
 [Service]
 Type=simple
 User=mihai
 Group=mihai
-WorkingDirectory=/code/panetone
 Environment=HOME=/home/mihai
-Environment=PYTHONUNBUFFERED=1
-Environment=WAKTERM_BIN=/home/mihai/.local/bin/wakterm
-Environment=WAKTERM_UNIX_SOCKET=/run/user/1000/wakterm/sock
-Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=RUST_LOG=panetone=info
+EnvironmentFile=/etc/panetone/panetone.env
+RuntimeDirectory=panetone
+RuntimeDirectoryMode=0700
+StateDirectory=panetone
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/panetone
 UMask=0077
-ExecStart=/usr/local/bin/uv --no-config run --locked --script /code/panetone/bridge.py
+ExecStart=/usr/local/bin/panetone daemon --socket /run/panetone/control.sock --database /var/lib/panetone/panetone.sqlite3 --wakterm-bin /usr/local/bin/wakterm --wakterm-socket /run/user/1000/wakterm/sock
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=20
 KillMode=control-group
 NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target

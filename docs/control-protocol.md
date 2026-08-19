@@ -18,9 +18,10 @@ $XDG_RUNTIME_DIR/panetone/control.sock
 directory is mode `0700` and the socket is mode `0600`. On Linux, the server also
 checks that the peer UID matches the bridge UID.
 
-The Wakterm mux socket remains separate. Panetone invokes `wakterm cli agent
-send` as a client of that interface after it has resolved its own route and
-Telegram state.
+The Wakterm mux socket remains separate. Panetone invokes the versioned Wakterm
+Agent API as a client of that interface after it has resolved its own route and
+channel state. The Rust candidate uses authoritative `agent admit` receipts and
+never parses provider stores.
 
 At startup, Panetone refuses to replace a symlink, regular file, or active
 socket. It removes a socket only after a connection probe establishes that the
@@ -41,17 +42,44 @@ newline-terminated JSON response. Requests are limited to 256 KiB.
     "from": "ufopedia",
     "to": "wakterm",
     "message": "Investigate the observer bug",
-    "return_final": true,
-    "timeout_ms": 3600000
+    "return_final": true
   }
 }
 ```
 
 The ID is both the correlation identifier and the idempotency key. Omitting
 `return_final`, or setting it to false, preserves one-way delivery. With
-`return_final: true`, Panetone durably registers the source agent and Telegram
-route before submitting the same ID to Wakterm. `timeout_ms` is optional and
-applies asynchronously. Zero disables the deadline.
+`return_final: true`, Panetone joins each currently resolved pane to a fresh
+Wakterm Agent API catalog entry, then durably registers the source agent ID,
+process incarnation, and Telegram route before submitting the same ID to
+Wakterm. The pane ID is only an ephemeral join key. Agent ID plus incarnation
+ID identify later callback admission.
+
+Asynchronous final callbacks have no elapsed-time deadline. They remain pending
+through arbitrarily long target turns until Wakterm reports a correlated
+terminal result or a concrete lifecycle or observer failure makes the result
+indeterminate. Panetone always submits a zero Wakterm final timeout. For
+compatibility, control v1 accepts an omitted `timeout_ms` or the value zero, but
+rejects a nonzero value with `invalid_params`. Bounded network and subprocess
+deadlines still apply to each individual acknowledgement operation. They do not
+expire the durable callback workflow.
+
+The Telegram audit contains the original message. The prompt submitted to
+Wakterm adds this deterministic envelope:
+
+```text
+[Panetone cross-agent message]
+From: ufopedia (codex)
+To: wakterm (codex)
+Request ID: fe57dc90-994e-4e73-b09c-fac483d9f05b
+Reply mode: asynchronous final callback
+
+Investigate the observer bug
+```
+
+`From` and `To` identify the Panetone routes selected by the caller plus the
+correlation ID. Because local same-UID clients may choose `--from`, this is
+routing attribution, not cryptographic authentication of the calling pane.
 
 ## Successful response
 
@@ -66,14 +94,20 @@ applies asynchronously. Zero disables the deadline.
       "tab_id": 1,
       "pane_id": 1,
       "harness": "codex",
-      "topic_id": 164000
+      "topic_id": 164000,
+      "agent_id": "agent-ufopedia",
+      "incarnation_id": "incarnation-ufopedia-3",
+      "agent_name": "ufopedia_codex"
     },
     "target": {
       "title": "wakterm",
       "tab_id": 7,
       "pane_id": 8,
       "harness": "codex",
-      "topic_id": 164481
+      "topic_id": 164481,
+      "agent_id": "agent-wakterm",
+      "incarnation_id": "incarnation-wakterm-5",
+      "agent_name": "wakterm_codex"
     },
     "telegram": {
       "chat_id": -1000000000000,
@@ -85,15 +119,19 @@ applies asynchronously. Zero disables the deadline.
       }
     },
     "wakterm": {
-      "agent_id": "detected-pane-8",
-      "agent_name": "wakterm",
-      "pane_id": 8,
-      "submitted": true,
-      "acknowledgement": {
-        "kind": "session_observer",
-        "acknowledged": true,
-        "latency_ms": 41
-      }
+      "schema": "wakterm.agent-api.v1",
+      "request_id": "fe57dc90-994e-4e73-b09c-fac483d9f05b",
+      "status": "accepted",
+      "definitive": true,
+      "prompt_written": true,
+      "agent_id": "agent-wakterm",
+      "incarnation_id": "incarnation-wakterm-5",
+      "return_final": true,
+      "request": {
+        "request_id": "fe57dc90-994e-4e73-b09c-fac483d9f05b",
+        "state": "submitted"
+      },
+      "detail": null
     },
     "reply_mode": "return_final",
     "reply_pending": true
@@ -106,35 +144,61 @@ message. The CLI exits while the delegated turn is still running. For one-way
 delivery, the older `submitted` and observer acknowledgement receipt is
 unchanged.
 
-Return mode is capability-dependent. Panetone probes for Wakterm durable agent
-request support at startup and enables the return watcher only when that probe
-succeeds. Installing a compatible Wakterm takes effect after a deliberate
-Panetone restart. The current Wakterm implementation supports correlated return
-requests for Codex targets. Other harnesses require equivalent observer
-support. The startup probe detects the command-level capability, not support for
-a particular target harness. If Wakterm rejects a target during submission, the
-normal audit-linked Wakterm failure and indeterminate-delivery policy applies.
+Return mode is capability-dependent and requires `catalog.v1`,
+`prompt_admission.v1`, and `return_request_terminal_stream.v1`. The Rust
+candidate negotiates these on each new Wakterm CLI connection. The current
+Wakterm implementation supports correlated return requests for Codex targets.
+Other harnesses require equivalent live observer evidence. If Wakterm rejects a
+target during submission, the normal audit-linked Wakterm failure and
+indeterminate-delivery policy applies.
+
+Wakterm commit `41e1ca00062bb51dd212e2254688ec50854ecd28` makes
+`event_stream.v1` a live capability after its durable store initializes. The
+Rust candidate consumes paged events, persists each page and its next cursor in
+one transaction, deduplicates by event ID plus process incarnation, and drains
+to the advertised head. Unknown major schemas or event kinds fail closed, while
+additive fields are tolerated. A `cursor_too_old` response causes a fresh
+catalog snapshot, a durable recovery baseline, and a global delivery hold. An
+operator must review and acknowledge the explicit gap before release. The
+existing return terminal stream remains the callback authority.
 
 ## Delivery order and failures
 
 Panetone performs these steps:
 
 1. Claim the UUID durably as `in_progress`.
-2. Refresh and resolve the live source and target routes.
+2. For return mode, read the Wakterm catalog before and after refreshing the
+   live source and target routes. Join by pane ID only when both catalogs have
+   the same exact agent and incarnation binding, then persist those identities.
+   A mux restart or pane reuse during resolution fails closed before the audit.
 3. Post `SOURCE → TARGET`, the UUID marked `[pending]`, and the message in the
    target Telegram topic.
 4. Persist the Telegram receipt as `audit_posted`.
 5. Switch the target's response route to Telegram.
 6. Persist `delivering` before invoking Wakterm.
-7. For return mode, persist the source return route and run `wakterm cli agent
-   send --return-final --request-id UUID` outside the asyncio event loop.
+7. Add the Panetone source, target, request, and reply-mode envelope. For return
+   mode, persist the source return route and submit through `wakterm cli agent
+   admit TARGET_AGENT_ID --exact-agent-id --incarnation TARGET_INCARNATION
+   --return-final --request-id UUID` outside the asyncio event loop.
 8. Edit the audit to `[submitted]`, or add a linked submitted marker if editing
    fails.
 9. Store the registration response.
 10. Consume Wakterm's resumable terminal request stream in one background
     subscription.
-11. Persist the terminal result, then deliver one correlated callback to the
-    source agent and its Telegram topic.
+11. Persist the terminal result and mirror it to the source Telegram topic.
+    Submit the agent callback through authoritative Wakterm admission using the
+    persisted source incarnation and a stable callback request ID derived from
+    the original ID. Panetone uses Wakterm's exact-agent-ID mode so an agent
+    missing from the current catalog still receives a structured definitive
+    `unavailable` classification from the admission service.
+
+If the source is busy, a definitive `busy` receipt with `prompt_written: false`
+returns the agent destination to durable `pending` state. The retry loop reuses
+the same callback ID and exact callback text after the source becomes idle. It
+does not steer the active turn. An indeterminate receipt is terminal and is not
+retried. A stale or unavailable source incarnation is recorded as a definitive
+agent callback failure without rebinding by title, while the terminal result
+remains durable and visible in the source Telegram topic.
 
 If Telegram fails before any audit is visible, Panetone does not invoke
 Wakterm. If an audit is partially visible, Panetone adds or edits a linked
@@ -145,6 +209,13 @@ message. The request becomes `indeterminate` because a PTY write and a database
 commit cannot be one transaction. Panetone never retries it automatically.
 An unclean restart can leave an audit marked `[pending]`, but it cannot leave an
 unconfirmed arrow presented as a successful submission.
+
+A structured definitive target rejection such as `busy`, `unavailable`, or
+`stale_incarnation` guarantees `prompt_written: false`. Panetone marks the
+audit as failed, removes the unused return route, and returns
+`wakterm_delivery_rejected` without claiming an indeterminate write. Durable
+busy-target queuing remains an intended Rust-core semantic and is not partially
+implemented in the temporary Python bridge.
 
 Errors use this shape:
 
@@ -191,11 +262,16 @@ to Telegram or Wakterm again. Reusing it with different content returns
 `idempotency_conflict`. Finding a nonterminal request after restart persists and
 returns `request_indeterminate`; it is not replayed.
 
-Completed `succeeded` and `failed` UUIDs expire 30 days after their last update.
-After expiry, reusing that UUID is a new request and can deliver again. Pruning
-never removes `in_progress`, `audit_posted`, `delivering`, or `indeterminate`
-records. These safety records remain durable even if their retention causes the
-journal to reach its size bound.
+The installed Python journal expires completed `succeeded` and `failed` UUIDs
+30 days after their last update. For return mode, expiry requires both callback
+destinations to be delivered. Its pruning never removes `in_progress`,
+`audit_posted`, `delivering`, or `indeterminate` control records, or return rows
+with a pending, failed, or indeterminate destination.
+
+The Rust schema-v5 store uses permanent UUID tombstones instead. Completed
+payloads may be compacted, but the request hash, terminal state, and UUID remain
+reserved. Reusing that UUID can therefore never become a new prompt. Pending,
+failed, and indeterminate workflows and effects also remain durable.
 
 The CLI does not retry automatically. If the connection is lost, use the UUID
 shown by the CLI with `--id` and the exact same request. A cached result is safe
