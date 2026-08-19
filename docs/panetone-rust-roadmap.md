@@ -2,10 +2,14 @@
 
 Date: 2026-08-16
 
-Status: Phase 0 completed on 2026-08-16. Phase 1 begins with the Wakterm agent
-event boundary and the broader Panetone conformance suite. This document
-retains the initial audit findings as historical context and records their
-current status separately.
+Last reviewed: 2026-08-19
+
+Status: Phase 0 completed on 2026-08-16. Wakterm has since implemented the
+Agent API boundary that Phase 1 expected to design. Phase 1 now begins with a
+consumer review of that implemented contract, a hermetic Panetone conformance
+suite, and a side-effect-free shadow comparison. This document retains the
+initial audit findings as historical context and records their current status
+separately.
 
 ## Decision
 
@@ -96,6 +100,43 @@ agreed callback architecture:
 The explicit second-send workflow is the current fallback and live Phase 0
 gate. It does not replace the non-blocking asynchronous callback agreed and
 implemented in Panetone commit `7c36292` and Wakterm commit `1ac79325d`.
+
+## Phase 1 review evidence
+
+The 2026-08-19 review changed several planning premises:
+
+- The installed Wakterm binary is revision `2549048e`. Its live capability
+  response advertises `wakterm.agent-api.v1`, `catalog.v1`,
+  `prompt_admission.v1`, `return_request_terminal_stream.v1`, and
+  `event_stream.v1`.
+- Wakterm commit `af748ffc5` implemented the durable Agent API event stream,
+  bounded retention, catalog ordering, explicit cursor gaps, and Wakterm-owned
+  golden fixtures. Commits `d3c496cd6` and `088c606a5` hardened the four
+  provider projections and derive agent turns from provider events. At the
+  installed revision, `docs/agent-api/v1/golden-fixtures.json` has SHA-256
+  `f845ed1943ed20c47292d0b925a90389580bd272ae528417f185e16dd2ebb8f8`.
+- Codex, Claude, Gemini, and OpenCode projections are already live in Wakterm.
+  Their existence is implementation evidence, not Panetone compatibility or
+  promotion evidence. Panetone has not yet consumed the event stream or run the
+  required shadow comparison.
+- The Wakterm checkout contains work newer than the installed binary. Phase 1
+  evidence must record the installed binary revision and negotiated response,
+  not infer deployed behavior from checkout HEAD.
+- The Panetone Python entry point treats extra arguments as normal service
+  startup and loads configured production adapters. A test or fixture command
+  that obtains dependencies by executing `bridge.py` can therefore contact
+  real services and mutate durable cursors. Phase 1 needs a dedicated hermetic
+  test entry point, temporary XDG directories, synthetic configuration, and
+  recording adapters before any black-box harness is run.
+- The Panetone user unit is enabled but was inactive during this review, with a
+  successful prior exit. Enabled state is not current health evidence. Any live
+  discovery or promotion run must record active state, loaded unit, binary
+  revision, negotiated capabilities, state paths, and queue counts before it
+  begins. No cause should be inferred from an intentionally stopped unit.
+
+These findings remove Wakterm API design and provider-projection implementation
+from Phase 1. They add consumer verification and test isolation as explicit
+gates. They do not authorize a production provider cutover.
 
 ## Problems found in the initial audit
 
@@ -218,13 +259,13 @@ a Wakterm agent operation with an explicit receipt. If a harness lacks that
 capability, the fallback must be labeled legacy and at-most-once rather than
 silently using weaker semantics.
 
-The long-term output path is a stable Wakterm agent-output event interface.
-Panetone currently parses Claude, Codex, OpenCode, and Gemini stores and
-rediscovers processes by TTY, cwd, and modification time. That duplicates
-Wakterm authority and caused the class of stale-session problem now being fixed
-there. Do not add provider readers to Rust Panetone. Existing Python readers
-remain only until each provider has passed shadow comparison and a controlled
-cutover to authoritative Wakterm events.
+The intended output path now exists as Wakterm's durable Agent API event
+interface. Panetone currently parses Claude, Codex, OpenCode, and Gemini stores
+and rediscovers processes by TTY, cwd, and modification time. That duplicates
+Wakterm authority and caused the class of stale-session problem fixed there.
+Do not add provider readers to Rust Panetone. Existing Python readers remain
+only until each provider has passed shadow comparison and a controlled cutover
+to authoritative Wakterm events.
 
 ### Panetone owns messaging and workflow truth
 
@@ -256,9 +297,10 @@ owns provider paths, parser cursors, process matching, observer state, and turn
 reconciliation. Panetone consumes normalized events and never imports those
 internals.
 
-The shared artifact is a Wakterm-owned wire contract with versioned JSON DTOs,
-golden compatibility fixtures, and cross-repository conformance tests. It must
-cover:
+The shared artifact is the implemented Wakterm-owned v1 wire contract and its
+golden compatibility fixture file. Panetone must consume the fixture from a
+recorded Wakterm revision and verify its hash rather than maintaining rewritten
+examples. The contract covers:
 
 - a stable agent catalog with opaque agent and process-incarnation identities
 - authoritative prompt submission and durable receipts
@@ -277,34 +319,40 @@ tiny `wakterm-agent-protocol` crate. That crate must contain only wire DTOs and
 compatibility logic, with no mux, panes, SQLite, provider formats, executors, or
 Panetone workflow policy.
 
-Wakterm leads the Agent API architecture, event journal, and provider
-projections. Panetone owns consumer requirements, its durable consumed cursor,
-shadow comparison, provider cutover, and removal of duplicate readers. A third
-agent may perform one bounded protocol and failure-semantics review before
-promotion, but must not become a third implementation authority.
+Wakterm owns the Agent API architecture, event journal, golden fixtures, and
+provider projections. Panetone owns consumer requirements, its durable consumed
+cursor, compatibility harness, shadow comparison, provider cutover, and removal
+of duplicate readers. One bounded independent protocol and failure-semantics
+review is useful before promotion, but it must not become a third implementation
+authority.
 
 ### Timing decision
 
-Start the boundary work now, before implementing the Rust core, but do not make
-all four provider cutovers a prerequisite for Rust. The cheapest reliable
-sequence is:
+Validate the implemented boundary before starting the Rust core, but do not
+make any provider production cutover a prerequisite for Rust. The cheapest
+reliable sequence is:
 
-1. Panetone records sanitized fixtures for the normalized outputs, ordering,
+1. Pin the installed Wakterm revision, negotiated capabilities, and hash of its
+   v1 golden fixture as the review baseline.
+2. Panetone records sanitized fixtures for the normalized outputs, ordering,
    cursors, restart behavior, and routing decisions it currently depends on.
-2. Wakterm defines the versioned catalog, receipt, event, capability, cursor,
-   retention-gap, and error contract. Panetone reviews it as a consumer.
-3. An independent reviewer challenges compatibility and failure semantics.
-4. Wakterm implements one additive Codex event-stream vertical slice.
-5. Panetone runs a side-effect-free Codex shadow comparison. This is discovery
-   evidence and cannot become production promotion evidence.
+3. Panetone reviews the implemented catalog, admission receipt, events,
+   retention gap, lifecycle ordering, and error contract as a consumer. An
+   independent reviewer then challenges compatibility and failure semantics
+   once.
+4. Build a hermetic Panetone fixture and black-box harness that cannot load
+   production credentials, sockets, state paths, or network adapters.
+5. Panetone runs a side-effect-free Codex comparison against the durable event
+   stream. This is discovery evidence and cannot become production promotion
+   evidence.
 6. Once that boundary is validated, Rust core work proceeds against fake
-   Wakterm events while remaining provider projections and live cutovers happen
+   Wakterm events while remaining provider shadow runs and live cutovers happen
    during Phase 3.
 
-Doing the contract later would let temporary Python ownership shape the Rust
-design and create a foreseeable rewrite. Implementing every provider now would
-instead make Wakterm work an open-ended blocker before the boundary has been
-falsified with one representative provider.
+Doing the consumer validation later would let temporary Python ownership shape
+the Rust design and create a foreseeable rewrite. Wakterm's existing four
+projections do not require Panetone to validate or promote them together. The
+Codex comparison remains the representative Phase 1 gate.
 
 ### SQLite owns durable state
 
@@ -476,16 +524,18 @@ partially valid security configuration.
 
 Keep Panetone and Wakterm under the same systemd manager so dependency ordering
 is real rather than implied across a system-manager and user-manager boundary.
-The Phase 0 deployment uses enabled user services with lingering, which is the
-cheapest reliable arrangement while Wakterm remains user-managed. Install the
-release binary atomically under the service user's executable path. Keep the
-runtime directory mode `0700`, and create the control socket and databases as
-`0600` under the appropriate XDG runtime and state directories.
+Prefer user services with lingering on this host so agents can inspect,
+restart, and verify both services without root. Install the release binary
+atomically under the service user's executable path. Keep the runtime directory
+mode `0700`, and create the control socket and databases as `0600` under the
+appropriate XDG runtime and state directories.
 
-If both Wakterm and Panetone later move to system services, install both under
-`/etc/systemd/system/` with `User=mihai` and system-labeled executable paths.
-Do not mix managers merely to move Panetone alone. Within either manager, use
-`After=wakterm-mux-server.service` and at most `Wants=`, not `Requires=`.
+Move both Wakterm and Panetone to system services only if a concrete
+system-level ownership or privilege requirement appears. If that happens,
+install both under `/etc/systemd/system/` with `User=mihai` and system-labeled
+executable paths. Do not mix managers merely to move Panetone alone. Within
+either manager, use `After=wakterm-mux-server.service` and at most `Wants=`, not
+`Requires=`.
 Panetone must remain alive, retain inbound work, expose degraded health, and
 reconnect if Wakterm is restarted. Configure `Restart=on-failure`, a bounded
 restart delay, graceful stop, and a timeout that allows the store and adapters
@@ -534,31 +584,45 @@ migrations, and shutdown. Convert current protocol examples and representative
 state into sanitized golden fixtures. Add a black-box harness that can run the
 same control v1 and state-machine cases against Python and Rust.
 
-Begin with the Panetone-to-Wakterm boundary. Panetone documents the normalized
+Begin by making the test boundary hermetic. Add a dedicated test entry point
+that resolves the locked Python dependencies without executing `bridge.py`.
+Run every fixture and black-box case with temporary XDG runtime, config, and
+state directories, a fake Wakterm socket, synthetic credentials, and recording
+channel adapters. The harness must fail if it attempts an external network call
+or opens a configured production path. Live discovery is a separate explicit
+mode that records its revisions and effective non-secret configuration before
+it starts.
+
+Then review the implemented Panetone-to-Wakterm boundary. Record the installed
+Wakterm revision and capability response, load Wakterm's v1 golden fixture from
+that recorded revision, and verify its hash. Panetone documents the normalized
 assistant output, plan, turn, lifecycle, ordering, cursor, restart, and routing
-behavior it currently consumes without proposing new provider semantics.
-Wakterm then owns the versioned Agent API design and implements an additive
-Codex event-stream vertical slice. A third agent performs one bounded review of
-schema compatibility, cursor gaps, retention, crash boundaries, and classified
-errors. Panetone shadows the Codex stream against its current reader with every
-outbound side effect replaced by a recording sink.
+behavior it currently consumes without proposing new provider semantics. One
+bounded independent review covers schema compatibility, prompt admission,
+catalog ordering, cursor gaps, retention, crash boundaries, unknown additive
+fields, unknown event kinds, and classified errors. Panetone then shadows the
+durable Codex event stream against its current reader with every outbound side
+effect replaced by a recording sink and a cursor separate from production.
 
 Capture fixtures for all currently enabled behavior: four harnesses, Telegram,
 Signal, Slack, debate routing, collaboration, topic recreation, source cursor
 recovery, one-way control send, and return-final callback. Callback conformance
-uses a Codex target with repository Wakterm `1ac79325d` or a compatible fake.
-It must also cover the explicit `return_final_unavailable` result from an older
+uses the reviewed Wakterm v1 fixture and a compatible fake, while retaining
+compatibility cases for the older `1ac79325d` return-request boundary. It must
+also cover the explicit `return_final_unavailable` result from an older
 installed Wakterm and unsupported return mode for other target harnesses.
 Include remote API errors, rate limits, partial multi-chunk sends, process
 restart, deleted remote topics, stale panes, duplicate titles, and incompatible
 Wakterm capability.
 
-Gate: current Python behavior is reproducible from fixtures, every intended
-semantic difference is written down, no production state format remains
-undocumented, the Wakterm Agent API contract has passed independent review, and
+Gate: the conformance command cannot reach production paths or external
+services; current Python behavior is reproducible from fixtures; every intended
+semantic difference is written down; no production state format remains
+undocumented; the exact Wakterm revision, capability response, and fixture hash
+are recorded; the Wakterm Agent API contract has passed independent review; and
 the Codex shadow run has zero unexplained normalized event differences. The
 shadow run is discovery evidence only. It does not authorize a production
-cutover or require the remaining three provider projections before Phase 2.
+cutover or require the remaining three provider shadows before Phase 2.
 
 ### Phase 2: implement the Rust core offline
 
@@ -579,9 +643,12 @@ practical. Clippy, formatting, dependency policy, and advisory checks are clean.
 Implement the real Wakterm Agent API adapter first, then Telegram, Signal, and
 Slack. Use local fake HTTP, WebSocket, Unix JSON-RPC, and Wakterm servers for
 deterministic adapter tests. Do not implement provider session readers in Rust
-Panetone. For each remaining provider, Wakterm adds the authoritative event
-projection and Panetone shadows it against the existing Python reader before
-any production switch.
+Panetone. Treat Wakterm's existing Codex, Claude, Gemini, and OpenCode
+projections as candidates that still require consumer evidence. Panetone
+shadows each one against the existing Python reader before any production
+switch. Fix an unexplained difference in the layer that owns it; add or change
+a Wakterm projection only when the comparison identifies a concrete missing or
+incorrect provider event.
 
 Cut over Codex, Claude, Gemini, and OpenCode one at a time. Each cutover records
 a durable watermark, disables the old reader before enabling event delivery,
@@ -721,19 +788,21 @@ Do not build these yet:
 - generalized workflow DAGs, scheduling, agent pools, or multi-host routing
 - hot reload in production
 - application-level database encryption without a credible key-management plan
-- broad Wakterm session parsing in Panetone once Wakterm supplies authoritative
-  events
+- broad Wakterm session parsing in Panetone now that Wakterm supplies
+  authoritative events
 - multiple Rust crates before a measured compile, reuse, or dependency-boundary
   need appears
 
 ## Final recommendation
 
 Proceed with a Rust replacement, but treat it as a reliability migration rather
-than a language rewrite. First contain the live deployment failures. Then freeze
-the current contracts and validate the Wakterm Agent API with one Codex shadow
-slice. Then build one Rust binary and one SQLite-backed service offline, verify
-it against the Python implementation and fault-injected local adapters, migrate
-state with the old service stopped, and make one reversible cutover. Keep
+than a language rewrite. The live deployment failures have been contained and
+Wakterm's Agent API boundary is implemented. Next freeze Panetone's current
+contracts, verify the implemented boundary as a consumer, and run one hermetic
+Codex shadow comparison. Then build one Rust binary and one SQLite-backed
+service offline, verify it against the Python implementation and fault-injected
+local adapters, migrate state with the old service stopped, and make one
+reversible cutover. Keep
 Wakterm authoritative for terminals and provider turns, Panetone authoritative
 for messaging workflows and channel delivery, and SQLite authoritative for
 durable Panetone state.
