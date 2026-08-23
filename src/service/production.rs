@@ -231,6 +231,14 @@ impl ProductionService {
     }
 
     pub async fn terminal_once(&self) -> Result<usize, String> {
+        if !self
+            .store
+            .has_unresolved_terminal()
+            .await
+            .map_err(error_string)?
+        {
+            return Ok(0);
+        }
         let cursor = self
             .store
             .get_metadata("wakterm_return_cursor".into())
@@ -1031,6 +1039,40 @@ fi
         assert_eq!(service.event_once().await.unwrap(), 2);
         assert_eq!(store.status().await.unwrap().event_cursor, Some(102));
         assert_eq!(fs::read_to_string(log).unwrap(), "100\n101\n");
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_worker_does_not_call_wakterm_without_return_work() {
+        let directory = tempdir().unwrap();
+        let log = directory.path().join("terminal.log");
+        let binary = directory.path().join("wakterm-fake");
+        fs::write(
+            &binary,
+            format!(
+                "#!/bin/bash\nprintf '%s\\n' \"$*\" >> '{}'\nexit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        let service = ProductionService::new(
+            store.clone(),
+            WaktermCli::new(
+                binary,
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            RealChannels::default(),
+            SupervisorHandle::default(),
+            vec!["return_request_terminal_stream.v1".into()],
+            directory.path().join("control.sock"),
+        );
+
+        assert_eq!(service.terminal_once().await.unwrap(), 0);
+        assert!(!log.exists());
         drop(service);
         store.shutdown().await.unwrap();
     }

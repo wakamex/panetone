@@ -236,6 +236,10 @@ Each destination has independent durable state. A possibly accepted callback
 becomes indeterminate and is not retried. A definitive busy callback remains
 pending until the source is idle.
 
+The terminal watcher calls Wakterm only while a `return-final` workflow has a
+submitted target and no stored terminal result. Ordinary operation therefore
+does not run an idle terminal poll.
+
 ## Status
 
 The `status` method takes null parameters. Its result includes:

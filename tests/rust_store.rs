@@ -314,6 +314,59 @@ fn return_record(workflow_id: WorkflowId, state: DeliveryState) -> ReturnDeliver
 }
 
 #[tokio::test]
+async fn unresolved_terminal_exists_only_after_return_final_submission() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    assert!(!store.has_unresolved_terminal().await.unwrap());
+
+    let request_id = id(29);
+    let mut return_command = command(request_id, "return the result");
+    return_command.return_final = true;
+    return_command.timeout_ms = 0;
+    let mut workflow = match store
+        .claim(
+            return_command,
+            route_id(1),
+            route_id(2),
+            binding("source"),
+            binding("target"),
+            100,
+        )
+        .await
+        .unwrap()
+    {
+        ClaimResult::New(record) => record,
+        other => panic!("expected a new claim, got {other:?}"),
+    };
+    assert!(!store.has_unresolved_terminal().await.unwrap());
+
+    for next in [
+        WorkflowState::AuditPosted,
+        WorkflowState::AdmissionPrepared,
+        WorkflowState::Submitted,
+    ] {
+        let expected = workflow.workflow.state;
+        if next == WorkflowState::Submitted {
+            workflow.workflow.submitted_target = Some(binding("target"));
+        }
+        workflow.workflow.transition(next).unwrap();
+        workflow.updated_at_ms += 1;
+        store
+            .save_workflow(workflow.clone(), expected)
+            .await
+            .unwrap();
+    }
+    assert!(store.has_unresolved_terminal().await.unwrap());
+
+    store
+        .register_return(return_record(request_id, DeliveryState::Pending))
+        .await
+        .unwrap();
+    assert!(!store.has_unresolved_terminal().await.unwrap());
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn callback_uncertainty_and_unresolved_results_survive_restart() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("state.sqlite3");

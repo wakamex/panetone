@@ -212,6 +212,9 @@ enum Command {
     PendingReturns {
         reply: oneshot::Sender<StoreResult<Vec<ReturnDelivery>>>,
     },
+    HasUnresolvedTerminal {
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
     EnqueueOutbox {
         workflow_id: Option<WorkflowId>,
         item: OutboxItem,
@@ -413,6 +416,11 @@ impl StoreHandle {
 
     pub async fn pending_returns(&self) -> StoreResult<Vec<ReturnDelivery>> {
         self.request(|reply| Command::PendingReturns { reply })
+            .await
+    }
+
+    pub async fn has_unresolved_terminal(&self) -> StoreResult<bool> {
+        self.request(|reply| Command::HasUnresolvedTerminal { reply })
             .await
     }
 
@@ -628,6 +636,9 @@ fn handle_command(connection: &mut Connection, command: Command) {
             send_reply(reply, save_return(connection, &record))
         }
         Command::PendingReturns { reply } => send_reply(reply, pending_returns(connection)),
+        Command::HasUnresolvedTerminal { reply } => {
+            send_reply(reply, has_unresolved_terminal(connection))
+        }
         Command::EnqueueOutbox {
             workflow_id,
             item,
@@ -1505,6 +1516,27 @@ fn pending_returns(connection: &Connection) -> StoreResult<Vec<ReturnDelivery>> 
     json.into_iter()
         .map(|value| serde_json::from_str(&value).map_err(StoreError::from))
         .collect()
+}
+
+fn has_unresolved_terminal(connection: &Connection) -> StoreResult<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM workflows AS workflow
+                 WHERE json_extract(workflow.record_json, '$.command.return_final') = 1
+                   AND json_type(
+                       workflow.record_json,
+                       '$.workflow.submitted_target'
+                   ) = 'object'
+                   AND NOT EXISTS(
+                       SELECT 1 FROM return_deliveries AS returned
+                       WHERE returned.request_id = workflow.request_id
+                   )
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::from)
 }
 
 fn enqueue_outbox(
