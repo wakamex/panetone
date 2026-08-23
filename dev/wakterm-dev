@@ -117,9 +117,7 @@ Ctrl-C. The production mux is not started, stopped, or restarted by this tool.
 PANETONE_WAKTERM_SOURCE may select a disposable source worktree.
 CARGO_TARGET_DIR may select a reusable build-artifact cache.
 PANETONE_WAKTERM_DEV_RUNTIME_ROOT and PANETONE_WAKTERM_DEV_STATE_ROOT may point
-at fresh private paths containing "panetone-wakterm-dev". The Phase 5B
-preflight uses these overrides so every run starts with pinned source and
-disposable state.
+at fresh private paths containing "panetone-wakterm-dev".
 EOF
 }
 

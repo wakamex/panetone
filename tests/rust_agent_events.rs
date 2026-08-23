@@ -1,8 +1,7 @@
 use std::fs;
 
-use panetone::domain::{AgentBinding, ChannelBinding, Route, RouteId, RouteStatus};
-use panetone::promotion::{EventCursorGap, OperatorAction, OperatorMutation};
-use panetone::store::{StoreError, StoreHandle};
+use panetone::domain::{AgentBinding, ChannelBinding, ChannelKind, Route, RouteId};
+use panetone::store::{EventCursorGap, RouteAgent, StoreError, StoreHandle};
 use panetone::wakterm::EventRecord;
 use rusqlite::Connection;
 use tempfile::tempdir;
@@ -28,16 +27,14 @@ fn route() -> Route {
             harness: "codex".into(),
             pane_id: Some(11),
         }),
-        status: RouteStatus::Available,
     }
 }
 
-fn mutation(action: OperatorAction) -> OperatorMutation {
-    OperatorMutation {
-        operation_id: Uuid::new_v4(),
-        intent: None,
-        action,
-    }
+fn live_agents(route: &Route) -> Vec<RouteAgent> {
+    vec![RouteAgent {
+        route_id: route.id,
+        agent: route.agent.clone().unwrap(),
+    }]
 }
 
 fn fixture_events() -> Vec<EventRecord> {
@@ -57,21 +54,15 @@ async fn event_page_recording_output_projection_and_cursor_advance_are_atomic() 
     store.save_route(route.clone(), 1).await.unwrap();
     store
         .set_metadata(
-            "migrated_route_preferences_v1".into(),
+            "route_output_preferences_v1".into(),
             serde_json::json!({route.id.to_string(): "tg"}).to_string(),
         )
         .await
         .unwrap();
-    store
-        .apply_operator_mutation(
-            mutation(OperatorAction::InitializeEventCursor { sequence: 100 }),
-            2,
-        )
-        .await
-        .unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
 
     let outcome = store
-        .ingest_agent_events(100, 107, fixture_events(), 3)
+        .ingest_agent_events(100, 107, fixture_events(), live_agents(&route), 3)
         .await
         .unwrap();
     assert_eq!(outcome.recorded, 7);
@@ -79,8 +70,22 @@ async fn event_page_recording_output_projection_and_cursor_advance_are_atomic() 
     assert_eq!(outcome.unrouted, 0);
     assert_eq!(outcome.next_after_sequence, 107);
     let status = store.status().await.unwrap();
-    assert_eq!(status.promotion.event_cursor, Some(107));
+    assert_eq!(status.event_cursor, Some(107));
     assert_eq!(status.pending_outbox, 2);
+    let disposition = store
+        .output_disposition(
+            "agent-zola".into(),
+            "incarnation-zola-7".into(),
+            100,
+            "Working on café support ✓".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(disposition.event_cursor, Some(107));
+    let routed = disposition.output.unwrap();
+    assert_eq!(routed.disposition, "projected");
+    assert_eq!(routed.route_id, Some(route.id));
+    assert_eq!(routed.event.kind, "assistant_message");
     let output = store.pending_outbox().await.unwrap();
     assert_eq!(output[0].destination, "101");
     assert_eq!(output[0].sender_harness.as_deref(), Some("codex"));
@@ -108,12 +113,71 @@ async fn event_page_recording_output_projection_and_cursor_advance_are_atomic() 
     assert_eq!(projected, 2);
     drop(connection);
     let reopened = StoreHandle::open(&path).unwrap();
-    assert_eq!(
-        reopened.promotion_status().await.unwrap().event_cursor,
-        Some(107)
-    );
+    assert_eq!(reopened.status().await.unwrap().event_cursor, Some(107));
     assert_eq!(reopened.pending_outbox().await.unwrap().len(), 2);
     reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn output_disposition_exposes_unrouted_assistant_output() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let event = fixture_events()
+        .into_iter()
+        .find(|event| event.kind == "assistant_message")
+        .unwrap();
+    let expected = event.sequence - 1;
+    store.initialize_event_cursor(expected).await.unwrap();
+    store
+        .ingest_agent_events(expected, event.sequence, vec![event], Vec::new(), 3)
+        .await
+        .unwrap();
+
+    let snapshot = store
+        .output_disposition(
+            "agent-zola".into(),
+            "incarnation-zola-7".into(),
+            expected,
+            "Working on café support ✓".into(),
+        )
+        .await
+        .unwrap();
+    let output = snapshot.output.unwrap();
+    assert_eq!(output.disposition, "unrouted");
+    assert_eq!(output.route_id, None);
+    assert_eq!(store.status().await.unwrap().unrouted_agent_events, 1);
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_output_defaults_to_an_available_signal_binding() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let route = route();
+    store.save_route(route.clone(), 1).await.unwrap();
+    let event = fixture_events()
+        .into_iter()
+        .find(|event| event.kind == "assistant_message")
+        .unwrap();
+    let expected = event.sequence - 1;
+    store.initialize_event_cursor(expected).await.unwrap();
+
+    store
+        .ingest_agent_events(
+            expected,
+            event.sequence,
+            vec![event],
+            live_agents(&route),
+            3,
+        )
+        .await
+        .unwrap();
+
+    let output = store.pending_outbox().await.unwrap();
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].kind, ChannelKind::Signal);
+    assert_eq!(output[0].destination, "signal-zola");
+    store.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -121,14 +185,9 @@ async fn invalid_visible_event_rolls_back_event_and_cursor_together() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("state.sqlite3");
     let store = StoreHandle::open(&path).unwrap();
-    store.save_route(route(), 1).await.unwrap();
-    store
-        .apply_operator_mutation(
-            mutation(OperatorAction::InitializeEventCursor { sequence: 100 }),
-            2,
-        )
-        .await
-        .unwrap();
+    let route = route();
+    store.save_route(route.clone(), 1).await.unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
     let mut event = fixture_events()
         .into_iter()
         .find(|event| event.kind == "assistant_message")
@@ -137,12 +196,12 @@ async fn invalid_visible_event_rolls_back_event_and_cursor_together() {
 
     assert!(matches!(
         store
-            .ingest_agent_events(100, event.sequence, vec![event], 3)
+            .ingest_agent_events(100, event.sequence, vec![event], live_agents(&route), 3,)
             .await,
         Err(StoreError::Conflict(_))
     ));
     let status = store.status().await.unwrap();
-    assert_eq!(status.promotion.event_cursor, Some(100));
+    assert_eq!(status.event_cursor, Some(100));
     assert_eq!(status.pending_outbox, 0);
     store.shutdown().await.unwrap();
     let connection = Connection::open(&path).unwrap();
@@ -153,35 +212,19 @@ async fn invalid_visible_event_rolls_back_event_and_cursor_together() {
 }
 
 #[tokio::test]
-async fn cursor_gap_takes_a_fresh_catalog_baseline_and_requires_audited_acknowledgement() {
+async fn cursor_gap_takes_a_fresh_catalog_baseline_and_remains_visible() {
     let directory = tempdir().unwrap();
     let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
     let route = route();
     store.save_route(route.clone(), 1).await.unwrap();
-    store
-        .apply_operator_mutation(
-            mutation(OperatorAction::InitializeEventCursor { sequence: 12 }),
-            2,
-        )
-        .await
-        .unwrap();
-    store
-        .apply_operator_mutation(
-            mutation(OperatorAction::SetRouteEnabled {
-                route_id: route.id,
-                enabled: true,
-            }),
-            3,
-        )
-        .await
-        .unwrap();
+    store.initialize_event_cursor(12).await.unwrap();
 
     let fixture: serde_json::Value = serde_json::from_str(
         &fs::read_to_string("/code/wakterm/docs/agent-api/v1/golden-fixtures.json").unwrap(),
     )
     .unwrap();
     let catalog = serde_json::from_value(fixture["catalog"].clone()).unwrap();
-    let held = store
+    store
         .recover_event_cursor_gap(
             EventCursorGap {
                 requested_after_sequence: 12,
@@ -195,37 +238,15 @@ async fn cursor_gap_takes_a_fresh_catalog_baseline_and_requires_audited_acknowle
         )
         .await
         .unwrap();
-    assert!(held.delivery_hold);
-    assert_eq!(held.event_cursor, Some(100));
+    let status = store.status().await.unwrap();
+    assert_eq!(status.event_cursor, Some(100));
     assert_eq!(
-        held.event_cursor_gap
+        status
+            .event_cursor_gap
             .as_ref()
             .unwrap()
             .requested_after_sequence,
         12
     );
-    assert!(matches!(
-        store
-            .apply_operator_mutation(mutation(OperatorAction::SetDeliveryHold { held: false }), 5,)
-            .await,
-        Err(StoreError::Conflict(_))
-    ));
-    store
-        .apply_operator_mutation(
-            mutation(OperatorAction::AcknowledgeEventCursorGap {
-                requested_after_sequence: 12,
-                evidence: "reviewed retained-output loss and Telegram state".into(),
-            }),
-            6,
-        )
-        .await
-        .unwrap();
-    store
-        .apply_operator_mutation(mutation(OperatorAction::SetDeliveryHold { held: false }), 7)
-        .await
-        .unwrap();
-    let released = store.promotion_status().await.unwrap();
-    assert!(!released.delivery_hold);
-    assert!(released.event_cursor_gap.is_none());
     store.shutdown().await.unwrap();
 }

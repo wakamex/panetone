@@ -3,7 +3,7 @@ use std::sync::Arc;
 use panetone::channels::RecordingChannels;
 use panetone::domain::{
     AdmissionStatus, AgentBinding, ChannelBinding, ChannelKind, DeliveryState, Route, RouteId,
-    RouteStatus, SendCommand, WorkflowId, WorkflowState,
+    SendCommand, WorkflowId, WorkflowState,
 };
 use panetone::service::{FaultInjector, FaultPoint, OfflineService, ServiceError};
 use panetone::store::StoreHandle;
@@ -35,7 +35,6 @@ fn route(value: u128, title: &str, binding: AgentBinding, channel: ChannelBindin
         title: title.into(),
         channels: vec![channel],
         agent: Some(binding),
-        status: RouteStatus::Available,
     }
 }
 
@@ -273,13 +272,12 @@ async fn missing_source_agent_keeps_the_result_visible_and_durable() {
         status: "completed".into(),
         message: "source has gone away".into(),
     };
-    source.status = RouteStatus::Unavailable;
     source.agent = None;
     let returned = service
         .accept_terminal(terminal, &source, 200)
         .await
         .unwrap();
-    assert_eq!(returned.agent.state, DeliveryState::Failed);
+    assert_eq!(returned.agent.state, DeliveryState::Pending);
     assert_eq!(returned.mirror.state, DeliveryState::Delivered);
     assert_eq!(store.status().await.unwrap().unresolved_returns, 1);
     assert!(

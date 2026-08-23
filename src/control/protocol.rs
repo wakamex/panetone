@@ -28,6 +28,27 @@ pub struct SendParams {
     pub timeout_ms: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RouteInspectParams {
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RouteEnsureParams {
+    pub title: String,
+    #[serde(default)]
+    pub telegram_topic_id: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OutputDispositionParams {
+    pub route: String,
+    pub agent_id: String,
+    pub incarnation_id: String,
+    pub after_sequence: u64,
+    pub expected_text: String,
+}
+
 impl SendParams {
     pub fn into_command(self, id: Uuid) -> SendCommand {
         SendCommand {

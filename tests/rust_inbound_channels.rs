@@ -62,6 +62,7 @@ async fn telegram_updates_are_durable_before_the_confirmation_cursor_advances() 
                     "chat": {"id": -1001},
                     "message_thread_id": 77,
                     "from": {"id": 42, "first_name": "Alice", "last_name": "Smith"},
+                    "reply_to_message": {"message_id": 501},
                     "text": "hello"
                 }
             },
@@ -88,6 +89,10 @@ async fn telegram_updates_are_durable_before_the_confirmation_cursor_advances() 
     assert_eq!(batch.messages[0].destination, "77");
     assert_eq!(batch.messages[0].sender_id.as_deref(), Some("42"));
     assert_eq!(batch.messages[0].sender.as_deref(), Some("Alice Smith"));
+    assert_eq!(
+        batch.messages[0].reply_to_external_id.as_deref(),
+        Some("501")
+    );
 
     let directory = tempdir().unwrap();
     let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
@@ -111,6 +116,12 @@ async fn telegram_updates_are_durable_before_the_confirmation_cursor_advances() 
         0
     );
     assert_eq!(store.status().await.unwrap().pending_inbox, 1);
+    assert_eq!(
+        store.pending_inbox().await.unwrap()[0]
+            .reply_to_external_id
+            .as_deref(),
+        Some("501")
+    );
     store.shutdown().await.unwrap();
 }
 
@@ -142,6 +153,7 @@ async fn signal_notifications_are_normalized_and_deduplicated_durably() {
                         "timestamp": 9001,
                         "dataMessage": {
                             "message": "signal hello",
+                            "quote": {"id": 8001},
                             "groupInfo": {"groupId": "group-one=="}
                         }
                     }
@@ -166,5 +178,11 @@ async fn signal_notifications_are_normalized_and_deduplicated_durably() {
     );
     server.await.unwrap();
     assert_eq!(store.status().await.unwrap().pending_inbox, 1);
+    assert_eq!(
+        store.pending_inbox().await.unwrap()[0]
+            .reply_to_external_id
+            .as_deref(),
+        Some("8001")
+    );
     store.shutdown().await.unwrap();
 }

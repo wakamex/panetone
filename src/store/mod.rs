@@ -12,67 +12,13 @@ use uuid::Uuid;
 
 use crate::domain::{
     AgentBinding, CallbackDelivery, ChannelKind, DeliveryState, EffectId, OutboxItem, OutboxState,
-    ReconcileDecision, Route, RouteId, SEMANTIC_HASH_KIND, SendCommand, Workflow, WorkflowId,
-    WorkflowState, semantic_request_hash, stored_request_hash_matches,
-};
-use crate::promotion::{
-    EventCursorGap, LegacyDecision, LegacyRecordKind, OperatorAction, OperatorMutation,
-    OperatorOutcome, PromotionStatus,
+    Route, RouteId, SEMANTIC_HASH_KIND, SendCommand, Workflow, WorkflowId, WorkflowState,
+    semantic_request_hash,
 };
 use crate::wakterm::{AgentCatalog, EventRecord};
 
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 7;
 const COMMAND_CAPACITY: usize = 128;
-const PHASE5_SCHEMA_SQL: &str = "
-    CREATE TABLE promotion_state (
-        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-        delivery_hold INTEGER NOT NULL CHECK(delivery_hold IN (0, 1)),
-        event_cursor INTEGER,
-        updated_at_ms INTEGER NOT NULL
-    );
-    INSERT INTO promotion_state(singleton, delivery_hold, event_cursor, updated_at_ms)
-    VALUES (1, 1, NULL, 0);
-    CREATE TABLE route_delivery_policy (
-        route_id TEXT PRIMARY KEY REFERENCES routes(route_id),
-        enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
-        updated_at_ms INTEGER NOT NULL
-    );
-    CREATE TABLE legacy_dispositions (
-        record_kind TEXT NOT NULL,
-        record_id TEXT NOT NULL,
-        decision TEXT NOT NULL,
-        evidence TEXT NOT NULL,
-        operation_id TEXT NOT NULL UNIQUE,
-        record_json TEXT NOT NULL,
-        resolved_at_ms INTEGER NOT NULL,
-        PRIMARY KEY(record_kind, record_id)
-    );
-    CREATE TABLE operator_actions (
-        operation_id TEXT PRIMARY KEY,
-        action_json TEXT NOT NULL,
-        outcome_json TEXT NOT NULL,
-        created_at_ms INTEGER NOT NULL
-    );
-    PRAGMA user_version = 4;
-";
-const EVENT_SCHEMA_SQL: &str = "
-    CREATE TABLE agent_events (
-        sequence INTEGER PRIMARY KEY,
-        event_id TEXT NOT NULL,
-        agent_id TEXT NOT NULL,
-        incarnation_id TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        route_id TEXT,
-        state TEXT NOT NULL,
-        record_json TEXT NOT NULL,
-        created_at_ms INTEGER NOT NULL,
-        UNIQUE(event_id, incarnation_id)
-    );
-    CREATE INDEX agent_events_state ON agent_events(state, sequence);
-    CREATE INDEX agent_events_agent
-        ON agent_events(agent_id, incarnation_id, sequence);
-    PRAGMA user_version = 5;
-";
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -84,6 +30,8 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("database schema {found} is newer than supported schema {supported}")]
     NewerSchema { found: i64, supported: i64 },
+    #[error("database schema {found} predates the supported post-cutover schema {supported}")]
+    OlderSchema { found: i64, supported: i64 },
     #[error("database path must not be a symbolic link")]
     Symlink,
     #[error("the store owner task stopped")]
@@ -143,9 +91,21 @@ pub struct InboxItem {
     pub sender_id: Option<String>,
     #[serde(default)]
     pub sender: Option<String>,
+    #[serde(default)]
+    pub reply_to_external_id: Option<String>,
     pub body: String,
     pub state: String,
     pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EventCursorGap {
+    pub requested_after_sequence: u64,
+    pub oldest_available_sequence: u64,
+    pub latest_sequence: u64,
+    pub recovery_catalog_as_of_sequence: u64,
+    pub fresh_catalog_as_of_sequence: u64,
+    pub recorded_at_ms: i64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -162,14 +122,11 @@ pub struct StoreStatus {
     pub indeterminate_outbox: u64,
     pub pending_inbox: u64,
     pub tombstones: u64,
-    pub legacy_control_requests: u64,
-    pub legacy_indeterminate_requests: u64,
-    pub legacy_unresolved_returns: u64,
-    pub legacy_debate_outbox: u64,
-    pub signal_messages: u64,
     pub unrouted_agent_events: u64,
     pub observer_failure_events: u64,
-    pub promotion: PromotionStatus,
+    pub event_cursor: Option<u64>,
+    pub event_cursor_gap: Option<EventCursorGap>,
+    pub telegram_update_offset: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -178,6 +135,26 @@ pub struct EventIngestOutcome {
     pub visible_outputs: u64,
     pub unrouted: u64,
     pub next_after_sequence: u64,
+    pub last_agents: Vec<RouteAgent>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RouteAgent {
+    pub route_id: RouteId,
+    pub agent: AgentBinding,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct StoredAgentOutput {
+    pub event: EventRecord,
+    pub route_id: Option<RouteId>,
+    pub disposition: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct OutputDispositionSnapshot {
+    pub event_cursor: Option<u64>,
+    pub output: Option<StoredAgentOutput>,
 }
 
 #[derive(Clone)]
@@ -249,6 +226,12 @@ enum Command {
     PendingOutbox {
         reply: oneshot::Sender<StoreResult<Vec<OutboxItem>>>,
     },
+    FindOutboxAgent {
+        channel: ChannelKind,
+        destination: String,
+        external_receipt: String,
+        reply: oneshot::Sender<StoreResult<Option<AgentBinding>>>,
+    },
     AcceptInbox {
         item: InboxItem,
         reply: oneshot::Sender<StoreResult<bool>>,
@@ -271,39 +254,33 @@ enum Command {
         key: String,
         reply: oneshot::Sender<StoreResult<Option<String>>>,
     },
-    PromotionStatus {
-        reply: oneshot::Sender<StoreResult<PromotionStatus>>,
+    InitializeEventCursor {
+        sequence: u64,
+        reply: oneshot::Sender<StoreResult<u64>>,
     },
-    ApplyOperatorMutation {
-        mutation: OperatorMutation,
-        now_ms: i64,
-        reply: oneshot::Sender<StoreResult<OperatorOutcome>>,
-    },
-    OperatorReplay {
-        operation_id: Uuid,
-        intent: Value,
-        reply: oneshot::Sender<StoreResult<Option<OperatorOutcome>>>,
-    },
-    AdvanceEventCursor {
-        expected: u64,
-        next: u64,
-        reply: oneshot::Sender<StoreResult<()>>,
+    RebaselinePassiveOutput {
+        sequence: u64,
+        reply: oneshot::Sender<StoreResult<u64>>,
     },
     IngestAgentEvents {
         expected: u64,
         next: u64,
         events: Vec<EventRecord>,
+        route_agents: Vec<RouteAgent>,
         now_ms: i64,
         reply: oneshot::Sender<StoreResult<EventIngestOutcome>>,
     },
     RecoverEventCursorGap {
         gap: EventCursorGap,
         catalog: AgentCatalog,
-        reply: oneshot::Sender<StoreResult<PromotionStatus>>,
+        reply: oneshot::Sender<StoreResult<()>>,
     },
-    Compact {
-        before_ms: i64,
-        reply: oneshot::Sender<StoreResult<u64>>,
+    OutputDisposition {
+        agent_id: String,
+        incarnation_id: String,
+        after_sequence: u64,
+        expected_text: String,
+        reply: oneshot::Sender<StoreResult<OutputDispositionSnapshot>>,
     },
     Status {
         reply: oneshot::Sender<StoreResult<StoreStatus>>,
@@ -467,6 +444,21 @@ impl StoreHandle {
         self.request(|reply| Command::PendingOutbox { reply }).await
     }
 
+    pub async fn find_outbox_agent(
+        &self,
+        channel: ChannelKind,
+        destination: String,
+        external_receipt: String,
+    ) -> StoreResult<Option<AgentBinding>> {
+        self.request(|reply| Command::FindOutboxAgent {
+            channel,
+            destination,
+            external_receipt,
+            reply,
+        })
+        .await
+    }
+
     pub async fn accept_inbox(&self, item: InboxItem) -> StoreResult<bool> {
         self.request(|reply| Command::AcceptInbox { item, reply })
             .await
@@ -501,44 +493,14 @@ impl StoreHandle {
             .await
     }
 
-    pub async fn promotion_status(&self) -> StoreResult<PromotionStatus> {
-        self.request(|reply| Command::PromotionStatus { reply })
+    pub async fn initialize_event_cursor(&self, sequence: u64) -> StoreResult<u64> {
+        self.request(|reply| Command::InitializeEventCursor { sequence, reply })
             .await
     }
 
-    pub async fn apply_operator_mutation(
-        &self,
-        mutation: OperatorMutation,
-        now_ms: i64,
-    ) -> StoreResult<OperatorOutcome> {
-        self.request(|reply| Command::ApplyOperatorMutation {
-            mutation,
-            now_ms,
-            reply,
-        })
-        .await
-    }
-
-    pub async fn operator_replay(
-        &self,
-        operation_id: Uuid,
-        intent: Value,
-    ) -> StoreResult<Option<OperatorOutcome>> {
-        self.request(|reply| Command::OperatorReplay {
-            operation_id,
-            intent,
-            reply,
-        })
-        .await
-    }
-
-    pub async fn advance_event_cursor(&self, expected: u64, next: u64) -> StoreResult<()> {
-        self.request(|reply| Command::AdvanceEventCursor {
-            expected,
-            next,
-            reply,
-        })
-        .await
+    pub async fn rebaseline_passive_output(&self, sequence: u64) -> StoreResult<u64> {
+        self.request(|reply| Command::RebaselinePassiveOutput { sequence, reply })
+            .await
     }
 
     pub async fn ingest_agent_events(
@@ -546,12 +508,14 @@ impl StoreHandle {
         expected: u64,
         next: u64,
         events: Vec<EventRecord>,
+        route_agents: Vec<RouteAgent>,
         now_ms: i64,
     ) -> StoreResult<EventIngestOutcome> {
         self.request(|reply| Command::IngestAgentEvents {
             expected,
             next,
             events,
+            route_agents,
             now_ms,
             reply,
         })
@@ -562,7 +526,7 @@ impl StoreHandle {
         &self,
         gap: EventCursorGap,
         catalog: AgentCatalog,
-    ) -> StoreResult<PromotionStatus> {
+    ) -> StoreResult<()> {
         self.request(|reply| Command::RecoverEventCursorGap {
             gap,
             catalog,
@@ -571,9 +535,21 @@ impl StoreHandle {
         .await
     }
 
-    pub async fn compact(&self, before_ms: i64) -> StoreResult<u64> {
-        self.request(|reply| Command::Compact { before_ms, reply })
-            .await
+    pub async fn output_disposition(
+        &self,
+        agent_id: String,
+        incarnation_id: String,
+        after_sequence: u64,
+        expected_text: String,
+    ) -> StoreResult<OutputDispositionSnapshot> {
+        self.request(|reply| Command::OutputDisposition {
+            agent_id,
+            incarnation_id,
+            after_sequence,
+            expected_text,
+            reply,
+        })
+        .await
     }
 
     pub async fn status(&self) -> StoreResult<StoreStatus> {
@@ -667,6 +643,15 @@ fn handle_command(connection: &mut Connection, command: Command) {
             reply,
         } => send_reply(reply, save_outbox(connection, &item, now_ms)),
         Command::PendingOutbox { reply } => send_reply(reply, pending_outbox(connection)),
+        Command::FindOutboxAgent {
+            channel,
+            destination,
+            external_receipt,
+            reply,
+        } => send_reply(
+            reply,
+            find_outbox_agent(connection, channel, &destination, &external_receipt),
+        ),
         Command::AcceptInbox { item, reply } => send_reply(reply, accept_inbox(connection, &item)),
         Command::PendingInbox { reply } => send_reply(reply, pending_inbox(connection)),
         Command::SaveInbox {
@@ -682,41 +667,44 @@ fn handle_command(connection: &mut Connection, command: Command) {
             send_reply(reply, set_metadata(connection, &key, &value))
         }
         Command::GetMetadata { key, reply } => send_reply(reply, get_metadata(connection, &key)),
-        Command::PromotionStatus { reply } => send_reply(reply, promotion_status(connection)),
-        Command::ApplyOperatorMutation {
-            mutation,
-            now_ms,
-            reply,
-        } => send_reply(
-            reply,
-            apply_operator_mutation(connection, &mutation, now_ms),
-        ),
-        Command::OperatorReplay {
-            operation_id,
-            intent,
-            reply,
-        } => send_reply(reply, operator_replay(connection, operation_id, &intent)),
-        Command::AdvanceEventCursor {
-            expected,
-            next,
-            reply,
-        } => send_reply(reply, advance_event_cursor(connection, expected, next)),
+        Command::InitializeEventCursor { sequence, reply } => {
+            send_reply(reply, initialize_event_cursor(connection, sequence))
+        }
+        Command::RebaselinePassiveOutput { sequence, reply } => {
+            send_reply(reply, rebaseline_passive_output(connection, sequence))
+        }
         Command::IngestAgentEvents {
             expected,
             next,
             events,
+            route_agents,
             now_ms,
             reply,
         } => send_reply(
             reply,
-            ingest_agent_events(connection, expected, next, &events, now_ms),
+            ingest_agent_events(connection, expected, next, &events, &route_agents, now_ms),
         ),
         Command::RecoverEventCursorGap {
             gap,
             catalog,
             reply,
         } => send_reply(reply, recover_event_cursor_gap(connection, &gap, &catalog)),
-        Command::Compact { before_ms, reply } => send_reply(reply, compact(connection, before_ms)),
+        Command::OutputDisposition {
+            agent_id,
+            incarnation_id,
+            after_sequence,
+            expected_text,
+            reply,
+        } => send_reply(
+            reply,
+            output_disposition(
+                connection,
+                &agent_id,
+                &incarnation_id,
+                after_sequence,
+                &expected_text,
+            ),
+        ),
         Command::Status { reply } => send_reply(reply, status(connection)),
         Command::Shutdown { reply } => send_reply(reply, Ok(())),
     }
@@ -818,73 +806,6 @@ pub(crate) fn migrate_schema(connection: &mut Connection) -> StoreResult<()> {
                  key TEXT PRIMARY KEY,
                  value TEXT NOT NULL
              );
-             CREATE TABLE legacy_control_requests (
-                 request_id TEXT PRIMARY KEY REFERENCES idempotency_tombstones(request_id),
-                 state TEXT NOT NULL,
-                 source TEXT NOT NULL,
-                 target TEXT NOT NULL,
-                 record_json TEXT NOT NULL,
-                 created_at_ms INTEGER NOT NULL,
-                 updated_at_ms INTEGER NOT NULL
-             );
-             CREATE TABLE legacy_return_deliveries (
-                 request_id TEXT PRIMARY KEY REFERENCES idempotency_tombstones(request_id),
-                 state TEXT NOT NULL,
-                 agent_state TEXT NOT NULL,
-                 mirror_state TEXT NOT NULL,
-                 record_json TEXT NOT NULL,
-                 created_at_ms INTEGER NOT NULL,
-                 updated_at_ms INTEGER NOT NULL
-             );
-             CREATE TABLE signal_messages (
-                 legacy_id TEXT PRIMARY KEY,
-                 group_id TEXT NOT NULL,
-                 state TEXT NOT NULL,
-                 record_json TEXT NOT NULL,
-                 received_at_ms INTEGER NOT NULL
-             );
-             CREATE INDEX signal_messages_state
-                 ON signal_messages(state, received_at_ms);
-             CREATE TABLE legacy_debate_outbox (
-                 effect_id TEXT PRIMARY KEY,
-                 destination TEXT NOT NULL,
-                 record_json TEXT NOT NULL,
-                 resolution_state TEXT NOT NULL,
-                 resolution_json TEXT,
-                 created_at_ms INTEGER NOT NULL,
-                 updated_at_ms INTEGER NOT NULL
-             );
-             CREATE INDEX legacy_debate_resolution
-                 ON legacy_debate_outbox(resolution_state, created_at_ms);
-             CREATE TABLE promotion_state (
-                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                 delivery_hold INTEGER NOT NULL CHECK(delivery_hold IN (0, 1)),
-                 event_cursor INTEGER,
-                 updated_at_ms INTEGER NOT NULL
-             );
-             INSERT INTO promotion_state(singleton, delivery_hold, event_cursor, updated_at_ms)
-             VALUES (1, 1, NULL, 0);
-             CREATE TABLE route_delivery_policy (
-                 route_id TEXT PRIMARY KEY REFERENCES routes(route_id),
-                 enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
-                 updated_at_ms INTEGER NOT NULL
-             );
-             CREATE TABLE legacy_dispositions (
-                 record_kind TEXT NOT NULL,
-                 record_id TEXT NOT NULL,
-                 decision TEXT NOT NULL,
-                 evidence TEXT NOT NULL,
-                 operation_id TEXT NOT NULL UNIQUE,
-                 record_json TEXT NOT NULL,
-                 resolved_at_ms INTEGER NOT NULL,
-                 PRIMARY KEY(record_kind, record_id)
-             );
-             CREATE TABLE operator_actions (
-                 operation_id TEXT PRIMARY KEY,
-                 action_json TEXT NOT NULL,
-                 outcome_json TEXT NOT NULL,
-                 created_at_ms INTEGER NOT NULL
-             );
              CREATE TABLE agent_events (
                  sequence INTEGER PRIMARY KEY,
                  event_id TEXT NOT NULL,
@@ -900,105 +821,28 @@ pub(crate) fn migrate_schema(connection: &mut Connection) -> StoreResult<()> {
              CREATE INDEX agent_events_state ON agent_events(state, sequence);
              CREATE INDEX agent_events_agent
                  ON agent_events(agent_id, incarnation_id, sequence);
-             PRAGMA user_version = 5;",
+             PRAGMA user_version = 7;",
         )?;
         transaction.commit()?;
     }
-    if version == 1 {
+    if version == 6 {
         let transaction = connection.transaction()?;
-        transaction.execute_batch(
-            "ALTER TABLE idempotency_tombstones
-                 ADD COLUMN hash_kind TEXT NOT NULL DEFAULT 'semantic_v1';
-             CREATE TABLE legacy_control_requests (
-                 request_id TEXT PRIMARY KEY REFERENCES idempotency_tombstones(request_id),
-                 state TEXT NOT NULL,
-                 source TEXT NOT NULL,
-                 target TEXT NOT NULL,
-                 record_json TEXT NOT NULL,
-                 created_at_ms INTEGER NOT NULL,
-                 updated_at_ms INTEGER NOT NULL
-             );
-             CREATE TABLE legacy_return_deliveries (
-                 request_id TEXT PRIMARY KEY REFERENCES idempotency_tombstones(request_id),
-                 state TEXT NOT NULL,
-                 agent_state TEXT NOT NULL,
-                 mirror_state TEXT NOT NULL,
-                 record_json TEXT NOT NULL,
-                 created_at_ms INTEGER NOT NULL,
-                 updated_at_ms INTEGER NOT NULL
-             );
-             CREATE TABLE signal_messages (
-                 legacy_id TEXT PRIMARY KEY,
-                 group_id TEXT NOT NULL,
-                 state TEXT NOT NULL,
-                 record_json TEXT NOT NULL,
-                 received_at_ms INTEGER NOT NULL
-             );
-             CREATE INDEX signal_messages_state
-                 ON signal_messages(state, received_at_ms);
-             CREATE TABLE legacy_debate_outbox (
-                 effect_id TEXT PRIMARY KEY,
-                 destination TEXT NOT NULL,
-                 record_json TEXT NOT NULL,
-                 resolution_state TEXT NOT NULL,
-                 resolution_json TEXT,
-                 created_at_ms INTEGER NOT NULL,
-                 updated_at_ms INTEGER NOT NULL
-             );
-             CREATE INDEX legacy_debate_resolution
-                 ON legacy_debate_outbox(resolution_state, created_at_ms);
-             INSERT INTO legacy_debate_outbox(
-                 effect_id, destination, record_json, resolution_state,
-                 resolution_json, created_at_ms, updated_at_ms
-             )
-             SELECT effect_id, destination, record_json, 'held', NULL,
-                    created_at_ms, updated_at_ms
-             FROM outbox WHERE channel = 'debate';
-             DELETE FROM outbox WHERE channel = 'debate';
-             PRAGMA user_version = 3;",
+        transaction.execute(
+            "UPDATE routes
+             SET route_json = json_remove(route_json, '$.agent', '$.status')",
+            [],
         )?;
-        transaction.execute_batch(PHASE5_SCHEMA_SQL)?;
-        transaction.execute_batch(EVENT_SCHEMA_SQL)?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
     }
-    if version == 2 {
-        let transaction = connection.transaction()?;
-        transaction.execute_batch(
-            "CREATE TABLE legacy_debate_outbox (
-                 effect_id TEXT PRIMARY KEY,
-                 destination TEXT NOT NULL,
-                 record_json TEXT NOT NULL,
-                 resolution_state TEXT NOT NULL,
-                 resolution_json TEXT,
-                 created_at_ms INTEGER NOT NULL,
-                 updated_at_ms INTEGER NOT NULL
-             );
-             CREATE INDEX legacy_debate_resolution
-                 ON legacy_debate_outbox(resolution_state, created_at_ms);
-             INSERT INTO legacy_debate_outbox(
-                 effect_id, destination, record_json, resolution_state,
-                 resolution_json, created_at_ms, updated_at_ms
-             )
-             SELECT effect_id, destination, record_json, 'held', NULL,
-                    created_at_ms, updated_at_ms
-             FROM outbox WHERE channel = 'debate';
-             DELETE FROM outbox WHERE channel = 'debate';
-             PRAGMA user_version = 3;",
-        )?;
-        transaction.execute_batch(PHASE5_SCHEMA_SQL)?;
-        transaction.execute_batch(EVENT_SCHEMA_SQL)?;
-        transaction.commit()?;
-    }
-    if version == 3 {
-        let transaction = connection.transaction()?;
-        transaction.execute_batch(PHASE5_SCHEMA_SQL)?;
-        transaction.execute_batch(EVENT_SCHEMA_SQL)?;
-        transaction.commit()?;
-    }
-    if version == 4 {
-        let transaction = connection.transaction()?;
-        transaction.execute_batch(EVENT_SCHEMA_SQL)?;
-        transaction.commit()?;
+    if version != 0 && version < SCHEMA_VERSION {
+        if version == 6 {
+            return Ok(());
+        }
+        return Err(StoreError::OlderSchema {
+            found: version,
+            supported: SCHEMA_VERSION,
+        });
     }
     Ok(())
 }
@@ -1075,7 +919,7 @@ fn claim(
         .optional()?
     {
         return Ok(ClaimResult::Tombstone {
-            same_content: stored_request_hash_matches(&hash_kind, &stored_hash, &command),
+            same_content: hash_kind == SEMANTIC_HASH_KIND && stored_hash == semantic_hash,
             state,
         });
     }
@@ -1221,642 +1065,73 @@ fn list_routes(connection: &Connection) -> StoreResult<Vec<Route>> {
         .collect()
 }
 
-fn promotion_status(connection: &Connection) -> StoreResult<PromotionStatus> {
-    let (delivery_hold, event_cursor) = connection.query_row(
-        "SELECT delivery_hold, event_cursor FROM promotion_state WHERE singleton = 1",
-        [],
-        |row| Ok((row.get::<_, bool>(0)?, row.get::<_, Option<u64>>(1)?)),
+fn initialize_event_cursor(connection: &Connection, sequence: u64) -> StoreResult<u64> {
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES (\"wakterm_event_cursor\", ?1)
+         ON CONFLICT(key) DO NOTHING",
+        params![sequence.to_string()],
     )?;
-    let mut statement = connection.prepare(
-        "SELECT route_id FROM route_delivery_policy WHERE enabled = 1 ORDER BY route_id",
-    )?;
-    let enabled_routes = statement
-        .query_map([], |row| row.get::<_, String>(0))?
+    event_cursor(connection)?
+        .ok_or_else(|| StoreError::Conflict("Wakterm event cursor was not initialized".into()))
+}
+
+fn event_cursor(connection: &Connection) -> StoreResult<Option<u64>> {
+    get_metadata(connection, "wakterm_event_cursor")?
         .map(|value| {
-            let value = value?;
-            Uuid::parse_str(&value).map(RouteId::new).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })
+            value
+                .parse::<u64>()
+                .map_err(|_| StoreError::Conflict("stored Wakterm event cursor is invalid".into()))
         })
-        .collect::<Result<_, _>>()?;
-    Ok(PromotionStatus {
-        delivery_hold,
-        event_cursor,
-        event_cursor_gap: get_metadata(connection, "wakterm_event_cursor_gap_v1")?
-            .map(|value| serde_json::from_str(&value).map_err(StoreError::from))
-            .transpose()?,
-        telegram_update_offset: get_metadata(connection, "telegram_update_offset")?
-            .map(|value| {
-                value.parse::<u64>().map_err(|_| {
-                    StoreError::Conflict("stored Telegram update offset is invalid".into())
+        .transpose()
+}
+
+fn output_disposition(
+    connection: &Connection,
+    agent_id: &str,
+    incarnation_id: &str,
+    after_sequence: u64,
+    expected_text: &str,
+) -> StoreResult<OutputDispositionSnapshot> {
+    let stored = connection
+        .query_row(
+            "SELECT route_id, state, record_json
+             FROM agent_events
+             WHERE agent_id = ?1 AND incarnation_id = ?2
+               AND sequence > ?3 AND kind = 'assistant_message'
+               AND json_extract(record_json, '$.text') = ?4
+             ORDER BY sequence LIMIT 1",
+            params![agent_id, incarnation_id, after_sequence, expected_text],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let output = stored
+        .map(
+            |(route_id, disposition, record_json)| -> StoreResult<StoredAgentOutput> {
+                let route_id = route_id
+                    .map(|value| {
+                        Uuid::parse_str(&value).map(RouteId::new).map_err(|_| {
+                            StoreError::Conflict("stored event route ID is invalid".into())
+                        })
+                    })
+                    .transpose()?;
+                Ok(StoredAgentOutput {
+                    event: serde_json::from_str(&record_json)?,
+                    route_id,
+                    disposition,
                 })
-            })
-            .transpose()?,
-        enabled_routes,
-        operator_actions: count(connection, "SELECT COUNT(*) FROM operator_actions")?,
-        unresolved_legacy_controls: count(
-            connection,
-            "SELECT COUNT(*) FROM legacy_control_requests legacy
-             LEFT JOIN legacy_dispositions disposition
-               ON disposition.record_kind = 'control'
-              AND disposition.record_id = legacy.request_id
-             WHERE legacy.state = 'indeterminate' AND disposition.record_id IS NULL",
-        )?,
-        unresolved_legacy_returns: count(
-            connection,
-            "SELECT COUNT(*) FROM legacy_return_deliveries legacy
-             LEFT JOIN legacy_dispositions disposition
-               ON disposition.record_kind = 'return'
-              AND disposition.record_id = legacy.request_id
-             WHERE (legacy.agent_state != 'delivered' OR legacy.mirror_state != 'delivered')
-               AND disposition.record_id IS NULL",
-        )?,
-        held_legacy_debate: count(
-            connection,
-            "SELECT COUNT(*) FROM legacy_debate_outbox WHERE resolution_state = 'held'",
-        )?,
+            },
+        )
+        .transpose()?;
+    Ok(OutputDispositionSnapshot {
+        event_cursor: event_cursor(connection)?,
+        output,
     })
-}
-
-fn apply_operator_mutation(
-    connection: &mut Connection,
-    mutation: &OperatorMutation,
-    now_ms: i64,
-) -> StoreResult<OperatorOutcome> {
-    let operation_id = mutation.operation_id.to_string();
-    let action_json = serde_json::to_string(mutation)?;
-    if let Some((stored_action, outcome)) = connection
-        .query_row(
-            "SELECT action_json, outcome_json FROM operator_actions WHERE operation_id = ?1",
-            params![operation_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?
-    {
-        if stored_action != action_json {
-            return Err(StoreError::Conflict(format!(
-                "operator operation {} was already used with different content",
-                mutation.operation_id
-            )));
-        }
-        let mut outcome: OperatorOutcome = serde_json::from_str(&outcome)?;
-        outcome.replayed = true;
-        return Ok(outcome);
-    }
-
-    let transaction = connection.transaction()?;
-    let (detail, route) = apply_operator_action(&transaction, mutation, now_ms)?;
-    let mut promotion = promotion_status(&transaction)?;
-    promotion.operator_actions += 1;
-    let outcome = OperatorOutcome {
-        operation_id: mutation.operation_id,
-        replayed: false,
-        detail,
-        promotion,
-        route,
-    };
-    transaction.execute(
-        "INSERT INTO operator_actions(operation_id, action_json, outcome_json, created_at_ms)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![
-            operation_id,
-            action_json,
-            serde_json::to_string(&outcome)?,
-            now_ms,
-        ],
-    )?;
-    transaction.commit()?;
-    Ok(outcome)
-}
-
-fn operator_replay(
-    connection: &Connection,
-    operation_id: Uuid,
-    intent: &Value,
-) -> StoreResult<Option<OperatorOutcome>> {
-    let Some((action_json, outcome_json)) = connection
-        .query_row(
-            "SELECT action_json, outcome_json FROM operator_actions WHERE operation_id = ?1",
-            params![operation_id.to_string()],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?
-    else {
-        return Ok(None);
-    };
-    let stored: OperatorMutation = serde_json::from_str(&action_json)?;
-    if stored.intent.as_ref() != Some(intent) {
-        return Err(StoreError::Conflict(format!(
-            "operator operation {operation_id} was already used with different content"
-        )));
-    }
-    let mut outcome: OperatorOutcome = serde_json::from_str(&outcome_json)?;
-    outcome.replayed = true;
-    Ok(Some(outcome))
-}
-
-fn apply_operator_action(
-    transaction: &rusqlite::Transaction<'_>,
-    mutation: &OperatorMutation,
-    now_ms: i64,
-) -> StoreResult<(String, Option<Route>)> {
-    match &mutation.action {
-        OperatorAction::SetDeliveryHold { held } => {
-            if !held {
-                let (cursor, enabled): (Option<u64>, u64) = transaction.query_row(
-                    "SELECT event_cursor,
-                        (SELECT COUNT(*) FROM route_delivery_policy WHERE enabled = 1)
-                     FROM promotion_state WHERE singleton = 1",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )?;
-                if cursor.is_none() || enabled == 0 {
-                    return Err(StoreError::Conflict(
-                        "delivery cannot be released before an event cursor and canary route are set"
-                            .into(),
-                    ));
-                }
-                if get_metadata(transaction, "wakterm_event_cursor_gap_v1")?.is_some() {
-                    return Err(StoreError::Conflict(
-                        "delivery cannot be released until the Wakterm event cursor gap is acknowledged"
-                            .into(),
-                    ));
-                }
-            }
-            transaction.execute(
-                "UPDATE promotion_state SET delivery_hold = ?1, updated_at_ms = ?2
-                 WHERE singleton = 1",
-                params![held, now_ms],
-            )?;
-            Ok((
-                if *held {
-                    "global delivery hold is active"
-                } else {
-                    "global delivery hold is released for enabled routes"
-                }
-                .into(),
-                None,
-            ))
-        }
-        OperatorAction::SetRouteEnabled { route_id, enabled } => {
-            let route = get_route(transaction, *route_id)?
-                .ok_or_else(|| StoreError::Conflict(format!("route {route_id} does not exist")))?;
-            if *enabled && route.status != crate::domain::RouteStatus::Available {
-                return Err(StoreError::Conflict(format!(
-                    "route {:?} is not authoritatively available",
-                    route.title
-                )));
-            }
-            transaction.execute(
-                "INSERT INTO route_delivery_policy(route_id, enabled, updated_at_ms)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(route_id) DO UPDATE SET
-                     enabled = excluded.enabled, updated_at_ms = excluded.updated_at_ms",
-                params![route_id.to_string(), enabled, now_ms],
-            )?;
-            Ok((
-                format!(
-                    "route {:?} delivery is {}",
-                    route.title,
-                    if *enabled { "enabled" } else { "held" }
-                ),
-                Some(route),
-            ))
-        }
-        OperatorAction::InitializeEventCursor { sequence } => {
-            let existing: Option<u64> = transaction.query_row(
-                "SELECT event_cursor FROM promotion_state WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )?;
-            if existing.is_some_and(|value| value != *sequence) {
-                return Err(StoreError::Conflict(format!(
-                    "event cursor is already initialized at {}",
-                    existing.expect("existing cursor was checked")
-                )));
-            }
-            transaction.execute(
-                "UPDATE promotion_state SET event_cursor = ?1, updated_at_ms = ?2
-                 WHERE singleton = 1",
-                params![sequence, now_ms],
-            )?;
-            Ok((format!("event cursor initialized at {sequence}"), None))
-        }
-        OperatorAction::AcknowledgeEventCursorGap {
-            requested_after_sequence,
-            evidence,
-        } => {
-            if evidence.trim().is_empty() {
-                return Err(StoreError::Conflict(
-                    "cursor-gap acknowledgement requires evidence".into(),
-                ));
-            }
-            let stored =
-                get_metadata(transaction, "wakterm_event_cursor_gap_v1")?.ok_or_else(|| {
-                    StoreError::Conflict("there is no event cursor gap to acknowledge".into())
-                })?;
-            let gap: EventCursorGap = serde_json::from_str(&stored)?;
-            if gap.requested_after_sequence != *requested_after_sequence {
-                return Err(StoreError::Conflict(format!(
-                    "event cursor gap began at {}, not {requested_after_sequence}",
-                    gap.requested_after_sequence
-                )));
-            }
-            transaction.execute(
-                "DELETE FROM metadata WHERE key = 'wakterm_event_cursor_gap_v1'",
-                [],
-            )?;
-            Ok((
-                format!(
-                    "event cursor gap at {requested_after_sequence} acknowledged with evidence: {}",
-                    evidence.trim()
-                ),
-                None,
-            ))
-        }
-        OperatorAction::InitializeInboundCursor { channel, cursor } => {
-            if *channel != ChannelKind::Telegram {
-                return Err(StoreError::Conflict(
-                    "only Telegram has a caller-initialized inbound cursor".into(),
-                ));
-            }
-            let key = "telegram_update_offset";
-            if let Some(existing) = get_metadata(transaction, key)? {
-                if existing != cursor.to_string() {
-                    return Err(StoreError::Conflict(format!(
-                        "Telegram update offset is already initialized at {existing}"
-                    )));
-                }
-            } else {
-                set_metadata(transaction, key, &cursor.to_string())?;
-            }
-            Ok((
-                format!("Telegram update offset initialized at {cursor}"),
-                None,
-            ))
-        }
-        OperatorAction::ReconcileRoute {
-            route_id,
-            binding,
-            replace_identity,
-        } => {
-            if binding.pane_id.is_none() {
-                return Err(StoreError::Conflict(
-                    "route reconciliation requires the fresh ephemeral pane locator".into(),
-                ));
-            }
-            let mut route = get_route(transaction, *route_id)?
-                .ok_or_else(|| StoreError::Conflict(format!("route {route_id} does not exist")))?;
-            let decision = route.reconcile(Some(binding.clone()));
-            let decision =
-                if decision == ReconcileDecision::ReconciliationRequired && *replace_identity {
-                    route.agent = Some(binding.clone());
-                    route.status = crate::domain::RouteStatus::Available;
-                    ReconcileDecision::Rebound
-                } else {
-                    decision
-                };
-            save_route(transaction, &route, now_ms)?;
-            let detail = match decision {
-                ReconcileDecision::Unchanged => "route identity was already current",
-                ReconcileDecision::Rebound => "route was bound to the fresh Wakterm identity",
-                ReconcileDecision::Unavailable => "route remains unavailable",
-                ReconcileDecision::ReconciliationRequired => {
-                    "route identity changed and requires explicit replacement review"
-                }
-            };
-            Ok((detail.into(), Some(route)))
-        }
-        OperatorAction::DisposeLegacy {
-            record_kind,
-            record_id,
-            decision,
-            evidence,
-        } => dispose_legacy(
-            transaction,
-            mutation.operation_id,
-            *record_kind,
-            record_id,
-            decision,
-            evidence,
-            now_ms,
-        ),
-    }
-}
-
-fn dispose_legacy(
-    transaction: &rusqlite::Transaction<'_>,
-    operation_id: Uuid,
-    record_kind: LegacyRecordKind,
-    record_id: &str,
-    decision: &LegacyDecision,
-    evidence: &str,
-    now_ms: i64,
-) -> StoreResult<(String, Option<Route>)> {
-    if record_id.trim().is_empty() || evidence.trim().is_empty() || evidence.len() > 4096 {
-        return Err(StoreError::Conflict(
-            "legacy disposition requires a record ID and concise evidence".into(),
-        ));
-    }
-    let kind = legacy_kind_name(record_kind);
-    if transaction
-        .query_row(
-            "SELECT 1 FROM legacy_dispositions WHERE record_kind = ?1 AND record_id = ?2",
-            params![kind, record_id],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some()
-    {
-        return Err(StoreError::Conflict(format!(
-            "legacy {kind} record {record_id:?} already has a disposition"
-        )));
-    }
-
-    let route = match record_kind {
-        LegacyRecordKind::Control => {
-            require_legacy_record(
-                transaction,
-                "legacy_control_requests",
-                "request_id",
-                record_id,
-            )?;
-            reject_debate_mapping(decision)?;
-            None
-        }
-        LegacyRecordKind::Return => {
-            require_legacy_record(
-                transaction,
-                "legacy_return_deliveries",
-                "request_id",
-                record_id,
-            )?;
-            reject_debate_mapping(decision)?;
-            None
-        }
-        LegacyRecordKind::Debate => {
-            dispose_legacy_debate(transaction, record_id, decision, now_ms)?
-        }
-        LegacyRecordKind::Signal => dispose_legacy_signal(transaction, record_id, decision)?,
-    };
-    let record_json = serde_json::to_string(&serde_json::json!({
-        "record_kind": record_kind,
-        "record_id": record_id,
-        "decision": decision,
-        "evidence": evidence,
-    }))?;
-    transaction.execute(
-        "INSERT INTO legacy_dispositions(
-             record_kind, record_id, decision, evidence, operation_id,
-             record_json, resolved_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            kind,
-            record_id,
-            decision_name(decision),
-            evidence,
-            operation_id.to_string(),
-            record_json,
-            now_ms,
-        ],
-    )?;
-    Ok((
-        format!("legacy {kind} record {record_id:?} received an explicit disposition"),
-        route,
-    ))
-}
-
-fn dispose_legacy_debate(
-    transaction: &rusqlite::Transaction<'_>,
-    record_id: &str,
-    decision: &LegacyDecision,
-    now_ms: i64,
-) -> StoreResult<Option<Route>> {
-    let (destination, record_json): (String, String) = transaction
-        .query_row(
-            "SELECT destination, record_json FROM legacy_debate_outbox
-             WHERE effect_id = ?1 AND resolution_state = 'held'",
-            params![record_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?
-        .ok_or_else(|| {
-            StoreError::Conflict(format!(
-                "held legacy Debate record {record_id:?} is missing"
-            ))
-        })?;
-    match decision {
-        LegacyDecision::MapDebateToSignal {
-            route_id,
-            expected_legacy_destination,
-        } => {
-            if expected_legacy_destination != &destination {
-                return Err(StoreError::Conflict(
-                    "the asserted legacy Debate destination does not match durable state".into(),
-                ));
-            }
-            let route = get_route(transaction, *route_id)?
-                .ok_or_else(|| StoreError::Conflict(format!("route {route_id} does not exist")))?;
-            let signal_groups = route
-                .channels
-                .iter()
-                .filter_map(|binding| match binding {
-                    crate::domain::ChannelBinding::Signal { group_id } => Some(group_id),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            let [group_id] = signal_groups.as_slice() else {
-                return Err(StoreError::Conflict(
-                    "the selected route does not have exactly one Signal binding".into(),
-                ));
-            };
-            let legacy: Value = serde_json::from_str(&record_json)?;
-            let body = legacy["chunk"].as_str().ok_or_else(|| {
-                StoreError::Conflict("legacy Debate payload has no message body".into())
-            })?;
-            let sender_harness = legacy["harness"].as_str().ok_or_else(|| {
-                StoreError::Conflict("legacy Debate payload has no harness identity".into())
-            })?;
-            let effect_id = Uuid::parse_str(record_id)
-                .map(EffectId::new)
-                .map_err(|_| StoreError::Conflict("legacy Debate effect ID is invalid".into()))?;
-            let item = OutboxItem {
-                id: effect_id,
-                route_id: Some(route.id),
-                sender_harness: Some(sender_harness.to_owned()),
-                kind: ChannelKind::Signal,
-                destination: (*group_id).clone(),
-                body: body.to_owned(),
-                state: OutboxState::Pending,
-                attempts: 0,
-                last_error: None,
-                external_receipt: None,
-            };
-            enqueue_outbox(transaction, None, &item, now_ms)?;
-            transaction.execute(
-                "UPDATE legacy_debate_outbox
-                 SET resolution_state = 'mapped_to_signal', resolution_json = ?2,
-                     updated_at_ms = ?3 WHERE effect_id = ?1",
-                params![record_id, serde_json::to_string(&item)?, now_ms],
-            )?;
-            Ok(Some(route))
-        }
-        LegacyDecision::NoReplay | LegacyDecision::ExternallyVerified => {
-            transaction.execute(
-                "UPDATE legacy_debate_outbox
-                 SET resolution_state = 'no_replay', resolution_json = ?2,
-                     updated_at_ms = ?3 WHERE effect_id = ?1",
-                params![record_id, serde_json::to_string(decision)?, now_ms],
-            )?;
-            Ok(None)
-        }
-    }
-}
-
-fn dispose_legacy_signal(
-    transaction: &rusqlite::Transaction<'_>,
-    record_id: &str,
-    decision: &LegacyDecision,
-) -> StoreResult<Option<Route>> {
-    reject_debate_mapping(decision)?;
-    let state: String = transaction
-        .query_row(
-            "SELECT state FROM signal_messages WHERE legacy_id = ?1",
-            params![record_id],
-            |row| row.get(0),
-        )
-        .optional()?
-        .ok_or_else(|| {
-            StoreError::Conflict(format!("legacy Signal record {record_id:?} is missing"))
-        })?;
-
-    if state == "pending" {
-        let suffix = record_id.strip_prefix("sqlite:").ok_or_else(|| {
-            StoreError::Conflict(
-                "pending legacy Signal record must use the sqlite:<id> identifier".into(),
-            )
-        })?;
-        let external_suffix = format!("%:{suffix}");
-        let inbox_rows = transaction
-            .prepare(
-                "SELECT effect_id, record_json FROM inbox
-                 WHERE channel = 'signal' AND external_id LIKE ?1",
-            )?
-            .query_map(params![external_suffix], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        let [(effect_id, record_json)] = inbox_rows.as_slice() else {
-            return Err(StoreError::Conflict(format!(
-                "pending legacy Signal record {record_id:?} has no unique inbox item"
-            )));
-        };
-        let mut item: InboxItem = serde_json::from_str(record_json)?;
-        if item.state != "pending" {
-            return Err(StoreError::Conflict(format!(
-                "legacy Signal inbox item {effect_id:?} is not pending"
-            )));
-        }
-        item.state = "archived".into();
-        let changed = transaction.execute(
-            "UPDATE inbox SET state = 'archived', record_json = ?2
-             WHERE effect_id = ?1 AND state = 'pending'",
-            params![effect_id, serde_json::to_string(&item)?],
-        )?;
-        if changed != 1 {
-            return Err(StoreError::Conflict(format!(
-                "legacy Signal inbox item {effect_id:?} changed while being archived"
-            )));
-        }
-        transaction.execute(
-            "UPDATE signal_messages SET state = 'archived'
-             WHERE legacy_id = ?1 AND state = 'pending'",
-            params![record_id],
-        )?;
-    } else if state != "archived" {
-        return Err(StoreError::Conflict(format!(
-            "legacy Signal record {record_id:?} has unsupported state {state:?}"
-        )));
-    }
-
-    Ok(None)
-}
-
-fn require_legacy_record(
-    connection: &Connection,
-    table: &str,
-    column: &str,
-    record_id: &str,
-) -> StoreResult<()> {
-    let sql = format!(
-        "SELECT 1 FROM {} WHERE {} = ?1",
-        quote_identifier(table),
-        quote_identifier(column)
-    );
-    if connection
-        .query_row(&sql, params![record_id], |_| Ok(()))
-        .optional()?
-        .is_none()
-    {
-        return Err(StoreError::Conflict(format!(
-            "legacy record {record_id:?} is missing"
-        )));
-    }
-    Ok(())
-}
-
-fn quote_identifier(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
-}
-
-fn reject_debate_mapping(decision: &LegacyDecision) -> StoreResult<()> {
-    if matches!(decision, LegacyDecision::MapDebateToSignal { .. }) {
-        Err(StoreError::Conflict(
-            "only a held legacy Debate record can be mapped to Signal".into(),
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn legacy_kind_name(kind: LegacyRecordKind) -> &'static str {
-    match kind {
-        LegacyRecordKind::Control => "control",
-        LegacyRecordKind::Return => "return",
-        LegacyRecordKind::Debate => "debate",
-        LegacyRecordKind::Signal => "signal",
-    }
-}
-
-fn decision_name(decision: &LegacyDecision) -> &'static str {
-    match decision {
-        LegacyDecision::NoReplay => "no_replay",
-        LegacyDecision::ExternallyVerified => "externally_verified",
-        LegacyDecision::MapDebateToSignal { .. } => "map_debate_to_signal",
-    }
-}
-
-fn advance_event_cursor(connection: &Connection, expected: u64, next: u64) -> StoreResult<()> {
-    if next < expected {
-        return Err(StoreError::Conflict(
-            "event cursor cannot move backwards".into(),
-        ));
-    }
-    let changed = connection.execute(
-        "UPDATE promotion_state SET event_cursor = ?2
-         WHERE singleton = 1 AND event_cursor = ?1",
-        params![expected, next],
-    )?;
-    if changed != 1 {
-        return Err(StoreError::Conflict(format!(
-            "event cursor was not at expected sequence {expected}"
-        )));
-    }
-    Ok(())
 }
 
 fn ingest_agent_events(
@@ -1864,6 +1139,7 @@ fn ingest_agent_events(
     expected: u64,
     next: u64,
     events: &[EventRecord],
+    route_agents: &[RouteAgent],
     now_ms: i64,
 ) -> StoreResult<EventIngestOutcome> {
     if next < expected
@@ -1880,11 +1156,7 @@ fn ingest_agent_events(
         ));
     }
     let transaction = connection.transaction()?;
-    let current: Option<u64> = transaction.query_row(
-        "SELECT event_cursor FROM promotion_state WHERE singleton = 1",
-        [],
-        |row| row.get(0),
-    )?;
+    let current = event_cursor(&transaction)?;
     if current != Some(expected) {
         return Err(StoreError::Conflict(format!(
             "event cursor was not at expected sequence {expected}"
@@ -1930,13 +1202,11 @@ fn ingest_agent_events(
             )));
         }
 
-        let matching = routes
+        let matching = route_agents
             .iter()
-            .filter(|route| {
-                route.agent.as_ref().is_some_and(|binding| {
-                    binding.agent_id == event.agent_id
-                        && binding.incarnation_id == event.incarnation_id
-                })
+            .filter(|candidate| {
+                candidate.agent.agent_id == event.agent_id
+                    && candidate.agent.incarnation_id == event.incarnation_id
             })
             .collect::<Vec<_>>();
         if matching.len() > 1 {
@@ -1945,21 +1215,13 @@ fn ingest_agent_events(
                 event.event_id
             )));
         }
-        let route = matching.first().copied();
-        if event.kind == "agent_lifecycle" {
-            if let Some(route) = route {
-                let mut route = route.clone();
-                route.status = match event.fields.get("lifecycle").and_then(Value::as_str) {
-                    Some("available") => crate::domain::RouteStatus::Available,
-                    Some("unavailable") => crate::domain::RouteStatus::Unavailable,
-                    _ => {
-                        return Err(StoreError::Conflict(
-                            "agent lifecycle event has an invalid lifecycle".into(),
-                        ));
-                    }
-                };
-                save_route(&transaction, &route, now_ms)?;
-            }
+        let route_agent = matching.first().copied();
+        let route = route_agent
+            .and_then(|candidate| routes.iter().find(|route| route.id == candidate.route_id));
+        if route_agent.is_some() && route.is_none() {
+            return Err(StoreError::Conflict(
+                "live agent projection references a missing route".into(),
+            ));
         }
 
         let mut state = "recorded";
@@ -2009,7 +1271,8 @@ fn ingest_agent_events(
                     format!("{}\0{}", event.incarnation_id, event.event_id).as_bytes(),
                 )),
                 route_id: Some(route.id),
-                sender_harness: route.agent.as_ref().map(|agent| agent.harness.clone()),
+                sender_harness: route_agent.map(|candidate| candidate.agent.harness.clone()),
+                source_agent: route_agent.map(|candidate| candidate.agent.clone()),
                 kind,
                 destination,
                 body,
@@ -2021,14 +1284,29 @@ fn ingest_agent_events(
             enqueue_outbox(&transaction, None, &item, now_ms)?;
             state = "projected";
             outcome.visible_outputs += 1;
+            if let Some(candidate) = route_agent
+                && !outcome
+                    .last_agents
+                    .iter()
+                    .any(|existing| existing.route_id == candidate.route_id)
+            {
+                outcome.last_agents.push(candidate.clone());
+            } else if let Some(candidate) = route_agent
+                && let Some(existing) = outcome
+                    .last_agents
+                    .iter_mut()
+                    .find(|existing| existing.route_id == candidate.route_id)
+            {
+                *existing = candidate.clone();
+            }
         }
         insert_agent_event(&transaction, event, route_id, state, &record_json, now_ms)?;
         outcome.recorded += 1;
     }
     let changed = transaction.execute(
-        "UPDATE promotion_state SET event_cursor = ?2, updated_at_ms = ?3
-         WHERE singleton = 1 AND event_cursor = ?1",
-        params![expected, next, now_ms],
+        "UPDATE metadata SET value = ?2
+         WHERE key = 'wakterm_event_cursor' AND value = ?1",
+        params![expected.to_string(), next.to_string()],
     )?;
     if changed != 1 {
         return Err(StoreError::Conflict(format!(
@@ -2043,7 +1321,7 @@ fn recover_event_cursor_gap(
     connection: &mut Connection,
     gap: &EventCursorGap,
     catalog: &AgentCatalog,
-) -> StoreResult<PromotionStatus> {
+) -> StoreResult<()> {
     if catalog.schema != "wakterm.agent-api.v1" {
         return Err(StoreError::Conflict(
             "cursor-gap recovery requires a v1 Wakterm catalog".into(),
@@ -2057,53 +1335,25 @@ fn recover_event_cursor_gap(
         ));
     }
     let transaction = connection.transaction()?;
-    let current: Option<u64> = transaction.query_row(
-        "SELECT event_cursor FROM promotion_state WHERE singleton = 1",
-        [],
-        |row| row.get(0),
-    )?;
+    let current = event_cursor(&transaction)?;
     if current != Some(gap.requested_after_sequence) {
         return Err(StoreError::Conflict(format!(
             "event cursor was not at gap sequence {}",
             gap.requested_after_sequence
         )));
     }
-    if get_metadata(&transaction, "wakterm_event_cursor_gap_v1")?.is_some() {
-        return Err(StoreError::Conflict(
-            "an event cursor gap is already awaiting acknowledgement".into(),
-        ));
-    }
-
-    let mut routes = list_routes(&transaction)?;
-    for route in &mut routes {
-        let Some(binding) = route.agent.as_ref() else {
-            continue;
-        };
-        let live = catalog.agents.iter().any(|agent| {
-            agent.agent_id == binding.agent_id
-                && agent.incarnation_id.as_deref() == Some(binding.incarnation_id.as_str())
-                && agent.alive
-        });
-        route.status = if live {
-            crate::domain::RouteStatus::Available
-        } else {
-            crate::domain::RouteStatus::Unavailable
-        };
-        save_route(&transaction, route, gap.recorded_at_ms)?;
-    }
     set_metadata(
         &transaction,
         "wakterm_event_cursor_gap_v1",
         &serde_json::to_string(gap)?,
     )?;
-    transaction.execute(
-        "UPDATE promotion_state
-         SET delivery_hold = 1, event_cursor = ?1, updated_at_ms = ?2
-         WHERE singleton = 1",
-        params![gap.fresh_catalog_as_of_sequence, gap.recorded_at_ms],
+    set_metadata(
+        &transaction,
+        "wakterm_event_cursor",
+        &gap.fresh_catalog_as_of_sequence.to_string(),
     )?;
     transaction.commit()?;
-    promotion_status(connection)
+    Ok(())
 }
 
 fn insert_agent_event(
@@ -2137,7 +1387,7 @@ fn insert_agent_event(
 fn route_preferences(
     connection: &Connection,
 ) -> StoreResult<std::collections::BTreeMap<String, String>> {
-    let value = get_metadata(connection, "migrated_route_preferences_v1")?;
+    let value = get_metadata(connection, "route_output_preferences_v1")?;
     value
         .map(|value| serde_json::from_str(&value).map_err(StoreError::from))
         .transpose()
@@ -2145,11 +1395,22 @@ fn route_preferences(
 }
 
 fn output_destination(route: &Route, preference: Option<&str>) -> Option<(ChannelKind, String)> {
-    let preferred = match preference {
+    let selected = match preference {
         Some("tg") => Some(ChannelKind::Telegram),
         Some("sig") => Some(ChannelKind::Signal),
         _ => None,
-    };
+    }
+    .unwrap_or_else(|| {
+        if route
+            .channels
+            .iter()
+            .any(|binding| matches!(binding, crate::domain::ChannelBinding::Signal { .. }))
+        {
+            ChannelKind::Signal
+        } else {
+            ChannelKind::Telegram
+        }
+    });
     let telegram_topic = route.channels.iter().find_map(|binding| match binding {
         crate::domain::ChannelBinding::Telegram { topic_id } => Some(*topic_id),
         _ => None,
@@ -2158,16 +1419,10 @@ fn output_destination(route: &Route, preference: Option<&str>) -> Option<(Channe
         crate::domain::ChannelBinding::Signal { group_id } => Some(group_id.as_str()),
         _ => None,
     });
-    crate::domain::select_channel(
-        preferred,
-        &route.title,
-        &crate::domain::ChannelAvailability {
-            telegram_topic,
-            signal_enabled: signal_group.is_some(),
-            signal_group,
-        },
-    )
-    .map(|selection| (selection.kind, selection.destination))
+    match selected {
+        ChannelKind::Telegram => telegram_topic.map(|topic_id| (selected, topic_id.to_string())),
+        ChannelKind::Signal => signal_group.map(|group_id| (selected, group_id.into())),
+    }
 }
 
 fn register_return(connection: &Connection, record: &ReturnDelivery) -> StoreResult<()> {
@@ -2323,6 +1578,43 @@ fn pending_outbox(connection: &Connection) -> StoreResult<Vec<OutboxItem>> {
         .collect()
 }
 
+fn rebaseline_passive_output(connection: &mut Connection, sequence: u64) -> StoreResult<u64> {
+    let transaction = connection.transaction()?;
+    let discarded = transaction.execute(
+        "DELETE FROM outbox
+         WHERE request_id IS NULL AND state IN ('pending', 'delivering')",
+        [],
+    )?;
+    set_metadata(&transaction, "wakterm_event_cursor", &sequence.to_string())?;
+    transaction.commit()?;
+    Ok(discarded as u64)
+}
+
+fn find_outbox_agent(
+    connection: &Connection,
+    channel: ChannelKind,
+    destination: &str,
+    external_receipt: &str,
+) -> StoreResult<Option<AgentBinding>> {
+    let json = connection
+        .query_row(
+            "SELECT record_json FROM outbox
+             WHERE channel = ?1 AND destination = ?2 AND state = 'delivered'
+               AND json_extract(record_json, '$.external_receipt') = ?3
+             ORDER BY updated_at_ms DESC LIMIT 1",
+            params![channel_name(channel), destination, external_receipt],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    json.map(|value| {
+        serde_json::from_str::<OutboxItem>(&value)
+            .map(|item| item.source_agent)
+            .map_err(StoreError::from)
+    })
+    .transpose()
+    .map(Option::flatten)
+}
+
 fn accept_inbox(connection: &Connection, item: &InboxItem) -> StoreResult<bool> {
     let changed = connection.execute(
         "INSERT OR IGNORE INTO inbox(
@@ -2387,7 +1679,7 @@ fn save_inbox(
         );
         set_metadata(
             &transaction,
-            "migrated_route_preferences_v1",
+            "route_output_preferences_v1",
             &serde_json::to_string(&preferences)?,
         )?;
     }
@@ -2414,38 +1706,7 @@ fn get_metadata(connection: &Connection, key: &str) -> StoreResult<Option<String
         .optional()?)
 }
 
-fn compact(connection: &mut Connection, before_ms: i64) -> StoreResult<u64> {
-    let transaction = connection.transaction()?;
-    let removable = {
-        let mut statement = transaction.prepare(
-            "SELECT w.request_id FROM workflows w
-             LEFT JOIN return_deliveries r ON r.request_id = w.request_id
-             WHERE w.updated_at_ms < ?1
-               AND w.state IN ('completed', 'failed', 'cancelled')
-               AND (r.request_id IS NULL OR (
-                    r.agent_state = 'delivered' AND r.mirror_state = 'delivered'
-               ))",
-        )?;
-        statement
-            .query_map(params![before_ms], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    for request_id in &removable {
-        transaction.execute(
-            "DELETE FROM return_deliveries WHERE request_id = ?1",
-            params![request_id],
-        )?;
-        transaction.execute(
-            "DELETE FROM workflows WHERE request_id = ?1",
-            params![request_id],
-        )?;
-    }
-    transaction.commit()?;
-    Ok(removable.len() as u64)
-}
-
 fn status(connection: &Connection) -> StoreResult<StoreStatus> {
-    let promotion = promotion_status(connection)?;
     Ok(StoreStatus {
         schema_version: SCHEMA_VERSION as u64,
         workflows: count(connection, "SELECT COUNT(*) FROM workflows")?,
@@ -2489,11 +1750,6 @@ fn status(connection: &Connection) -> StoreResult<StoreStatus> {
             "SELECT COUNT(*) FROM inbox WHERE state = 'pending'",
         )?,
         tombstones: count(connection, "SELECT COUNT(*) FROM idempotency_tombstones")?,
-        legacy_control_requests: count(connection, "SELECT COUNT(*) FROM legacy_control_requests")?,
-        legacy_indeterminate_requests: promotion.unresolved_legacy_controls,
-        legacy_unresolved_returns: promotion.unresolved_legacy_returns,
-        legacy_debate_outbox: promotion.held_legacy_debate,
-        signal_messages: count(connection, "SELECT COUNT(*) FROM signal_messages")?,
         unrouted_agent_events: count(
             connection,
             "SELECT COUNT(*) FROM agent_events WHERE state = 'unrouted'",
@@ -2502,7 +1758,17 @@ fn status(connection: &Connection) -> StoreResult<StoreStatus> {
             connection,
             "SELECT COUNT(*) FROM agent_events WHERE kind = 'observer_failure'",
         )?,
-        promotion,
+        event_cursor: event_cursor(connection)?,
+        event_cursor_gap: get_metadata(connection, "wakterm_event_cursor_gap_v1")?
+            .map(|value| serde_json::from_str(&value).map_err(StoreError::from))
+            .transpose()?,
+        telegram_update_offset: get_metadata(connection, "telegram_update_offset")?
+            .map(|value| {
+                value.parse::<u64>().map_err(|_| {
+                    StoreError::Conflict("stored Telegram update offset is invalid".into())
+                })
+            })
+            .transpose()?,
     })
 }
 

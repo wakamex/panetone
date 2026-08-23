@@ -2,13 +2,13 @@ use std::fs;
 
 use panetone::domain::{
     AdmissionReceipt, AdmissionStatus, AgentBinding, CallbackDelivery, ChannelBinding, ChannelKind,
-    DeliveryState, EffectId, OutboxItem, OutboxState, Route, RouteId, RouteStatus, SendCommand,
-    WorkflowId, WorkflowState,
+    DeliveryState, EffectId, OutboxItem, OutboxState, Route, RouteId, SendCommand, WorkflowId,
+    WorkflowState,
 };
 use panetone::store::{
     ClaimResult, DestinationDelivery, InboxItem, ReturnDelivery, StoreError, StoreHandle,
 };
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use serde_json::json;
 use tempfile::tempdir;
 use uuid::Uuid;
@@ -85,195 +85,121 @@ async fn store_is_private_and_rejects_newer_schemas() {
         StoreHandle::open(&path),
         Err(StoreError::NewerSchema {
             found: 99,
-            supported: 5
+            supported: 7
         })
     ));
 }
 
 #[tokio::test]
-async fn version_one_store_upgrades_without_changing_native_hash_semantics() {
+async fn version_five_is_rejected() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("state.sqlite3");
-    let store = StoreHandle::open(&path).unwrap();
-    store.shutdown().await.unwrap();
     let connection = Connection::open(&path).unwrap();
-    connection
-        .execute_batch(
-            "DROP TABLE agent_events;
-             DROP TABLE operator_actions;
-             DROP TABLE legacy_dispositions;
-             DROP TABLE route_delivery_policy;
-             DROP TABLE promotion_state;
-             DROP TABLE legacy_debate_outbox;
-             DROP TABLE signal_messages;
-             DROP TABLE legacy_return_deliveries;
-             DROP TABLE legacy_control_requests;
-             ALTER TABLE idempotency_tombstones DROP COLUMN hash_kind;
-             PRAGMA user_version = 1;",
-        )
-        .unwrap();
+    connection.pragma_update(None, "user_version", 5).unwrap();
     drop(connection);
 
-    let upgraded = StoreHandle::open(&path).unwrap();
-    assert_eq!(upgraded.status().await.unwrap().schema_version, 5);
-    let request = id(9);
     assert!(matches!(
-        upgraded
-            .claim(
-                command(request, "hello"),
-                route_id(1),
-                route_id(2),
-                binding("source"),
-                binding("target"),
-                100,
-            )
-            .await
-            .unwrap(),
-        ClaimResult::New(_)
+        StoreHandle::open(&path),
+        Err(StoreError::OlderSchema {
+            found: 5,
+            supported: 7
+        })
     ));
-    upgraded.shutdown().await.unwrap();
-    let connection = Connection::open(&path).unwrap();
-    let hash_kind: String = connection
-        .query_row(
-            "SELECT hash_kind FROM idempotency_tombstones WHERE request_id = ?1",
-            params![request.to_string()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(hash_kind, "semantic_v1");
 }
 
 #[tokio::test]
-async fn version_two_store_holds_legacy_debate_output_instead_of_sending_it() {
+async fn version_six_routes_drop_persisted_runtime_bindings() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("state.sqlite3");
     let store = StoreHandle::open(&path).unwrap();
     store.shutdown().await.unwrap();
+
+    let route_id = route_id(6);
     let connection = Connection::open(&path).unwrap();
     connection
-        .execute_batch(
-            "DROP TABLE agent_events;
-             DROP TABLE operator_actions;
-             DROP TABLE legacy_dispositions;
-             DROP TABLE route_delivery_policy;
-             DROP TABLE promotion_state;
-             DROP TABLE legacy_debate_outbox;
-             INSERT INTO outbox(
-                 effect_id, request_id, channel, destination, state, record_json,
-                 created_at_ms, updated_at_ms
-             ) VALUES (
-                 '00000000-0000-4000-8000-000000000099', NULL, 'debate',
-                 '-100123', 'pending',
-                 '{\"kind\":\"debate\",\"body\":\"legacy\"}', 10, 11
-             );
-             PRAGMA user_version = 2;",
+        .execute(
+            "INSERT INTO routes(route_id, route_json, updated_at_ms)
+             VALUES (?1, ?2, 1)",
+            rusqlite::params![
+                route_id.to_string(),
+                json!({
+                    "id": route_id,
+                    "title": "panetone",
+                    "channels": [{"kind": "telegram", "topic_id": 12}],
+                    "agent": {
+                        "agent_id": "old-agent",
+                        "incarnation_id": "old-incarnation",
+                        "harness": "codex",
+                        "pane_id": 7
+                    },
+                    "status": "available"
+                })
+                .to_string()
+            ],
         )
         .unwrap();
+    connection.pragma_update(None, "user_version", 6).unwrap();
     drop(connection);
 
-    let upgraded = StoreHandle::open(&path).unwrap();
-    let status = upgraded.status().await.unwrap();
-    assert_eq!(status.schema_version, 5);
-    assert_eq!(status.pending_outbox, 0);
-    assert_eq!(status.legacy_debate_outbox, 1);
-    upgraded.shutdown().await.unwrap();
+    let migrated = StoreHandle::open(&path).unwrap();
+    let route = migrated.get_route(route_id).await.unwrap().unwrap();
+    assert_eq!(route.title, "panetone");
+    assert_eq!(route.agent, None);
+    migrated.shutdown().await.unwrap();
 
     let connection = Connection::open(&path).unwrap();
-    let held: (String, String) = connection
-        .query_row(
-            "SELECT destination, resolution_state FROM legacy_debate_outbox",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(held, ("-100123".into(), "held".into()));
-    assert_eq!(
-        connection
-            .query_row("SELECT COUNT(*) FROM outbox", [], |row| row
-                .get::<_, u64>(0))
+    assert_eq!(version, 7);
+    let route_json: serde_json::Value = serde_json::from_str(
+        &connection
+            .query_row(
+                "SELECT route_json FROM routes WHERE route_id = ?1",
+                [route_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
             .unwrap(),
-        0
-    );
+    )
+    .unwrap();
+    assert!(route_json.get("agent").is_none());
+    assert!(route_json.get("status").is_none());
 }
 
 #[tokio::test]
-async fn idempotency_survives_compaction_as_a_permanent_tombstone() {
+async fn unknown_historical_hash_kind_keeps_uuid_reserved() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("state.sqlite3");
     let store = StoreHandle::open(&path).unwrap();
+    store.shutdown().await.unwrap();
+
     let request_id = id(10);
-    let mut record = claim_new(&store, request_id).await;
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO idempotency_tombstones(
+                 request_id, semantic_hash, hash_kind, terminal_state,
+                 created_at_ms, completed_at_ms
+             ) VALUES (?1, 'historical-hash', 'retired_format', 'completed', 1, 2)",
+            [request_id.to_string()],
+        )
+        .unwrap();
+    drop(connection);
 
+    let store = StoreHandle::open(&path).unwrap();
+    let claim = store
+        .claim(
+            command(request_id, "hello"),
+            route_id(1),
+            route_id(2),
+            binding("source"),
+            binding("target"),
+            100,
+        )
+        .await
+        .unwrap();
     assert!(matches!(
-        store
-            .claim(
-                command(request_id, "hello"),
-                route_id(1),
-                route_id(2),
-                binding("source"),
-                binding("target"),
-                101
-            )
-            .await
-            .unwrap(),
-        ClaimResult::Existing(_)
-    ));
-    assert!(matches!(
-        store
-            .claim(
-                command(request_id, "different"),
-                route_id(1),
-                route_id(2),
-                binding("source"),
-                binding("target"),
-                101
-            )
-            .await
-            .unwrap(),
-        ClaimResult::Conflict { .. }
-    ));
-
-    for next in [
-        WorkflowState::AuditPosted,
-        WorkflowState::AdmissionPrepared,
-        WorkflowState::Submitted,
-        WorkflowState::Completed,
-    ] {
-        let expected = record.workflow.state;
-        record.workflow.transition(next).unwrap();
-        record.updated_at_ms += 1;
-        store.save_workflow(record.clone(), expected).await.unwrap();
-    }
-    assert_eq!(store.compact(1_000).await.unwrap(), 1);
-    assert!(matches!(
-        store
-            .claim(
-                command(request_id, "hello"),
-                route_id(1),
-                route_id(2),
-                binding("source"),
-                binding("target"),
-                2_000
-            )
-            .await
-            .unwrap(),
-        ClaimResult::Tombstone {
-            same_content: true,
-            ..
-        }
-    ));
-    assert!(matches!(
-        store
-            .claim(
-                command(request_id, "different"),
-                route_id(1),
-                route_id(2),
-                binding("source"),
-                binding("target"),
-                2_000
-            )
-            .await
-            .unwrap(),
+        claim,
         ClaimResult::Tombstone {
             same_content: false,
             ..
@@ -388,7 +314,7 @@ fn return_record(workflow_id: WorkflowId, state: DeliveryState) -> ReturnDeliver
 }
 
 #[tokio::test]
-async fn callback_uncertainty_and_unresolved_results_survive_restart_and_pruning() {
+async fn callback_uncertainty_and_unresolved_results_survive_restart() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("state.sqlite3");
     let store = StoreHandle::open(&path).unwrap();
@@ -409,14 +335,12 @@ async fn callback_uncertainty_and_unresolved_results_survive_restart_and_pruning
     }
     let returned = return_record(workflow.command.id, DeliveryState::Delivering);
     store.register_return(returned).await.unwrap();
-    assert_eq!(store.compact(1_000).await.unwrap(), 0);
     store.shutdown().await.unwrap();
 
     let reopened = StoreHandle::open(&path).unwrap();
     let pending = reopened.pending_returns().await.unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].agent.state, DeliveryState::Indeterminate);
-    assert_eq!(reopened.compact(1_000).await.unwrap(), 0);
     let status = reopened.status().await.unwrap();
     assert_eq!(status.unresolved_returns, 1);
     reopened.shutdown().await.unwrap();
@@ -432,7 +356,6 @@ async fn routes_outbox_inbox_and_metadata_are_durable_and_deduplicated() {
         title: "alpha".into(),
         channels: vec![ChannelBinding::Telegram { topic_id: 12 }],
         agent: Some(binding("alpha")),
-        status: RouteStatus::Available,
     };
     store.save_route(route.clone(), 100).await.unwrap();
 
@@ -441,6 +364,7 @@ async fn routes_outbox_inbox_and_metadata_are_durable_and_deduplicated() {
         id: effect,
         route_id: Some(route.id),
         sender_harness: Some("codex".into()),
+        source_agent: route.agent.clone(),
         kind: ChannelKind::Telegram,
         destination: "12".into(),
         body: "audit".into(),
@@ -459,6 +383,32 @@ async fn routes_outbox_inbox_and_metadata_are_durable_and_deduplicated() {
         Err(StoreError::Conflict(_))
     ));
 
+    let reply_agent = binding("reply");
+    let delivered = OutboxItem {
+        id: EffectId::new(Uuid::from_u128(43)),
+        route_id: Some(route.id),
+        sender_harness: Some("codex".into()),
+        source_agent: Some(reply_agent.clone()),
+        kind: ChannelKind::Telegram,
+        destination: "12".into(),
+        body: "agent output".into(),
+        state: OutboxState::Delivered,
+        attempts: 1,
+        last_error: None,
+        external_receipt: Some("501".into()),
+    };
+    store
+        .enqueue_outbox(None, delivered.clone(), 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .find_outbox_agent(ChannelKind::Telegram, "12".into(), "501".into())
+            .await
+            .unwrap(),
+        Some(reply_agent)
+    );
+
     let inbox = InboxItem {
         id: EffectId::new(Uuid::from_u128(42)),
         channel: ChannelKind::Signal,
@@ -466,6 +416,7 @@ async fn routes_outbox_inbox_and_metadata_are_durable_and_deduplicated() {
         destination: "group-one".into(),
         sender_id: Some("+15551234567".into()),
         sender: Some("alice".into()),
+        reply_to_external_id: None,
         body: "hello".into(),
         state: "pending".into(),
         created_at_ms: 100,
@@ -479,7 +430,11 @@ async fn routes_outbox_inbox_and_metadata_are_durable_and_deduplicated() {
     store.shutdown().await.unwrap();
 
     let reopened = StoreHandle::open(&path).unwrap();
-    assert_eq!(reopened.get_route(route.id).await.unwrap().unwrap(), route);
+    let persisted_route = reopened.get_route(route.id).await.unwrap().unwrap();
+    assert_eq!(persisted_route.id, route.id);
+    assert_eq!(persisted_route.title, route.title);
+    assert_eq!(persisted_route.channels, route.channels);
+    assert_eq!(persisted_route.agent, None);
     let recovered = reopened.pending_outbox().await.unwrap();
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].state, OutboxState::Pending);
@@ -495,4 +450,46 @@ async fn routes_outbox_inbox_and_metadata_are_durable_and_deduplicated() {
     assert_eq!(status.pending_outbox, 1);
     assert_eq!(status.pending_inbox, 1);
     reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn passive_output_rebaseline_discards_only_unrequested_delivery_work() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let passive = OutboxItem {
+        id: EffectId::new(Uuid::from_u128(501)),
+        route_id: Some(route_id(50)),
+        sender_harness: Some("codex".into()),
+        source_agent: Some(binding("passive")),
+        kind: ChannelKind::Telegram,
+        destination: "12".into(),
+        body: "observed while offline".into(),
+        state: OutboxState::Pending,
+        attempts: 0,
+        last_error: None,
+        external_receipt: None,
+    };
+    let requested = OutboxItem {
+        id: EffectId::new(Uuid::from_u128(502)),
+        body: "explicit workflow delivery".into(),
+        ..passive.clone()
+    };
+    store.enqueue_outbox(None, passive, 100).await.unwrap();
+    store
+        .enqueue_outbox(Some(id(503)), requested.clone(), 100)
+        .await
+        .unwrap();
+    store.initialize_event_cursor(10).await.unwrap();
+
+    assert_eq!(store.rebaseline_passive_output(99).await.unwrap(), 1);
+    assert_eq!(store.pending_outbox().await.unwrap(), vec![requested]);
+    assert_eq!(
+        store
+            .get_metadata("wakterm_event_cursor".into())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("99")
+    );
+    store.shutdown().await.unwrap();
 }

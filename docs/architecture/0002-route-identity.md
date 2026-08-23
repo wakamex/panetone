@@ -1,23 +1,48 @@
 # ADR 0002: Route identity and resolution
 
-Status: accepted for Phase 1
+Status: accepted and implemented
 
 ## Context
 
-Operators address agents by a readable title, while pane IDs, tab IDs, processes, sessions, and provider turns can all change across restarts. Treating any ephemeral identifier as durable route identity risks delivering to a stale or unrelated agent.
+The user addresses a workspace by the effective title Wakterm derives from its
+current tab and agent working directories. Tabs, panes, agents, and processes
+may all disappear during a no-save deployment and be recreated later in a
+different layout.
 
 ## Decision
 
-The CLI continues to locate a route by exact case-insensitive title. Resolution must return not found when no live route matches and ambiguous when more than one live route matches. No side effect may occur until resolution succeeds.
+The durable Panetone route is its UUID, workspace title, and messaging-channel
+bindings. It does not persist a Wakterm agent, incarnation, pane, tab, or
+availability status.
 
-The long-term store assigns every Panetone route a stable UUID. A route records its current display title, messaging-channel bindings, and current opaque Wakterm agent and process-incarnation binding. Pane, tab, process, provider-session, and provider-turn identifiers are observations attached to a binding, not durable route identity.
+Before each admission Panetone reads Wakterm's current effective titles and
+catalog. An exact case-insensitive title must identify one live tab. Panetone
+then submits through the selected pane's current agent and incarnation pair.
+That pair protects the individual admission from a process replacement between
+lookup and submission, but it is not route state.
 
-A live refresh may change an ephemeral binding but cannot silently merge two durable routes. A missing agent makes the route unavailable without deleting its durable channel bindings. Reappearing agents are rebound only through an unambiguous reconciliation rule.
+One tab may contain multiple live agent panes. A channel reply prefers the
+agent that produced the quoted message. Otherwise Panetone prefers the last
+agent that produced visible output for the route, then the lowest live pane ID.
+This reproduces the normal Python routing rule without treating the visual tab
+as one agent.
 
-Control requests persist both the user-supplied source and target locators and the resolved route identities used for delivery. Later retries and callbacks use the persisted route identity and explicitly re-resolve its live binding. They do not reinterpret the original title as a different route.
+Zero matching tabs leave the work pending or return unavailable. Multiple
+matching tabs are ambiguous and no admission occurs. Busy retries and final
+callbacks resolve the workspace again. Workflow records retain the exact pair
+used for an attempted admission so receipts and terminal results can still be
+validated.
 
 ## Consequences
 
-The current Python implementation has title-derived runtime routes and does not yet persist route UUIDs. This is a documented intended difference for the Rust store migration, not a requirement to retrofit the temporary Python state.
+Closing a tab and later reopening the same workspace requires no Panetone
+reconciliation. Schema version 7 removes old route `agent` and `status` fields.
+Golden cases cover effective-title lookup, multiple panes, preferred replies,
+missing and ambiguous routes, exact admission identity, and preserved channel
+bindings.
 
-Golden cases must cover case-insensitive exact matching, missing routes, duplicate titles, disappearing agents, incarnation changes, and preserved channel bindings.
+The supported `route.ensure` control method establishes a fresh route only
+when Wakterm currently exposes exactly one matching effective title. It creates
+or accepts a Telegram topic binding, persists only the stable route data, and
+returns the current live agents plus Panetone's event-cursor baseline. Repeating
+the method inspects the same binding without creating another topic.

@@ -39,7 +39,7 @@ if [[ "$operation" == *"agent capabilities"* ]]; then
 elif [[ "$operation" == *"agent catalog"* ]]; then
   printf '%s\n' '{"schema":"wakterm.agent-api.v1","agents":[{"agent_id":"agent-zola","incarnation_id":"incarnation-zola-7","pane_id":9,"name":"renamed display","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"}]}'
 elif [[ "$operation" == *"list --format json"* ]]; then
-  printf '%s\n' '[{"pane_id":9,"tab_title":"route title"}]'
+  printf '%s\n' '[{"pane_id":9,"tab_id":4,"window_id":2,"tab_title":"","effective_title":"route title"}]'
 elif [[ "$operation" == *"agent events"* ]]; then
   printf '%s\n' '{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":100,"oldest_available_sequence":90,"latest_sequence":101,"next_after_sequence":101,"events":[{"sequence":101,"event_id":"event-101","kind":"assistant_message","agent_id":"agent-zola","incarnation_id":"incarnation-zola-7","turn_id":"turn-1","observed_at":"2026-08-17T00:00:00Z","text":"done"}]}'
 elif [[ "$operation" == *"agent admit"* ]]; then
@@ -81,7 +81,9 @@ fi
     assert_eq!(route_observations.load(Ordering::SeqCst), 1);
     assert_eq!(resolved, binding());
     assert_eq!(
-        cli.resolve_route_binding("ROUTE TITLE").await.unwrap(),
+        cli.resolve_route_binding("ROUTE TITLE", None)
+            .await
+            .unwrap(),
         binding()
     );
     assert!(matches!(
@@ -106,6 +108,40 @@ fi
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].terminal_event_sequence, 41);
     assert_eq!(events[0].final_message.as_deref(), Some("done"));
+}
+
+#[tokio::test]
+async fn effective_route_keeps_multiple_agent_panes_and_prefers_the_requested_one() {
+    let (_directory, binary) = fake_cli(
+        r#"
+operation="$*"
+if [[ "$operation" == *"agent capabilities"* ]]; then
+  printf '%s\n' '{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1"]}'
+elif [[ "$operation" == *"agent catalog"* ]]; then
+  printf '%s\n' '{"schema":"wakterm.agent-api.v1","as_of_event_sequence":12,"agents":[{"agent_id":"agent-first","incarnation_id":"inc-first","pane_id":4,"name":"first","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"},{"agent_id":"agent-second","incarnation_id":"inc-second","pane_id":9,"name":"second","harness":"claude","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"}]}'
+elif [[ "$operation" == *"list --format json"* ]]; then
+  printf '%s\n' '[{"pane_id":9,"tab_id":3,"window_id":1,"effective_title":"panetone"},{"pane_id":4,"tab_id":3,"window_id":1,"effective_title":"panetone"}]'
+else
+  exit 9
+fi
+"#,
+    );
+    let cli = WaktermCli::new(binary, "/tmp/non-production.sock", Duration::from_secs(2));
+    let live = cli.live_routes().await.unwrap();
+    let route = live.route("PANETONE").unwrap();
+    assert_eq!(route.agents.len(), 2);
+    assert_eq!(route.select(None).unwrap().pane_id, Some(4));
+
+    let preferred = AgentBinding {
+        agent_id: "agent-second".into(),
+        incarnation_id: "older-incarnation".into(),
+        harness: "claude".into(),
+        pane_id: Some(9),
+    };
+    assert_eq!(
+        route.select(Some(&preferred)).unwrap().agent_id,
+        "agent-second"
+    );
 }
 
 #[tokio::test]

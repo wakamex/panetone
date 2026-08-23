@@ -1,159 +1,175 @@
 # Panetone production operations
 
-This runbook applies to the Rust system service. Phase 5A prepares and rehearses
-it. Phase 5B is the separate live cutover.
+Panetone uses an enabled systemd user service and starts with the lingering user
+manager.
 
-## Files and ownership
+## Loaded paths
 
-- binary: `/usr/local/bin/panetone`, root-owned mode `0755`
-- unit: `/etc/systemd/system/panetone.service`, root-owned mode `0644`
-- credentials: `/etc/panetone/panetone.env`, root-owned mode `0600`
-- database: `/var/lib/panetone/panetone.sqlite3`, `mihai:mihai` mode `0600`
-- control socket: `/run/panetone/control.sock`, mode `0600` in a mode `0700`
-  runtime directory
-- Wakterm socket: `/run/user/1000/wakterm/sock`, separate from the Panetone socket
-- installation evidence: `/var/lib/panetone/install-evidence.json`
+- checkout: `/code/panetone`
+- binary: `/code/panetone/target/release/panetone`
+- unit: `~/.config/systemd/user/panetone.service`
+- environment: `/code/panetone/.env`
+- database: `~/.local/state/panetone-rust/migration/panetone.sqlite3`
+- control socket: `/run/user/1000/panetone/control.sock`
+- Wakterm socket: `/run/user/1000/wakterm/sock`
 
-The unit runs as `mihai`, has no source checkout or hot reload in `ExecStart`,
-and uses the system-labelled `/usr/local/bin/panetone`. It requires the Wakterm
-mux system service under the same system manager. Move Wakterm separately and
-restore its agents before scheduling Panetone promotion.
+The service and database are user-owned. An agent can inspect and restart them
+without root.
 
-The Wakterm maintenance procedure is separate and documented in
-[wakterm-phase5b-promotion.md](wakterm-phase5b-promotion.md). Run its disposable
-preflight first. Do not use the isolated development mux as production evidence,
-and do not restart the production mux until every PTY agent has a tested manual
-resume plan.
+## Build and inspect
 
-## Configuration
-
-The environment file can contain:
-
-```text
-WEZ_TG_CHAT=-1000000000000
-WEZ_TG_TOKEN_CLAUDE=...
-WEZ_TG_TOKEN_CODEX=...
-WEZ_TG_TOKEN_GEMINI=...
-WEZ_TG_TOKEN_OPENCODE=...
-WEZ_TG_OWNER=123456789
-WEZ_SIG_SOCKET=/run/signal-cli/socket
-WEZ_SIG_ACCOUNT=+15550000000
-WEZ_SIG_OWNER=+15551111111
-```
-
-Telegram requires a chat and Claude token together. Other harness tokens select
-the visible output identity. Signal is enabled only when its socket, account,
-and owner are all present. Debate needs no additional variable because it is a
-Signal group route.
-
-Slack is removed and has no accepted configuration. Delete any `WEZ_SLACK_*`
-or `PANETONE_SLACK_*` entries when preparing the Rust environment. The offline
-migration retains an old Slack preference only as deprecated metadata and
-refuses a pending Slack delivery. Resolve such an item before promotion rather
-than silently replaying or dropping it. Revoke the old Slack credentials after
-the Python service that used them is permanently retired.
-
-## Side-effect-free candidate check
-
-Build and check an exact committed candidate without sudo:
+Build a committed candidate and run the locked tests:
 
 ```sh
 cargo build --locked --release
-deploy/install-system-service.sh \
-  --binary target/release/panetone \
-  --database /path/to/rehearsal/panetone.sqlite3
+cargo test --locked
+cargo clippy --locked --all-targets --all-features -- -D warnings
 ```
 
-For the full permanent test and release gate:
+Verify what systemd will actually load:
 
 ```sh
-dev/phase5a-rehearsal /path/to/rehearsal/panetone.sqlite3
+systemctl --user daemon-reload
+systemctl --user cat panetone.service
+systemctl --user show panetone.service \
+  -p FragmentPath -p ExecStart -p EnvironmentFiles -p UnitFileState
+sha256sum /code/panetone/target/release/panetone
 ```
 
-Neither command installs, starts, stops, polls, admits, or sends.
-
-## Held install
-
-Only during the labeled Phase 5B window, after Python is stopped and the final
-migration bundle and rollback snapshots are verified:
+Verify Wakterm separately. A source commit does not prove that the running mux
+contains the fix:
 
 ```sh
-sudo /bin/bash deploy/install-system-service.sh \
-  --binary target/release/panetone \
-  --database /path/to/final-bundle/panetone.sqlite3 \
-  --environment /path/to/panetone.env \
-  --start-held
+~/.local/bin/wakterm --version
+systemctl --user status wakterm-mux-server.service
 ```
 
-The installer refuses an active user Panetone service, a missing system Wakterm
-service, an existing Rust state database, a non-0600 environment file, or an
-unsafe partial installation. A failed held start restores the previous binary
-and unit before any route is released.
+Do not restart Wakterm merely to start Panetone. Its live panes are separate
+state and need their own maintenance decision.
 
-## Promotion commands
-
-Use a stable `--id UUID` for every command and save each structured response.
-Run them in this order while the global hold remains active:
+## Start and stop
 
 ```sh
-panetone operator --id UUID --socket /run/panetone/control.sock \
-  baseline-event
-
-panetone operator --id UUID --socket /run/panetone/control.sock \
-  baseline-telegram
-
-panetone operator --id UUID --socket /run/panetone/control.sock \
-  reconcile-route ROUTE
-
-panetone operator --id UUID --socket /run/panetone/control.sock \
-  enable-route ROUTE
+systemctl --user start panetone.service
+systemctl --user status panetone.service
+journalctl --user -u panetone.service -f
 ```
 
-If an existing route identity changes, the first reconciliation leaves it in
-`reconciliation_required`. Review the old and new identities, then repeat with
-a new operation UUID and `--replace-identity` only when the replacement is
-intentional.
-
-Resolve every staged legacy record before release. Examples:
+Stop it without starting another delivery owner:
 
 ```sh
-panetone operator --id UUID --socket /run/panetone/control.sock \
-  dispose-legacy control REQUEST_ID no-replay \
-  --evidence 'inspected stopped Python journal; delivery remains uncertain'
-
-panetone operator --id UUID --socket /run/panetone/control.sock \
-  dispose-legacy debate EFFECT_ID map-debate-to-signal \
-  --route ROUTE --expected-legacy-destination OLD_CHAT_ID \
-  --evidence 'old Debate destination matched this exact Signal group'
+systemctl --user stop panetone.service
 ```
 
-Release only the reviewed canary:
+The retired `panetone.service` Python unit has been removed.
+
+## Health
 
 ```sh
-panetone operator --id UUID --socket /run/panetone/control.sock release
+target/release/panetone status \
+  --socket /run/user/1000/panetone/control.sock
 ```
 
-If status reports `event_cursor_gap`, keep the service held. Review the missing
-sequence interval, fresh catalog, channel state, and any output that may need a
-manual disposition. Then acknowledge that exact gap and release separately:
+Status reports current workflows, returns, inbox and outbox state, UUID
+tombstones, Wakterm event state, channel availability, and supervised worker
+health. It has no promotion or legacy-migration section.
+
+Run the read-only doctor when the daemon is stopped:
 
 ```sh
-panetone operator --id UUID --socket /run/panetone/control.sock \
-  acknowledge-event-gap REQUESTED_AFTER_SEQUENCE \
-  --evidence 'reviewed retained interval, catalog snapshot, and channel state'
+target/release/panetone doctor \
+  --socket /run/user/1000/panetone/control.sock \
+  --journal ~/.local/state/panetone-rust/migration/panetone.sqlite3 \
+  --wakterm-bin ~/.local/bin/wakterm \
+  --wakterm-socket /run/user/1000/wakterm/sock
 ```
 
-Then run the Phase 5B live gates before enabling another route. Ordinary send
-is one-way. For explicit report-back, the original prompt tells the target to
-run a second `panetone send` when it decides the work is complete.
+## Route resolution
 
-## Rollback boundary
+Routes persist only the workspace title and channel bindings. Panetone resolves
+the current effective title and live agent panes through Wakterm before each
+admission, retry, and callback. Closing and recreating a workspace therefore
+requires no Panetone repair or reconciliation command.
 
-Before the first Rust channel acknowledgement, prompt admission, accepted
-inbound message, or event-cursor advance, stop Rust and restore Python from the
-verified legacy snapshots. The installer automates rollback only for a failed
-held start.
+When a tab has multiple agent panes, a quoted channel reply targets the pane
+that produced the quoted message. Otherwise the most recent pane to produce
+visible output wins, followed by the lowest live pane ID.
 
-After any Rust-owned effect, do not blindly restore the old snapshots. Preserve
-the Rust database and reconcile every post-cutover inbox, outbox, control,
-callback, and cursor delta. Prefer forward recovery.
+## Launcher contract
+
+An external launcher must use the control CLI rather than the database or the
+retired `~/.config/wez-tg` files.
+
+After Wakterm has registered the fresh agent, establish or verify its route:
+
+```sh
+route_json=$(target/release/panetone route ensure infobase \
+  --socket /run/user/1000/panetone/control.sock)
+```
+
+Require `result.live.status` to be `available`. Save these exact fields from
+the response:
+
+- `result.route.channels[].topic_id`
+- the `result.live.agents[]` entry whose `pane_id` equals the pane just launched,
+  including its `agent_id` and `incarnation_id`
+- `result.event_cursor`
+
+Send the bootstrap prompt through Wakterm only after that response. Then prove
+that the resulting assistant output was durably routed:
+
+```sh
+target/release/panetone output wait \
+  --route infobase \
+  --agent-id "$agent_id" \
+  --incarnation-id "$incarnation_id" \
+  --after "$event_cursor" \
+  --expect-text READY \
+  --timeout-ms 90000 \
+  --socket /run/user/1000/panetone/control.sock
+```
+
+Send the real startup prompt only after this command exits zero and its JSON
+result has `disposition: "projected"`. The result identifies the exact event by
+sequence and event ID and includes its text. `unrouted` and `misrouted` exit
+nonzero immediately. A timeout exits nonzero while the result remains
+`pending`.
+
+`projected` means Panetone assigned the event to that durable route and
+committed the event, outbox effect, and cursor together. It does not mean
+Telegram has already delivered the effect. The launcher needs durable capture
+before the real prompt, not remote delivery confirmation.
+
+## Offline output and Telegram pacing
+
+Normal startup discards unsent passive agent-output notifications and advances
+the Wakterm event cursor to the current catalog head. It does not discard
+accepted Telegram or Signal input, explicit workflow effects, busy work, or
+pending final returns.
+
+For a deliberate catch-up start, set
+`PANETONE_REPLAY_OFFLINE_OUTPUT=true` in `/code/panetone/.env`, restart the
+service, then remove the setting after the backlog drains. Catch-up is off by
+default because a long-lived passive backlog can be noisy rather than useful.
+
+Telegram sends through each bot token are serialized at one message every 3.1
+seconds, below Telegram's 20-per-minute group limit. A Telegram 429 response
+extends the pause by the returned `retry_after` interval. Each outbox worker
+pass attempts one item, so a flood cannot monopolize shutdown or other workers.
+
+## Durable failure rules
+
+- Never replay an indeterminate prompt merely because the daemon restarted.
+- A delivering outbox item returns to pending after restart because channel
+  sends use stable effect IDs and channel-level deduplication where available.
+- An admission prepared without a definitive receipt becomes indeterminate.
+- Preserve the database before manual repair.
+- Attribute Wakterm client, mux, Telegram, Signal, and Panetone failures to one
+  layer before changing code.
+
+## Cold archive
+
+The Python migration bundle is retained only as historical evidence. It is not
+accepted by the current CLI and is not a rollback target. After Rust processed
+real channel and Wakterm effects, restoring the Python snapshot would lose or
+duplicate post-cutover state.

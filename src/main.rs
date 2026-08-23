@@ -1,18 +1,20 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 use panetone::channels::{
     RealChannels, SignalClient, SignalSubscriber, TelegramClient, TelegramPoller,
 };
-use panetone::control::{CONTROL_SCHEMA, ControlRequest, ControlServer, SendParams, request};
-use panetone::migration::{MigrationOptions, migrate};
-use panetone::service::{ConformanceService, InboundIngestor, ProductionService};
+use panetone::control::{
+    CONTROL_SCHEMA, ControlRequest, ControlServer, OutputDispositionParams, RouteEnsureParams,
+    RouteInspectParams, SendParams, request,
+};
+use panetone::service::{InboundIngestor, ProductionService};
 use panetone::store::StoreHandle;
 use panetone::supervisor::{Supervisor, TaskPolicy};
-use panetone::wakterm::{ProfileKind, WaktermCli, WaktermContract};
+use panetone::wakterm::WaktermCli;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -31,31 +33,12 @@ enum Command {
     Send(SendArgs),
     /// Inspect durable daemon health and backlogs.
     Status(StatusArgs),
-    /// Apply one audited, idempotent promotion operation.
-    Operator(OperatorArgs),
-    /// Check local paths and the offline store without sending messages.
+    /// Inspect or establish durable workspace routes.
+    Route(RouteArgs),
+    /// Wait for durable routing of exact Wakterm agent output.
+    Output(OutputArgs),
+    /// Check local paths and the store without sending messages.
     Doctor(DoctorArgs),
-    /// Create or upgrade the offline database schema explicitly.
-    Migrate(MigrationArgs),
-    #[command(hide = true)]
-    ConformanceBackend(DaemonArgs),
-}
-
-#[derive(Clone, Args)]
-struct DaemonArgs {
-    #[arg(long)]
-    socket: PathBuf,
-    #[arg(long, alias = "database")]
-    journal: PathBuf,
-    #[arg(long)]
-    effect_log: PathBuf,
-    #[arg(
-        long,
-        default_value = "/code/wakterm/docs/agent-api/v1/golden-fixtures.json"
-    )]
-    wakterm_fixture: PathBuf,
-    #[arg(long, value_enum, default_value_t = ProfileArg::Current)]
-    profile: ProfileArg,
 }
 
 #[derive(Clone, Args)]
@@ -74,41 +57,28 @@ struct ProductionArgs {
         default_value = "https://api.telegram.org"
     )]
     telegram_api_base: String,
-    #[arg(long, env = "WEZ_TG_CHAT", allow_hyphen_values = true)]
+    #[arg(long, env = "WAK_TG_CHAT", allow_hyphen_values = true)]
     telegram_chat: Option<i64>,
-    #[arg(long, env = "WEZ_TG_TOKEN_CLAUDE")]
+    #[arg(long, env = "WAK_TG_TOKEN_CLAUDE")]
     telegram_claude_token: Option<String>,
-    #[arg(long, env = "WEZ_TG_TOKEN_CODEX")]
+    #[arg(long, env = "WAK_TG_TOKEN_CODEX")]
     telegram_codex_token: Option<String>,
-    #[arg(long, env = "WEZ_TG_TOKEN_GEMINI")]
+    #[arg(long, env = "WAK_TG_TOKEN_GEMINI")]
     telegram_gemini_token: Option<String>,
-    #[arg(long, env = "WEZ_TG_TOKEN_OPENCODE")]
+    #[arg(long, env = "WAK_TG_TOKEN_OPENCODE")]
     telegram_opencode_token: Option<String>,
-    #[arg(long, env = "WEZ_TG_OWNER")]
+    #[arg(long, env = "WAK_TG_OWNER")]
     telegram_owner: Option<String>,
-    #[arg(long, env = "WEZ_SIG_SOCKET")]
+    #[arg(long, env = "WAK_SIG_SOCKET")]
     signal_socket: Option<PathBuf>,
-    #[arg(long, env = "WEZ_SIG_ACCOUNT")]
+    #[arg(long, env = "WAK_SIG_ACCOUNT")]
     signal_account: Option<String>,
-    #[arg(long, env = "WEZ_SIG_OWNER")]
+    #[arg(long, env = "WAK_SIG_OWNER")]
     signal_owner: Option<String>,
     #[arg(long, env = "PANETONE_WORKER_POLL_MS", default_value_t = 1000)]
     worker_poll_ms: u64,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum ProfileArg {
-    Current,
-    FutureEvents,
-}
-
-impl From<ProfileArg> for ProfileKind {
-    fn from(value: ProfileArg) -> Self {
-        match value {
-            ProfileArg::Current => ProfileKind::Current,
-            ProfileArg::FutureEvents => ProfileKind::FutureEvents,
-        }
-    }
+    #[arg(long, env = "PANETONE_REPLAY_OFFLINE_OUTPUT", default_value_t = false)]
+    replay_offline_output: bool,
 }
 
 #[derive(Args)]
@@ -135,71 +105,65 @@ struct StatusArgs {
 }
 
 #[derive(Args)]
-struct OperatorArgs {
-    #[arg(long, env = "PANETONE_CONTROL_SOCKET")]
-    socket: PathBuf,
-    #[arg(long)]
-    id: Option<Uuid>,
+struct RouteArgs {
     #[command(subcommand)]
-    action: OperatorCommand,
+    command: RouteCommand,
 }
 
 #[derive(Subcommand)]
-enum OperatorCommand {
-    Hold,
-    Release,
-    EnableRoute {
-        route: String,
-    },
-    DisableRoute {
-        route: String,
-    },
-    InitEventCursor {
-        sequence: u64,
-    },
-    BaselineEvent,
-    AcknowledgeEventGap {
-        requested_after_sequence: u64,
-        #[arg(long)]
-        evidence: String,
-    },
-    InitTelegramCursor {
-        offset: u64,
-    },
-    BaselineTelegram,
-    ReconcileRoute {
-        route: String,
-        #[arg(long)]
-        replace_identity: bool,
-    },
-    DisposeLegacy {
-        #[arg(value_enum)]
-        record_kind: LegacyKindArg,
-        record_id: String,
-        #[arg(value_enum)]
-        decision: LegacyDecisionArg,
-        #[arg(long)]
-        evidence: String,
-        #[arg(long)]
-        route: Option<String>,
-        #[arg(long)]
-        expected_legacy_destination: Option<String>,
-    },
+enum RouteCommand {
+    /// Inspect one exact case-insensitive route title.
+    Inspect(RouteInspectArgs),
+    /// Ensure a live title has a durable Telegram route.
+    Ensure(RouteEnsureArgs),
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum LegacyKindArg {
-    Control,
-    Return,
-    Debate,
-    Signal,
+#[derive(Args)]
+struct RouteInspectArgs {
+    title: String,
+    #[arg(long, env = "PANETONE_CONTROL_SOCKET")]
+    socket: PathBuf,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum LegacyDecisionArg {
-    NoReplay,
-    ExternallyVerified,
-    MapDebateToSignal,
+#[derive(Args)]
+struct RouteEnsureArgs {
+    title: String,
+    #[arg(long)]
+    telegram_topic_id: Option<i64>,
+    #[arg(long, env = "PANETONE_CONTROL_SOCKET")]
+    socket: PathBuf,
+}
+
+#[derive(Args)]
+struct OutputArgs {
+    #[command(subcommand)]
+    command: OutputCommand,
+}
+
+#[derive(Subcommand)]
+enum OutputCommand {
+    /// Wait for exact assistant output after a durable event sequence.
+    Wait(OutputWaitArgs),
+}
+
+#[derive(Args)]
+struct OutputWaitArgs {
+    #[arg(long)]
+    route: String,
+    #[arg(long)]
+    agent_id: String,
+    #[arg(long)]
+    incarnation_id: String,
+    #[arg(long = "after")]
+    after_sequence: u64,
+    #[arg(long)]
+    expect_text: String,
+    #[arg(long, default_value_t = 90_000)]
+    timeout_ms: u64,
+    #[arg(long, default_value_t = 100)]
+    poll_ms: u64,
+    #[arg(long, env = "PANETONE_CONTROL_SOCKET")]
+    socket: PathBuf,
 }
 
 #[derive(Args)]
@@ -208,31 +172,10 @@ struct DoctorArgs {
     socket: PathBuf,
     #[arg(long, alias = "database")]
     journal: PathBuf,
-    #[arg(
-        long,
-        default_value = "/code/wakterm/docs/agent-api/v1/golden-fixtures.json"
-    )]
-    wakterm_fixture: PathBuf,
-    #[arg(long, requires = "wakterm_socket")]
-    wakterm_bin: Option<PathBuf>,
-    #[arg(long, requires = "wakterm_bin")]
-    wakterm_socket: Option<PathBuf>,
-}
-
-#[derive(Args)]
-struct MigrationArgs {
     #[arg(long)]
-    state: PathBuf,
+    wakterm_bin: PathBuf,
     #[arg(long)]
-    pending: PathBuf,
-    #[arg(long)]
-    control_journal: PathBuf,
-    #[arg(long)]
-    signal_database: Option<PathBuf>,
-    #[arg(long)]
-    legacy_control_socket: PathBuf,
-    #[arg(long)]
-    output: PathBuf,
+    wakterm_socket: PathBuf,
 }
 
 #[tokio::main]
@@ -243,12 +186,11 @@ async fn main() -> Result<()> {
         .init();
     match Cli::parse().command {
         Command::Daemon(args) => run_production_daemon(*args).await,
-        Command::ConformanceBackend(args) => run_daemon(args).await,
         Command::Send(args) => run_send(args).await,
         Command::Status(args) => run_status(args).await,
-        Command::Operator(args) => run_operator(args).await,
+        Command::Route(args) => run_route(args).await,
+        Command::Output(args) => run_output(args).await,
         Command::Doctor(args) => run_doctor(args).await,
-        Command::Migrate(args) => run_migrate(args).await,
     }
 }
 
@@ -263,23 +205,69 @@ enum ProductionWorker {
 }
 
 async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
-    reject_removed_slack_configuration()?;
     let deadline = Duration::from_secs(10);
     let wakterm = WaktermCli::new(&args.wakterm_bin, &args.wakterm_socket, deadline);
-    let (version, capabilities, _catalog) =
+    let (version, capabilities, catalog) =
         tokio::try_join!(wakterm.version(), wakterm.capabilities(), wakterm.catalog())
             .context("preflight the live Wakterm Agent API")?;
     if !capabilities.general_event_consumer_enabled() {
         bail!("production requires Wakterm capability event_stream.v1");
     }
+    let live_routes = wakterm
+        .live_routes()
+        .await
+        .context("preflight Wakterm effective route titles")?;
     tracing::info!(
         wakterm_version = %version,
         capabilities = ?capabilities.capabilities,
+        live_routes = live_routes.routes().len(),
         "Wakterm production preflight succeeded"
     );
 
     let (channels, telegram, signal) = production_channels(&args, deadline)?;
     let store = StoreHandle::open(&args.database).context("open production store")?;
+    let (event_cursor, discarded_passive_output) = if args.replay_offline_output {
+        (
+            store
+                .initialize_event_cursor(catalog.as_of_event_sequence)
+                .await
+                .context("initialize Wakterm event cursor")?,
+            0,
+        )
+    } else {
+        (
+            catalog.as_of_event_sequence,
+            store
+                .rebaseline_passive_output(catalog.as_of_event_sequence)
+                .await
+                .context("skip offline Wakterm output")?,
+        )
+    };
+    if let Some((poller, _)) = telegram.as_ref()
+        && store
+            .get_metadata("telegram_update_offset".into())
+            .await
+            .context("read Telegram update offset")?
+            .is_none()
+    {
+        let baseline = poller
+            .poll(-1, 0)
+            .await
+            .context("initialize Telegram update offset")?;
+        store
+            .set_metadata(
+                "telegram_update_offset".into(),
+                baseline.next_offset.max(0).to_string(),
+            )
+            .await
+            .context("persist Telegram update offset")?;
+    }
+    tracing::info!(
+        event_cursor,
+        replay_offline_output = args.replay_offline_output,
+        discarded_passive_output,
+        "durable cursors are initialized"
+    );
     let server = ControlServer::bind(&args.socket)
         .await
         .context("bind Panetone control socket")?;
@@ -288,7 +276,6 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
         store.clone(),
         wakterm,
         channels,
-        telegram.as_ref().map(|(poller, _)| poller.clone()),
         supervisor.handle(),
         capabilities.capabilities.iter().cloned().collect(),
         args.socket.clone(),
@@ -327,10 +314,9 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
     }
     if let Some((socket, account, owner)) = signal {
         let ingestor = InboundIngestor::new(store.clone());
-        let channel_store = store.clone();
         let shutdown = supervisor.shutdown_receiver();
         supervisor.spawn("signal-inbound", TaskPolicy::Degraded, async move {
-            signal_loop(socket, account, owner, ingestor, channel_store, shutdown).await
+            signal_loop(socket, account, owner, ingestor, shutdown).await
         });
     }
     supervisor
@@ -341,31 +327,7 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
     Ok(())
 }
 
-fn reject_removed_slack_configuration() -> Result<()> {
-    const REMOVED: &[&str] = &[
-        "WEZ_SLACK_BOT_TOKEN",
-        "WEZ_SLACK_APP_TOKEN",
-        "WEZ_SLACK_CHANNELS",
-        "WEZ_SLACK_TABS",
-        "WEZ_SLACK_DIRECT",
-        "PANETONE_SLACK_API_BASE",
-        "PANETONE_SLACK_SOCKET_URL",
-    ];
-    let configured = REMOVED
-        .iter()
-        .filter(|name| std::env::var(name).is_ok_and(|value| !value.is_empty()))
-        .copied()
-        .collect::<Vec<_>>();
-    if !configured.is_empty() {
-        bail!(
-            "Slack support was removed; delete the deprecated configuration: {}",
-            configured.join(", ")
-        );
-    }
-    Ok(())
-}
-
-type TelegramRuntime = (TelegramPoller, Option<String>);
+type TelegramRuntime = (TelegramPoller, String);
 type SignalRuntime = (PathBuf, String, String);
 
 type ProductionChannels = (RealChannels, Option<TelegramRuntime>, Option<SignalRuntime>);
@@ -378,9 +340,13 @@ fn production_channels(args: &ProductionArgs, deadline: Duration) -> Result<Prod
         ("gemini", args.telegram_gemini_token.as_ref()),
         ("opencode", args.telegram_opencode_token.as_ref()),
     ];
-    let telegram = match (args.telegram_chat, args.telegram_claude_token.as_ref()) {
-        (None, None) if tokens.iter().all(|(_, token)| token.is_none()) => None,
-        (Some(chat), Some(primary)) => {
+    let telegram = match (
+        args.telegram_chat,
+        args.telegram_claude_token.as_ref(),
+        args.telegram_owner.as_ref(),
+    ) {
+        (None, None, None) if tokens.iter().all(|(_, token)| token.is_none()) => None,
+        (Some(chat), Some(primary), Some(owner)) => {
             for (harness, token) in tokens
                 .into_iter()
                 .filter_map(|(name, token)| token.map(|token| (name, token)))
@@ -398,11 +364,11 @@ fn production_channels(args: &ProductionArgs, deadline: Duration) -> Result<Prod
                     chat,
                     Duration::from_secs(35),
                 )?,
-                args.telegram_owner.clone(),
+                owner.clone(),
             ))
         }
         _ => bail!(
-            "Telegram requires WEZ_TG_CHAT and WEZ_TG_TOKEN_CLAUDE together; other harness tokens cannot poll inbound"
+            "Telegram requires WAK_TG_CHAT, WAK_TG_TOKEN_CLAUDE, and WAK_TG_OWNER together; other harness tokens cannot poll inbound"
         ),
     };
 
@@ -416,7 +382,7 @@ fn production_channels(args: &ProductionArgs, deadline: Duration) -> Result<Prod
             channels.signal = Some(SignalClient::new(socket, account, deadline));
             Some((socket.clone(), account.clone(), owner.clone()))
         }
-        _ => bail!("Signal requires WEZ_SIG_SOCKET, WEZ_SIG_ACCOUNT, and WEZ_SIG_OWNER together"),
+        _ => bail!("Signal requires WAK_SIG_SOCKET, WAK_SIG_ACCOUNT, and WAK_SIG_OWNER together"),
     };
 
     Ok((channels, telegram, signal))
@@ -438,22 +404,37 @@ async fn production_worker_loop(
                 }
             }
             _ = interval.tick() => {
-                match worker {
-                    ProductionWorker::Events => service.event_once().await?,
-                    ProductionWorker::Outbox => service.outbox_once().await?,
-                    ProductionWorker::BusyTargets => service.busy_once().await?,
-                    ProductionWorker::ReturnTerminals => service.terminal_once().await?,
-                    ProductionWorker::PendingReturns => service.pending_return_once().await?,
-                    ProductionWorker::Inbox => service.inbox_once().await?,
-                };
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            return Ok(());
+                        }
+                    }
+                    result = run_production_worker(&service, worker) => result?,
+                }
             }
         }
     }
 }
 
+async fn run_production_worker(
+    service: &ProductionService,
+    worker: ProductionWorker,
+) -> Result<(), String> {
+    match worker {
+        ProductionWorker::Events => service.event_once().await?,
+        ProductionWorker::Outbox => service.outbox_once().await?,
+        ProductionWorker::BusyTargets => service.busy_once().await?,
+        ProductionWorker::ReturnTerminals => service.terminal_once().await?,
+        ProductionWorker::PendingReturns => service.pending_return_once().await?,
+        ProductionWorker::Inbox => service.inbox_once().await?,
+    };
+    Ok(())
+}
+
 async fn telegram_loop(
     poller: TelegramPoller,
-    owner: Option<String>,
+    owner: String,
     ingestor: InboundIngestor,
     store: StoreHandle,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -462,15 +443,11 @@ async fn telegram_loop(
         if *shutdown.borrow() {
             return Ok(());
         }
-        let promotion = store
-            .promotion_status()
-            .await
-            .map_err(|error| error.to_string())?;
         let cursor = store
             .get_metadata("telegram_update_offset".into())
             .await
             .map_err(|error| error.to_string())?;
-        if promotion.delivery_hold || cursor.is_none() {
+        if cursor.is_none() {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                 _ = shutdown.changed() => continue,
@@ -486,11 +463,9 @@ async fn telegram_loop(
             .poll(offset, 1)
             .await
             .map_err(|error| error.to_string())?;
-        if let Some(owner) = owner.as_deref() {
-            batch
-                .messages
-                .retain(|message| message.sender_id.as_deref() == Some(owner));
-        }
+        batch
+            .messages
+            .retain(|message| message.sender_id.as_deref() == Some(owner.as_str()));
         ingestor
             .persist_telegram_batch("telegram_update_offset", batch, wall_now_ms())
             .await
@@ -503,49 +478,23 @@ async fn signal_loop(
     account: String,
     owner: String,
     ingestor: InboundIngestor,
-    store: StoreHandle,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
+    let mut subscriber = SignalSubscriber::connect(&socket, &account, Duration::from_secs(35))
+        .await
+        .map_err(|error| error.to_string())?;
     loop {
-        if *shutdown.borrow() {
-            return Ok(());
-        }
-        if store
-            .promotion_status()
-            .await
-            .map_err(|error| error.to_string())?
-            .delivery_hold
-        {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                _ = shutdown.changed() => continue,
-            }
-            continue;
-        }
-        let mut subscriber = SignalSubscriber::connect(&socket, &account, Duration::from_secs(35))
-            .await
-            .map_err(|error| error.to_string())?;
-        loop {
-            tokio::select! {
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return Ok(());
-                    }
-                }
-                message = subscriber.next() => {
-                    let message = message.map_err(|error| error.to_string())?;
-                    if message.sender_id.as_deref() == Some(owner.as_str()) {
-                        ingestor.persist(message, wall_now_ms()).await.map_err(|error| error.to_string())?;
-                    }
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
                 }
             }
-            if store
-                .promotion_status()
-                .await
-                .map_err(|error| error.to_string())?
-                .delivery_hold
-            {
-                break;
+            message = subscriber.next() => {
+                let message = message.map_err(|error| error.to_string())?;
+                if message.sender_id.as_deref() == Some(owner.as_str()) {
+                    ingestor.persist(message, wall_now_ms()).await.map_err(|error| error.to_string())?;
+                }
             }
         }
     }
@@ -557,42 +506,6 @@ fn wall_now_ms() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
-}
-
-async fn run_daemon(args: DaemonArgs) -> Result<()> {
-    let fixture = std::fs::read_to_string(&args.wakterm_fixture)
-        .context("read pinned Wakterm Agent API fixture")?;
-    let contract = WaktermContract::from_golden_json(&fixture, args.profile.into())
-        .context("validate Wakterm Agent API fake profile")?;
-    let store = StoreHandle::open(&args.journal).context("open offline store")?;
-    let server = ControlServer::bind(&args.socket)
-        .await
-        .context("bind Panetone control socket")?;
-    let mut supervisor = Supervisor::new();
-    let handler = Arc::new(
-        ConformanceService::new(store.clone(), args.effect_log).with_runtime_status(
-            supervisor.handle(),
-            match args.profile {
-                ProfileArg::Current => "current",
-                ProfileArg::FutureEvents => "future_events",
-            },
-            contract.capabilities.iter().cloned().collect(),
-            args.socket.clone(),
-        ),
-    );
-    let shutdown = supervisor.shutdown_receiver();
-    supervisor.spawn("control", TaskPolicy::Critical, async move {
-        server
-            .run(handler, shutdown)
-            .await
-            .map_err(|error| error.to_string())
-    });
-    supervisor
-        .run_until(shutdown_signal())
-        .await
-        .context("supervise offline daemon")?;
-    store.shutdown().await.context("stop store owner")?;
-    Ok(())
 }
 
 async fn shutdown_signal() {
@@ -660,87 +573,91 @@ async fn run_status(args: StatusArgs) -> Result<()> {
     }
 }
 
-async fn run_operator(args: OperatorArgs) -> Result<()> {
-    let (method, params) = match args.action {
-        OperatorCommand::Hold => ("set_delivery_hold", json!({"held": true})),
-        OperatorCommand::Release => ("set_delivery_hold", json!({"held": false})),
-        OperatorCommand::EnableRoute { route } => (
-            "set_route_enabled",
-            json!({"route": route, "enabled": true}),
+async fn run_route(args: RouteArgs) -> Result<()> {
+    let (socket, method, params) = match args.command {
+        RouteCommand::Inspect(args) => (
+            args.socket,
+            "route.inspect",
+            serde_json::to_value(RouteInspectParams { title: args.title })?,
         ),
-        OperatorCommand::DisableRoute { route } => (
-            "set_route_enabled",
-            json!({"route": route, "enabled": false}),
-        ),
-        OperatorCommand::InitEventCursor { sequence } => {
-            ("initialize_event_cursor", json!({"sequence": sequence}))
-        }
-        OperatorCommand::BaselineEvent => ("baseline_event_cursor", Value::Null),
-        OperatorCommand::AcknowledgeEventGap {
-            requested_after_sequence,
-            evidence,
-        } => (
-            "acknowledge_event_cursor_gap",
-            json!({
-                "requested_after_sequence": requested_after_sequence,
-                "evidence": evidence,
-            }),
-        ),
-        OperatorCommand::InitTelegramCursor { offset } => (
-            "initialize_inbound_cursor",
-            json!({"channel": "telegram", "cursor": offset}),
-        ),
-        OperatorCommand::BaselineTelegram => ("baseline_telegram_cursor", Value::Null),
-        OperatorCommand::ReconcileRoute {
-            route,
-            replace_identity,
-        } => (
-            "reconcile_route",
-            json!({"route": route, "replace_identity": replace_identity}),
-        ),
-        OperatorCommand::DisposeLegacy {
-            record_kind,
-            record_id,
-            decision,
-            evidence,
-            route,
-            expected_legacy_destination,
-        } => (
-            "dispose_legacy",
-            json!({
-                "record_kind": match record_kind {
-                    LegacyKindArg::Control => "control",
-                    LegacyKindArg::Return => "return",
-                    LegacyKindArg::Debate => "debate",
-                    LegacyKindArg::Signal => "signal",
-                },
-                "record_id": record_id,
-                "decision": match decision {
-                    LegacyDecisionArg::NoReplay => "no_replay",
-                    LegacyDecisionArg::ExternallyVerified => "externally_verified",
-                    LegacyDecisionArg::MapDebateToSignal => "map_debate_to_signal",
-                },
-                "evidence": evidence,
-                "route": route,
-                "expected_legacy_destination": expected_legacy_destination,
-            }),
+        RouteCommand::Ensure(args) => (
+            args.socket,
+            "route.ensure",
+            serde_json::to_value(RouteEnsureParams {
+                title: args.title,
+                telegram_topic_id: args.telegram_topic_id,
+            })?,
         ),
     };
     let response = request(
-        &args.socket,
+        &socket,
         &ControlRequest {
             schema: CONTROL_SCHEMA.into(),
-            id: args.id.unwrap_or_else(Uuid::new_v4),
+            id: Uuid::new_v4(),
             method: method.into(),
             params,
         },
     )
     .await?;
-    println!("{}", serde_json::to_string_pretty(&response)?);
+    println!("{}", serde_json::to_string(&response)?);
     if response.ok {
         Ok(())
     } else {
-        bail!("operator action was rejected")
+        bail!("route request failed")
+    }
+}
+
+async fn run_output(args: OutputArgs) -> Result<()> {
+    match args.command {
+        OutputCommand::Wait(args) => run_output_wait(args).await,
+    }
+}
+
+async fn run_output_wait(args: OutputWaitArgs) -> Result<()> {
+    if args.timeout_ms == 0 || args.poll_ms == 0 {
+        bail!("--timeout-ms and --poll-ms must be positive");
+    }
+    let started = Instant::now();
+    loop {
+        let response = request(
+            &args.socket,
+            &ControlRequest {
+                schema: CONTROL_SCHEMA.into(),
+                id: Uuid::new_v4(),
+                method: "output.disposition".into(),
+                params: serde_json::to_value(OutputDispositionParams {
+                    route: args.route.clone(),
+                    agent_id: args.agent_id.clone(),
+                    incarnation_id: args.incarnation_id.clone(),
+                    after_sequence: args.after_sequence,
+                    expected_text: args.expect_text.clone(),
+                })?,
+            },
+        )
+        .await?;
+        if !response.ok {
+            println!("{}", serde_json::to_string(&response)?);
+            bail!("output disposition request failed");
+        }
+        let disposition = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("disposition"))
+            .and_then(Value::as_str)
+            .context("output disposition response is malformed")?;
+        if disposition != "pending" {
+            println!("{}", serde_json::to_string(&response)?);
+            return if disposition == "projected" {
+                Ok(())
+            } else {
+                bail!("Wakterm output disposition is {disposition}")
+            };
+        }
+        if started.elapsed() >= Duration::from_millis(args.timeout_ms) {
+            println!("{}", serde_json::to_string(&response)?);
+            bail!("timed out waiting for Wakterm output disposition");
+        }
+        tokio::time::sleep(Duration::from_millis(args.poll_ms)).await;
     }
 }
 
@@ -750,41 +667,28 @@ async fn run_doctor(args: DoctorArgs) -> Result<()> {
         .parent()
         .context("control socket requires a parent directory")?;
     let parent_check = private_directory_check(parent);
-    let live_preflight = args.wakterm_bin.is_some();
-    let wakterm_check = match (args.wakterm_bin.as_ref(), args.wakterm_socket.as_ref()) {
-        (Some(binary), Some(socket)) => {
-            let cli = WaktermCli::new(binary, socket, Duration::from_secs(5));
-            match tokio::try_join!(cli.version(), cli.capabilities(), cli.catalog()) {
-                Ok((version, capabilities, catalog)) => json!({
-                    "ok": true,
-                    "detail": "explicit Wakterm Agent API preflight succeeded",
-                    "version": version,
-                    "socket": socket,
-                    "capabilities": capabilities.capabilities,
-                    "general_event_consumer": capabilities.general_event_consumer_enabled(),
-                    "catalog_agents": catalog.agents.len()
-                }),
-                Err(error) => json!({"ok": false, "detail": error.to_string()}),
-            }
-        }
-        (None, None) => match std::fs::read_to_string(&args.wakterm_fixture) {
-            Ok(fixture) => match (
-                WaktermContract::from_golden_json(&fixture, ProfileKind::Current),
-                WaktermContract::from_golden_json(&fixture, ProfileKind::FutureEvents),
-            ) {
-                (Ok(current), Ok(future)) => json!({
-                    "ok": true,
-                    "detail": "both pinned Wakterm capability snapshots are compatible",
-                    "current_capabilities": current.capabilities,
-                    "future_capabilities": future.capabilities
-                }),
-                (Err(error), _) | (_, Err(error)) => {
-                    json!({"ok": false, "detail": error.to_string()})
-                }
-            },
-            Err(error) => json!({"ok": false, "detail": error.to_string()}),
-        },
-        _ => unreachable!("clap requires both explicit Wakterm arguments"),
+    let cli = WaktermCli::new(
+        &args.wakterm_bin,
+        &args.wakterm_socket,
+        Duration::from_secs(5),
+    );
+    let wakterm_check = match tokio::try_join!(
+        cli.version(),
+        cli.capabilities(),
+        cli.catalog(),
+        cli.live_routes()
+    ) {
+        Ok((version, capabilities, catalog, live_routes)) => json!({
+            "ok": true,
+            "detail": "explicit Wakterm Agent API and effective-title preflight succeeded",
+            "version": version,
+            "socket": args.wakterm_socket,
+            "capabilities": capabilities.capabilities,
+            "general_event_consumer": capabilities.general_event_consumer_enabled(),
+            "catalog_agents": catalog.agents.len(),
+            "live_routes": live_routes.routes().len()
+        }),
+        Err(error) => json!({"ok": false, "detail": error.to_string()}),
     };
     let store = StoreHandle::open(&args.journal);
     let (store_check, opened) = match store {
@@ -792,9 +696,6 @@ async fn run_doctor(args: DoctorArgs) -> Result<()> {
             Ok(status) => {
                 let degraded = status.failed_workflows > 0
                     || status.indeterminate_workflows > 0
-                    || status.legacy_indeterminate_requests > 0
-                    || status.legacy_unresolved_returns > 0
-                    || status.legacy_debate_outbox > 0
                     || status.failed_outbox > 0
                     || status.indeterminate_outbox > 0
                     || status.unresolved_returns > 0;
@@ -802,7 +703,7 @@ async fn run_doctor(args: DoctorArgs) -> Result<()> {
                     json!({
                         "ok": !degraded,
                         "detail": if degraded {
-                            "schema is compatible, but durable failures require operator attention"
+                            "schema is compatible, but durable failures require manual attention"
                         } else {
                             "schema is compatible and no durable failures are recorded"
                         },
@@ -820,18 +721,14 @@ async fn run_doctor(args: DoctorArgs) -> Result<()> {
     };
     let report = json!({
         "ok": parent_check["ok"] == true && store_check["ok"] == true && wakterm_check["ok"] == true,
-        "mode": if live_preflight { "adapter_preflight" } else { "offline_fake" },
+        "mode": "adapter_preflight",
         "checks": {
             "runtime_directory": parent_check,
             "store": store_check,
             "wakterm_contract": wakterm_check,
             "production_connections": {
                 "ok": true,
-                "detail": if live_preflight {
-                    "only the explicitly selected Wakterm Agent API was read; channel connections and prompt submission were disabled"
-                } else {
-                    "disabled in offline mode"
-                }
+                "detail": "only the explicitly selected Wakterm Agent API was read; channel connections and prompt submission were disabled"
             }
         }
     });
@@ -844,33 +741,6 @@ async fn run_doctor(args: DoctorArgs) -> Result<()> {
     } else {
         bail!("doctor found unsafe or incompatible local state")
     }
-}
-
-async fn run_migrate(args: MigrationArgs) -> Result<()> {
-    let output = args.output.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        migrate(&MigrationOptions {
-            state: args.state,
-            pending: args.pending,
-            control_journal: args.control_journal,
-            signal_database: args.signal_database,
-            legacy_control_socket: args.legacy_control_socket,
-            output: args.output,
-        })
-    })
-    .await
-    .context("migration worker stopped")??;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "ok": true,
-            "reused": outcome.reused,
-            "bundle": output,
-            "database": output.join("panetone.sqlite3"),
-            "manifest": outcome.manifest,
-        }))?
-    );
-    Ok(())
 }
 
 fn private_directory_check(path: &Path) -> Value {
@@ -896,4 +766,45 @@ fn private_directory_check(path: &Path) -> Value {
     }
     #[cfg(not(unix))]
     json!({"ok": false, "detail": "Unix sockets are required"})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn production_args() -> ProductionArgs {
+        ProductionArgs {
+            socket: "/tmp/panetone-test.sock".into(),
+            database: "/tmp/panetone-test.sqlite3".into(),
+            wakterm_bin: "/bin/false".into(),
+            wakterm_socket: "/tmp/wakterm-test.sock".into(),
+            telegram_api_base: "http://127.0.0.1:1".into(),
+            telegram_chat: None,
+            telegram_claude_token: None,
+            telegram_codex_token: None,
+            telegram_gemini_token: None,
+            telegram_opencode_token: None,
+            telegram_owner: None,
+            signal_socket: None,
+            signal_account: None,
+            signal_owner: None,
+            worker_poll_ms: 1000,
+            replay_offline_output: false,
+        }
+    }
+
+    #[test]
+    fn telegram_configuration_fails_closed_without_an_owner() {
+        let mut args = production_args();
+        args.telegram_chat = Some(-1001);
+        args.telegram_claude_token = Some("test-token".into());
+        let error = match production_channels(&args, Duration::from_secs(1)) {
+            Ok(_) => panic!("Telegram unexpectedly started without an owner"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("WAK_TG_OWNER"));
+
+        args.telegram_owner = Some("42".into());
+        assert!(production_channels(&args, Duration::from_secs(1)).is_ok());
+    }
 }

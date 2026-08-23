@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -92,8 +92,10 @@ pub enum WaktermCliError {
     UnexpectedSchema,
     #[error("no live Wakterm agent pane matches route title {0:?}")]
     RouteNotFound(String),
-    #[error("more than one live Wakterm agent pane matches route title {0:?}")]
+    #[error("more than one live Wakterm tab matches route title {0:?}")]
     RouteAmbiguous(String),
+    #[error("live Wakterm route {0:?} has no agent pane")]
+    RouteUnavailable(String),
     #[error("Wakterm Agent API event page violates the v1 contract: {0}")]
     InvalidEventPage(&'static str),
     #[error(transparent)]
@@ -110,7 +112,80 @@ struct WireReceipt {
 #[derive(Deserialize)]
 struct LivePane {
     pane_id: u64,
-    tab_title: String,
+    tab_id: u64,
+    window_id: u64,
+    effective_title: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveRoute {
+    pub title: String,
+    pub window_id: u64,
+    pub tab_id: u64,
+    pub agents: Vec<AgentBinding>,
+}
+
+impl LiveRoute {
+    pub fn select(&self, preferred: Option<&AgentBinding>) -> Option<AgentBinding> {
+        let preferred = preferred.and_then(|preferred| {
+            self.agents
+                .iter()
+                .find(|agent| {
+                    agent.agent_id == preferred.agent_id
+                        && agent.incarnation_id == preferred.incarnation_id
+                })
+                .or_else(|| {
+                    self.agents
+                        .iter()
+                        .find(|agent| agent.agent_id == preferred.agent_id)
+                })
+                .or_else(|| {
+                    preferred.pane_id.and_then(|pane_id| {
+                        self.agents
+                            .iter()
+                            .find(|agent| agent.pane_id == Some(pane_id))
+                    })
+                })
+        });
+        preferred.or_else(|| self.agents.first()).cloned()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveRouteSnapshot {
+    routes: Vec<LiveRoute>,
+}
+
+impl LiveRouteSnapshot {
+    pub fn routes(&self) -> &[LiveRoute] {
+        &self.routes
+    }
+
+    pub fn route(&self, title: &str) -> Result<&LiveRoute, WaktermCliError> {
+        let matches = self
+            .routes
+            .iter()
+            .filter(|route| route.title.eq_ignore_ascii_case(title))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => Err(WaktermCliError::RouteNotFound(title.into())),
+            [route] if route.agents.is_empty() => {
+                Err(WaktermCliError::RouteUnavailable(title.into()))
+            }
+            [route] => Ok(route),
+            _ => Err(WaktermCliError::RouteAmbiguous(title.into())),
+        }
+    }
+
+    pub fn resolve(
+        &self,
+        title: &str,
+        preferred: Option<&AgentBinding>,
+    ) -> Result<AgentBinding, WaktermCliError> {
+        self.route(title)?
+            .select(preferred)
+            .ok_or_else(|| WaktermCliError::RouteUnavailable(title.into()))
+    }
 }
 
 #[derive(Deserialize)]
@@ -184,29 +259,53 @@ impl WaktermCli {
         Ok(join_catalog_binding(pane_id, &before, &after)?)
     }
 
-    pub async fn resolve_route_binding(
-        &self,
-        route_title: &str,
-    ) -> Result<AgentBinding, WaktermCliError> {
+    pub async fn live_routes(&self) -> Result<LiveRouteSnapshot, WaktermCliError> {
         let before = self.catalog().await?;
         let panes: Vec<LivePane> = self.run_json(&["list", "--format", "json"], None).await?;
         let after = self.catalog().await?;
-        let mut matches = Vec::new();
-        for pane in panes
-            .into_iter()
-            .filter(|pane| pane.tab_title.eq_ignore_ascii_case(route_title))
-        {
+        let mut grouped = BTreeMap::<(u64, u64, String), Vec<AgentBinding>>::new();
+        for pane in panes {
+            let agents = grouped
+                .entry((pane.window_id, pane.tab_id, pane.effective_title))
+                .or_default();
             match join_catalog_binding(pane.pane_id, &before, &after) {
-                Ok(binding) => matches.push(binding),
+                Ok(binding)
+                    if !agents.iter().any(|agent| {
+                        agent.agent_id == binding.agent_id
+                            && agent.incarnation_id == binding.incarnation_id
+                    }) =>
+                {
+                    agents.push(binding);
+                }
+                Ok(_) => {}
                 Err(ContractError::MissingPane(_)) => {}
                 Err(error) => return Err(error.into()),
             }
         }
-        match matches.len() {
-            0 => Err(WaktermCliError::RouteNotFound(route_title.into())),
-            1 => Ok(matches.remove(0)),
-            _ => Err(WaktermCliError::RouteAmbiguous(route_title.into())),
-        }
+        let routes = grouped
+            .into_iter()
+            .filter_map(|((window_id, tab_id, title), mut agents)| {
+                if title.trim().is_empty() {
+                    return None;
+                }
+                agents.sort_by_key(|agent| agent.pane_id);
+                Some(LiveRoute {
+                    title,
+                    window_id,
+                    tab_id,
+                    agents,
+                })
+            })
+            .collect();
+        Ok(LiveRouteSnapshot { routes })
+    }
+
+    pub async fn resolve_route_binding(
+        &self,
+        route_title: &str,
+        preferred: Option<&AgentBinding>,
+    ) -> Result<AgentBinding, WaktermCliError> {
+        self.live_routes().await?.resolve(route_title, preferred)
     }
 
     pub async fn admit(

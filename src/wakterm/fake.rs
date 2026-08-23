@@ -30,7 +30,6 @@ pub struct FakeWakterm {
     contract: WaktermContract,
     receipts: Mutex<VecDeque<AdmissionStatus>>,
     calls: Mutex<Vec<AdmissionCall>>,
-    terminal: Mutex<VecDeque<TerminalResult>>,
 }
 
 impl FakeWakterm {
@@ -39,7 +38,6 @@ impl FakeWakterm {
             contract,
             receipts: Mutex::new(VecDeque::new()),
             calls: Mutex::new(Vec::new()),
-            terminal: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -49,10 +47,6 @@ impl FakeWakterm {
 
     pub fn catalog(&self) -> AgentCatalog {
         self.contract.catalog.clone()
-    }
-
-    pub fn general_event_consumer_enabled(&self) -> bool {
-        self.contract.general_event_consumer_enabled()
     }
 
     pub fn read_events(&self, after_sequence: u64) -> Result<EventRead, ContractError> {
@@ -110,20 +104,6 @@ impl FakeWakterm {
             .lock()
             .expect("fake call lock is healthy")
             .clone()
-    }
-
-    pub fn push_terminal(&self, result: TerminalResult) {
-        self.terminal
-            .lock()
-            .expect("fake terminal lock is healthy")
-            .push_back(result);
-    }
-
-    pub fn next_terminal(&self) -> Option<TerminalResult> {
-        self.terminal
-            .lock()
-            .expect("fake terminal lock is healthy")
-            .pop_front()
     }
 
     pub fn envelope(command: &SendCommand, source_harness: &str, target_harness: &str) -> String {

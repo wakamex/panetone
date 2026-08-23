@@ -70,6 +70,7 @@ fn item(kind: ChannelKind, destination: &str) -> OutboxItem {
         id: EffectId::new(Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap()),
         route_id: None,
         sender_harness: None,
+        source_agent: None,
         kind,
         destination: destination.into(),
         body: "message café ✓".into(),
@@ -99,6 +100,21 @@ async fn telegram_sends_the_expected_stable_request() {
     assert_eq!(request.body["message_thread_id"], 77);
     assert_eq!(request.body["text"], "message café ✓");
     assert!(request.headers.contains("x-panetone-delivery-id: 11111111"));
+}
+
+#[tokio::test]
+async fn telegram_creates_a_forum_topic_for_a_new_route() {
+    let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 85\r\n\r\n{\"ok\":true,\"result\":{\"message_thread_id\":777,\"name\":\"infobase\",\"icon_color\":7322096}}";
+    let (base, request) = http_server(response, Duration::ZERO).await;
+    let telegram = TelegramClient::new(&base, "fake-token", -1001, Duration::from_secs(2)).unwrap();
+    assert_eq!(telegram.create_forum_topic("infobase").await.unwrap(), 777);
+    let request = request.await.unwrap();
+    assert_eq!(
+        request.request_line,
+        "POST /botfake-token/createForumTopic HTTP/1.1"
+    );
+    assert_eq!(request.body["chat_id"], -1001);
+    assert_eq!(request.body["name"], "infobase");
 }
 
 #[tokio::test]

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use panetone::domain::{AgentBinding, ChannelBinding, Route, RouteId, RouteStatus};
+use panetone::domain::{AgentBinding, ChannelBinding, Route, RouteId};
 use panetone::store::StoreHandle;
 use serde_json::Value;
 use tempfile::tempdir;
@@ -76,38 +76,11 @@ fn route(id: u128, title: &str, pane_id: u64, topic_id: i64) -> Route {
             harness: "codex".into(),
             pane_id: Some(pane_id),
         }),
-        status: RouteStatus::Available,
     }
 }
 
-#[test]
-fn production_refuses_removed_slack_configuration_without_contacting_wakterm() {
-    let directory = tempdir().unwrap();
-    let socket = directory.path().join("control.sock");
-    let database = directory.path().join("state.sqlite3");
-    let output = Command::new(env!("CARGO_BIN_EXE_panetone"))
-        .arg("daemon")
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--database")
-        .arg(&database)
-        .arg("--wakterm-bin")
-        .arg("/does/not/exist")
-        .arg("--wakterm-socket")
-        .arg("/does/not/exist")
-        .env("WEZ_SLACK_BOT_TOKEN", "deprecated-secret")
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Slack support was removed"));
-    assert!(stderr.contains("WEZ_SLACK_BOT_TOKEN"));
-    assert!(!stderr.contains("deprecated-secret"));
-    assert!(!socket.exists());
-}
-
 #[tokio::test]
-async fn held_production_daemon_opens_state_without_polling_or_external_effects() {
+async fn fresh_production_daemon_initializes_runtime_without_promotion() {
     let directory = tempdir().unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let database = directory.path().join("state.sqlite3");
@@ -131,13 +104,19 @@ async fn held_production_daemon_opens_state_without_polling_or_external_effects(
 set -euo pipefail
 printf '%s\n' "$*" >> '{}'
 if [[ "$*" == *"--version"* ]]; then
-  echo 'wakterm held-test'
+  echo 'wakterm production-test'
 elif [[ "$*" == *"agent capabilities"* ]]; then
   echo '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
 elif [[ "$*" == *"agent catalog"* ]]; then
   echo '{{"schema":"wakterm.agent-api.v1","as_of_event_sequence":500,"agents":[]}}'
+elif [[ "$*" == *"list --format json"* ]]; then
+  echo '[]'
+elif [[ "$*" == *"agent events"* ]]; then
+  echo '{{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":500,"oldest_available_sequence":1,"latest_sequence":500,"next_after_sequence":500,"events":[]}}'
+elif [[ "$*" == *"agent request watch"* ]]; then
+  exit 0
 else
-  echo 'external operation attempted while held' >&2
+  echo 'unexpected external operation' >&2
   exit 91
 fi
 "#,
@@ -166,37 +145,12 @@ fi
     assert!(status.status.success());
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["result"]["mode"], "production");
-    assert_eq!(
-        status["result"]["store"]["promotion"]["delivery_hold"],
-        true
-    );
-    assert_eq!(
-        status["result"]["store"]["promotion"]["event_cursor"],
-        Value::Null
-    );
+    assert_eq!(status["result"]["store"]["event_cursor"], 500);
+    assert_eq!(status["result"]["store"]["promotion"], Value::Null);
     assert_eq!(status["result"]["store"]["pending_outbox"], 0);
 
-    let send = Command::new(env!("CARGO_BIN_EXE_panetone"))
-        .args([
-            "send",
-            "--from",
-            "source",
-            "--to",
-            "target",
-            "--socket",
-            daemon.socket.to_str().unwrap(),
-            "held test",
-        ])
-        .output()
-        .unwrap();
-    assert!(!send.status.success());
-    let response: Value = serde_json::from_slice(&send.stdout).unwrap();
-    assert_eq!(response["error"]["code"], "delivery_held");
-
     let calls = fs::read_to_string(&log).unwrap();
-    assert_eq!(calls.lines().count(), 4);
-    assert!(!calls.contains("agent events"));
-    assert!(!calls.contains("agent request"));
+    assert!(calls.contains("agent events"));
     assert!(!calls.contains("agent admit"));
     daemon.terminate();
 }

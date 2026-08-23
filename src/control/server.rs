@@ -65,10 +65,6 @@ impl ControlServer {
         })
     }
 
-    pub fn identity(&self) -> SocketIdentity {
-        self.identity
-    }
-
     pub async fn run(
         self,
         handler: Arc<dyn ControlHandler>,

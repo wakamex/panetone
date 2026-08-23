@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::channels::{RealChannels, RecordingChannels};
 use crate::domain::{
     AgentBinding, CallbackDelivery, ChannelBinding, ChannelKind, DeliveryState, EffectId,
-    OutboxItem, OutboxState, Route, RouteStatus, SendCommand, WorkflowId, WorkflowState,
+    OutboxItem, OutboxState, Route, SendCommand, WorkflowId, WorkflowState,
 };
 use crate::store::{
     ClaimResult, DestinationDelivery, ReturnDelivery, StoreError, StoreHandle, StoredWorkflow,
@@ -311,6 +311,7 @@ impl OfflineService {
             id: EffectId::named(record.command.id, "target-audit"),
             route_id: Some(record.workflow.target_route_id),
             sender_harness: Some(record.workflow.observed_source.harness.clone()),
+            source_agent: Some(target_binding.clone()),
             kind: audit_kind,
             destination: audit_destination,
             body: format!(
@@ -509,6 +510,11 @@ impl OfflineService {
             id: EffectId::named(record.command.id, &format!("target-{purpose}")),
             route_id: Some(record.workflow.target_route_id),
             sender_harness: Some(record.workflow.observed_source.harness.clone()),
+            source_agent: record
+                .workflow
+                .submitted_target
+                .clone()
+                .or_else(|| Some(record.workflow.observed_target.clone())),
             kind,
             destination,
             body: format!(
@@ -630,13 +636,20 @@ impl OfflineService {
         source_route: &Route,
         now_ms: i64,
     ) -> Result<ReturnDelivery, ServiceError> {
-        self.deliver_return(workflow_id, source_route, now_ms).await
+        self.deliver_return(
+            workflow_id,
+            source_route,
+            source_route.agent.clone(),
+            now_ms,
+        )
+        .await
     }
 
     async fn deliver_return(
         &self,
         workflow_id: WorkflowId,
         source_route: &Route,
+        current_source: Option<AgentBinding>,
         now_ms: i64,
     ) -> Result<ReturnDelivery, ServiceError> {
         let mut returned = self
@@ -666,6 +679,7 @@ impl OfflineService {
                     .submitted_target
                     .as_ref()
                     .map(|binding| binding.harness.clone()),
+                source_agent: workflow.workflow.submitted_target.clone(),
                 kind,
                 destination,
                 body: callback_envelope_from_value(&workflow, &returned),
@@ -702,8 +716,10 @@ impl OfflineService {
             returned.updated_at_ms = now_ms;
             self.store.save_return(returned.clone()).await?;
         }
-        if returned.agent.state == DeliveryState::Pending {
-            self.deliver_return_to_agent(returned, workflow, now_ms)
+        if returned.agent.state == DeliveryState::Pending
+            && let Some(current_source) = current_source
+        {
+            self.deliver_return_to_agent(returned, workflow, current_source, now_ms)
                 .await
         } else {
             Ok(returned)
@@ -729,7 +745,8 @@ impl OfflineService {
             .get_workflow(workflow_id)
             .await?
             .ok_or(ServiceError::NotPending)?;
-        self.deliver_return_to_agent(returned, workflow, now_ms)
+        let current_source = returned.agent.source.clone();
+        self.deliver_return_to_agent(returned, workflow, current_source, now_ms)
             .await
     }
 
@@ -737,8 +754,10 @@ impl OfflineService {
         &self,
         mut returned: ReturnDelivery,
         workflow: StoredWorkflow,
+        current_source: AgentBinding,
         now_ms: i64,
     ) -> Result<ReturnDelivery, ServiceError> {
+        returned.agent.source = current_source;
         returned.agent.prepare()?;
         returned.updated_at_ms = now_ms;
         self.store.save_return(returned.clone()).await?;
@@ -799,9 +818,6 @@ async fn persist_ack(
 }
 
 fn available_agent(route: &Route) -> Result<AgentBinding, ServiceError> {
-    if route.status != RouteStatus::Available {
-        return Err(ServiceError::RouteUnavailable(route.title.clone()));
-    }
     route
         .agent
         .clone()

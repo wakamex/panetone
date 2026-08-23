@@ -4,8 +4,7 @@ use std::time::Duration;
 
 use panetone::channels::{RealChannels, TelegramClient};
 use panetone::domain::{
-    AgentBinding, ChannelBinding, Route, RouteId, RouteStatus, SendCommand, WorkflowId,
-    WorkflowState,
+    AgentBinding, ChannelBinding, Route, RouteId, SendCommand, WorkflowId, WorkflowState,
 };
 use panetone::service::OfflineService;
 use panetone::service::ServiceError;
@@ -22,7 +21,6 @@ fn route(id: u128, title: &str, agent: AgentBinding, topic_id: i64) -> Route {
         title: title.into(),
         channels: vec![ChannelBinding::Telegram { topic_id }],
         agent: Some(agent),
-        status: RouteStatus::Available,
     }
 }
 
@@ -281,7 +279,9 @@ async fn rejected_audit_is_durable_visible_and_prevents_prompt_submission() {
         format!(
             r#"#!/bin/bash
 set -euo pipefail
-if [[ "$*" == *"agent capabilities"* ]]; then
+if [[ "$*" == *"--version"* ]]; then
+  printf '%s\n' 'wakterm test-version-1'
+elif [[ "$*" == *"agent capabilities"* ]]; then
   printf '%s\n' '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
 elif [[ "$*" == *"agent catalog"* ]]; then
   printf '%s\n' '{{"schema":"wakterm.agent-api.v1","agents":[{{"agent_id":"agent-target","incarnation_id":"target-incarnation-1","pane_id":22,"name":"target","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"}}]}}'
@@ -375,8 +375,10 @@ fi
             directory.path().join("control.sock").to_str().unwrap(),
             "--journal",
             journal.to_str().unwrap(),
-            "--wakterm-fixture",
-            "/code/wakterm/docs/agent-api/v1/golden-fixtures.json",
+            "--wakterm-bin",
+            script.to_str().unwrap(),
+            "--wakterm-socket",
+            directory.path().join("dev-mux.sock").to_str().unwrap(),
         ])
         .output()
         .unwrap();

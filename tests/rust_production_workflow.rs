@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use panetone::domain::{ChannelBinding, Route, RouteId, RouteStatus};
+use panetone::domain::{ChannelBinding, Route, RouteId};
 use panetone::store::StoreHandle;
 use serde_json::Value;
 use tempfile::tempdir;
@@ -59,6 +59,16 @@ impl HttpCapture {
             .unwrap()
             .iter()
             .filter(|(path, _)| path.ends_with("/sendMessage"))
+            .map(|(_, body)| body.clone())
+            .collect()
+    }
+
+    fn created_topics(&self) -> Vec<Value> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path.ends_with("/createForumTopic"))
             .map(|(_, body)| body.clone())
             .collect()
     }
@@ -116,9 +126,14 @@ fn handle_http(
         .to_owned();
     let body: Value = serde_json::from_slice(&bytes[header_end..header_end + content_length])
         .unwrap_or(Value::Null);
+    let topic_name = body["name"].as_str().unwrap_or("topic").to_owned();
     requests.lock().unwrap().push((path.clone(), body));
     let response = if path.ends_with("/getUpdates") {
         r#"{"ok":true,"result":[]}"#.to_owned()
+    } else if path.ends_with("/createForumTopic") {
+        format!(
+            r#"{{"ok":true,"result":{{"message_thread_id":777,"name":{topic_name:?},"icon_color":7322096}}}}"#
+        )
     } else {
         let id = message_id.fetch_add(1, Ordering::Relaxed);
         format!(r#"{{"ok":true,"result":{{"message_id":{id}}}}}"#)
@@ -130,6 +145,53 @@ fn handle_http(
         response
     )
     .unwrap();
+}
+
+fn write_launcher_wakterm_fake(directory: &Path) -> (PathBuf, PathBuf) {
+    let path = directory.join("wakterm-launcher-fake");
+    let ready = directory.join("bootstrap-ready");
+    fs::write(
+        &path,
+        format!(
+            r#"#!/bin/bash
+set -euo pipefail
+operation="$*"
+if [[ "$operation" == *"--version"* ]]; then
+  echo 'wakterm launcher-test'
+elif [[ "$operation" == *"agent capabilities"* ]]; then
+  echo '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
+elif [[ "$operation" == *"agent catalog"* ]]; then
+  echo '{{"schema":"wakterm.agent-api.v1","as_of_event_sequence":500,"agents":[{{"agent_id":"agent-infobase","incarnation_id":"inc-infobase","pane_id":14,"name":"infobase","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-23T00:00:00Z"}},{{"agent_id":"agent-other","incarnation_id":"inc-other","pane_id":15,"name":"other","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-23T00:00:00Z"}}]}}'
+elif [[ "$operation" == *"list --format json"* ]]; then
+  echo '[{{"pane_id":14,"tab_id":14,"window_id":1,"effective_title":"infobase"}},{{"pane_id":15,"tab_id":15,"window_id":1,"effective_title":"other"}}]'
+elif [[ "$operation" == *"agent events"* ]]; then
+  after=500
+  previous=""
+  for argument in "$@"; do
+    if [[ "$previous" == "--after" ]]; then after="$argument"; fi
+    previous="$argument"
+  done
+  if [[ -e '{}' && "$after" -eq 500 ]]; then
+    echo '{{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":500,"oldest_available_sequence":1,"latest_sequence":502,"next_after_sequence":502,"events":[{{"sequence":501,"event_id":"bootstrap-ready","kind":"assistant_message","agent_id":"agent-infobase","incarnation_id":"inc-infobase","turn_id":"turn-bootstrap","text":"READY"}},{{"sequence":502,"event_id":"other-output","kind":"assistant_message","agent_id":"agent-other","incarnation_id":"inc-other","turn_id":"turn-other","text":"OTHER"}}]}}'
+  elif [[ -e '{}' ]]; then
+    printf '{{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":%s,"oldest_available_sequence":1,"latest_sequence":502,"next_after_sequence":%s,"events":[]}}\n' "$after" "$after"
+  else
+    printf '{{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":%s,"oldest_available_sequence":1,"latest_sequence":500,"next_after_sequence":%s,"events":[]}}\n' "$after" "$after"
+  fi
+elif [[ "$operation" == *"agent request watch"* ]]; then
+  exit 0
+else
+  echo "unexpected fake invocation: $operation" >&2
+  exit 93
+fi
+"#,
+            ready.display(),
+            ready.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    (path, ready)
 }
 
 struct Daemon {
@@ -157,6 +219,8 @@ impl Daemon {
                 "-1001",
                 "--telegram-claude-token",
                 "test-token",
+                "--telegram-owner",
+                "42",
                 "--worker-poll-ms",
                 "100",
             ])
@@ -198,32 +262,13 @@ fn unavailable_route(value: u128, title: &str, topic_id: i64) -> Route {
         title: title.into(),
         channels: vec![ChannelBinding::Telegram { topic_id }],
         agent: None,
-        status: RouteStatus::Unavailable,
     }
 }
 
 fn cli(socket: &Path, args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_panetone"));
-    if args.first() == Some(&"operator") {
-        command
-            .arg("operator")
-            .arg("--socket")
-            .arg(socket)
-            .args(&args[1..]);
-    } else {
-        command.args(args).arg("--socket").arg(socket);
-    }
+    command.args(args).arg("--socket").arg(socket);
     command.output().unwrap()
-}
-
-fn operator(socket: &Path, args: &[&str]) -> Value {
-    let output = cli(socket, &[&["operator"], args].concat());
-    assert!(
-        output.status.success(),
-        "operator failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap()
 }
 
 fn write_wakterm_fake(directory: &Path) -> (PathBuf, PathBuf) {
@@ -236,13 +281,13 @@ fn write_wakterm_fake(directory: &Path) -> (PathBuf, PathBuf) {
 set -euo pipefail
 operation="$*"
 if [[ "$operation" == *"--version"* ]]; then
-  echo 'wakterm promotion-test'
+  echo 'wakterm production-workflow-test'
 elif [[ "$operation" == *"agent capabilities"* ]]; then
   echo '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
 elif [[ "$operation" == *"agent catalog"* ]]; then
   echo '{{"schema":"wakterm.agent-api.v1","as_of_event_sequence":500,"agents":[{{"agent_id":"agent-source","incarnation_id":"inc-source","pane_id":1,"name":"not-the-route-title","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"}},{{"agent_id":"agent-target","incarnation_id":"inc-target","pane_id":2,"name":"also-renamed","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"}}]}}'
 elif [[ "$operation" == *"list --format json"* ]]; then
-  echo '[{{"pane_id":1,"tab_title":"source"}},{{"pane_id":2,"tab_title":"target"}}]'
+  echo '[{{"pane_id":1,"tab_id":1,"window_id":1,"effective_title":"source"}},{{"pane_id":2,"tab_id":2,"window_id":1,"effective_title":"target"}}]'
 elif [[ "$operation" == *"agent events"* ]]; then
   echo '{{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":500,"oldest_available_sequence":1,"latest_sequence":500,"next_after_sequence":500,"events":[]}}'
 elif [[ "$operation" == *"agent request watch"* ]]; then
@@ -275,7 +320,7 @@ fi
 }
 
 #[tokio::test]
-async fn local_promotion_rehearsal_covers_canary_send_report_back_replay_and_restart() {
+async fn production_workflow_resolves_live_routes_and_survives_restart() {
     let directory = tempdir().unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let database = directory.path().join("state.sqlite3");
@@ -292,14 +337,6 @@ async fn local_promotion_rehearsal_covers_canary_send_report_back_replay_and_res
     let telegram = HttpCapture::start();
     let (wakterm, admissions) = write_wakterm_fake(directory.path());
     let daemon = Daemon::start(directory.path(), &database, &wakterm, &telegram.base);
-
-    for route in ["source", "target"] {
-        operator(&daemon.socket, &["reconcile-route", route]);
-        operator(&daemon.socket, &["enable-route", route]);
-    }
-    operator(&daemon.socket, &["init-event-cursor", "500"]);
-    operator(&daemon.socket, &["init-telegram-cursor", "0"]);
-    operator(&daemon.socket, &["release"]);
 
     let request_id = "11111111-1111-4111-8111-111111111111";
     let send = cli(
@@ -404,4 +441,109 @@ async fn local_promotion_rehearsal_covers_canary_send_report_back_replay_and_res
     assert_eq!(fs::read_to_string(&admissions).unwrap().lines().count(), 2);
     assert_eq!(telegram.sent_messages().len(), 4);
     restarted.stop();
+}
+
+#[tokio::test]
+async fn launcher_can_ensure_a_route_and_wait_for_exact_durable_output() {
+    let directory = tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let database = directory.path().join("state.sqlite3");
+    let telegram = HttpCapture::start();
+    let (wakterm, ready) = write_launcher_wakterm_fake(directory.path());
+    let daemon = Daemon::start(directory.path(), &database, &wakterm, &telegram.base);
+
+    let ensured = cli(&daemon.socket, &["route", "ensure", "infobase"]);
+    assert!(
+        ensured.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ensured.stderr)
+    );
+    let ensured: Value = serde_json::from_slice(&ensured.stdout).unwrap();
+    assert_eq!(ensured["result"]["created"], true);
+    assert_eq!(ensured["result"]["binding_created"], true);
+    assert_eq!(ensured["result"]["event_cursor"], 500);
+    assert_eq!(ensured["result"]["route"]["title"], "infobase");
+    assert_eq!(ensured["result"]["route"]["channels"][0]["topic_id"], 777);
+    assert_eq!(ensured["result"]["live"]["status"], "available");
+    assert_eq!(
+        ensured["result"]["live"]["agents"][0]["agent_id"],
+        "agent-infobase"
+    );
+
+    let inspected = cli(&daemon.socket, &["route", "inspect", "INFOBASE"]);
+    assert!(inspected.status.success());
+    let inspected: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(
+        inspected["result"]["route"]["id"],
+        ensured["result"]["route"]["id"]
+    );
+    assert_eq!(inspected["result"]["event_cursor"], 500);
+    let ensured_again = cli(&daemon.socket, &["route", "ensure", "Infobase"]);
+    assert!(ensured_again.status.success());
+    let ensured_again: Value = serde_json::from_slice(&ensured_again.stdout).unwrap();
+    assert_eq!(ensured_again["result"]["created"], false);
+    assert_eq!(ensured_again["result"]["binding_created"], false);
+    assert_eq!(telegram.created_topics().len(), 1);
+
+    fs::write(&ready, b"ready").unwrap();
+    let projected = cli(
+        &daemon.socket,
+        &[
+            "output",
+            "wait",
+            "--route",
+            "infobase",
+            "--agent-id",
+            "agent-infobase",
+            "--incarnation-id",
+            "inc-infobase",
+            "--after",
+            "500",
+            "--expect-text",
+            "READY",
+            "--timeout-ms",
+            "5000",
+            "--poll-ms",
+            "20",
+        ],
+    );
+    assert!(
+        projected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&projected.stderr)
+    );
+    let projected: Value = serde_json::from_slice(&projected.stdout).unwrap();
+    assert_eq!(projected["result"]["disposition"], "projected");
+    assert_eq!(projected["result"]["event"]["sequence"], 501);
+    assert_eq!(projected["result"]["event"]["event_id"], "bootstrap-ready");
+    assert_eq!(projected["result"]["event"]["text"], "READY");
+    assert_eq!(projected["result"]["actual_route"]["title"], "infobase");
+
+    let unrouted = cli(
+        &daemon.socket,
+        &[
+            "output",
+            "wait",
+            "--route",
+            "infobase",
+            "--agent-id",
+            "agent-other",
+            "--incarnation-id",
+            "inc-other",
+            "--after",
+            "500",
+            "--expect-text",
+            "OTHER",
+            "--timeout-ms",
+            "1000",
+            "--poll-ms",
+            "20",
+        ],
+    );
+    assert!(!unrouted.status.success());
+    let unrouted: Value = serde_json::from_slice(&unrouted.stdout).unwrap();
+    assert_eq!(unrouted["result"]["disposition"], "unrouted");
+    assert_eq!(unrouted["result"]["event"]["event_id"], "other-output");
+
+    daemon.stop();
 }

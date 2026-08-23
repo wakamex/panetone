@@ -1,26 +1,23 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use serde::Deserialize;
-use serde_json::{Value, json};
-use tokio::sync::RwLock;
+use serde_json::json;
 use uuid::Uuid;
 
-use crate::channels::{RealChannels, TelegramPoller};
+use crate::channels::RealChannels;
 use crate::control::{
-    CONTROL_SCHEMA, ControlHandler, ControlRequest, ControlResponse, SendParams, error_response,
-    success_response,
+    CONTROL_SCHEMA, ControlHandler, ControlRequest, ControlResponse, OutputDispositionParams,
+    RouteEnsureParams, RouteInspectParams, SendParams, error_response, success_response,
 };
 use crate::domain::{
-    AdmissionStatus, ChannelBinding, ChannelKind, OutboxState, Route, RouteStatus, WorkflowId,
+    AdmissionStatus, AgentBinding, ChannelBinding, ChannelKind, OutboxState, Route, RouteId,
+    WorkflowId,
 };
-use crate::promotion::{
-    EventCursorGap, LegacyDecision, LegacyRecordKind, OperatorAction, OperatorMutation,
-};
-use crate::store::{InboxItem, StoreHandle};
+use crate::store::{EventCursorGap, InboxItem, RouteAgent, StoreHandle};
 use crate::supervisor::SupervisorHandle;
-use crate::wakterm::{EventRead, TerminalResult, WaktermCli};
+use crate::wakterm::{EventRead, LiveRouteSnapshot, TerminalResult, WaktermCli, WaktermCliError};
 
 use super::{OfflineService, ServiceError};
 
@@ -28,58 +25,13 @@ pub struct ProductionService {
     store: StoreHandle,
     wakterm: WaktermCli,
     channels: RealChannels,
-    telegram_poller: Option<TelegramPoller>,
     workflows: Arc<OfflineService>,
-    effects: RwLock<()>,
     health: SupervisorHandle,
     capabilities: Vec<String>,
     control_socket: PathBuf,
     started_at: Instant,
-}
-
-#[derive(Debug, Deserialize)]
-struct HoldParams {
-    held: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct RoutePolicyParams {
-    route: String,
-    enabled: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct CursorParams {
-    sequence: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct CursorGapAckParams {
-    requested_after_sequence: u64,
-    evidence: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct InboundCursorParams {
-    channel: ChannelKind,
-    cursor: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReconcileParams {
-    route: String,
-    #[serde(default)]
-    replace_identity: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct DisposeLegacyParams {
-    record_kind: LegacyRecordKind,
-    record_id: String,
-    decision: String,
-    evidence: String,
-    route: Option<String>,
-    expected_legacy_destination: Option<String>,
+    last_agents: tokio::sync::RwLock<HashMap<RouteId, AgentBinding>>,
+    route_changes: tokio::sync::Mutex<()>,
 }
 
 impl ProductionService {
@@ -87,7 +39,6 @@ impl ProductionService {
         store: StoreHandle,
         wakterm: WaktermCli,
         channels: RealChannels,
-        telegram_poller: Option<TelegramPoller>,
         health: SupervisorHandle,
         capabilities: Vec<String>,
         control_socket: PathBuf,
@@ -101,25 +52,31 @@ impl ProductionService {
             store,
             wakterm,
             channels,
-            telegram_poller,
             workflows,
-            effects: RwLock::new(()),
             health,
             capabilities,
             control_socket,
             started_at: Instant::now(),
+            last_agents: tokio::sync::RwLock::new(HashMap::new()),
+            route_changes: tokio::sync::Mutex::new(()),
         }
     }
 
     pub async fn event_once(&self) -> Result<usize, String> {
-        let _guard = self.effects.read().await;
-        let promotion = self.store.promotion_status().await.map_err(error_string)?;
-        if promotion.delivery_hold {
-            return Ok(0);
-        }
-        let Some(mut cursor) = promotion.event_cursor else {
+        let Some(mut cursor) = self
+            .store
+            .get_metadata("wakterm_event_cursor".into())
+            .await
+            .map_err(error_string)?
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .map_err(|_| "stored Wakterm event cursor is invalid".to_string())?
+        else {
             return Err("Wakterm event cursor has not been initialized".into());
         };
+        let routes = self.store.list_routes().await.map_err(error_string)?;
+        let live = self.wakterm.live_routes().await.map_err(error_string)?;
+        let route_agents = project_live_routes(&routes, &live)?;
         let mut recorded = 0usize;
         loop {
             match self
@@ -135,9 +92,21 @@ impl ProductionService {
                 } => {
                     let outcome = self
                         .store
-                        .ingest_agent_events(cursor, next_after_sequence, events, now_ms())
+                        .ingest_agent_events(
+                            cursor,
+                            next_after_sequence,
+                            events,
+                            route_agents.clone(),
+                            now_ms(),
+                        )
                         .await
                         .map_err(error_string)?;
+                    if !outcome.last_agents.is_empty() {
+                        let mut last_agents = self.last_agents.write().await;
+                        for last in outcome.last_agents {
+                            last_agents.insert(last.route_id, last.agent);
+                        }
+                    }
                     recorded += outcome.recorded as usize;
                     cursor = next_after_sequence;
                     if cursor >= latest_sequence {
@@ -167,7 +136,7 @@ impl ProductionService {
                         .await
                         .map_err(error_string)?;
                     return Err(format!(
-                        "Wakterm event cursor {requested_after_sequence} was older than retained sequence {oldest_available_sequence}; delivery is held at fresh catalog cursor {fresh_catalog_as_of_sequence} until the explicit gap is reviewed and acknowledged"
+                        "Wakterm event cursor {requested_after_sequence} was older than retained sequence {oldest_available_sequence}; the cursor advanced to fresh catalog sequence {fresh_catalog_as_of_sequence}"
                     ));
                 }
                 EventRead::Unsupported => {
@@ -178,64 +147,56 @@ impl ProductionService {
     }
 
     pub async fn outbox_once(&self) -> Result<usize, String> {
-        let _guard = self.effects.read().await;
-        let promotion = self.store.promotion_status().await.map_err(error_string)?;
-        if promotion.delivery_hold {
+        let Some(mut item) = self
+            .store
+            .pending_outbox()
+            .await
+            .map_err(error_string)?
+            .into_iter()
+            .next()
+        else {
             return Ok(0);
+        };
+        let expected_attempts = item.attempts;
+        item.state = OutboxState::Delivering;
+        item.attempts += 1;
+        self.store
+            .save_outbox(item.clone(), now_ms())
+            .await
+            .map_err(error_string)?;
+        match self.channels.send(&item).await {
+            Ok(receipt) => {
+                item.state = OutboxState::Delivered;
+                item.external_receipt = Some(receipt.external_id);
+                item.last_error = None;
+            }
+            Err(error) => {
+                item.state = if error.retryable() {
+                    OutboxState::Pending
+                } else {
+                    OutboxState::Failed
+                };
+                item.last_error = Some(error.to_string());
+            }
         }
-        let mut attempted = 0;
-        for mut item in self.store.pending_outbox().await.map_err(error_string)? {
-            if item
-                .route_id
-                .is_none_or(|route_id| !promotion.delivery_allowed(route_id))
-            {
-                continue;
-            }
-            let expected_attempts = item.attempts;
-            item.state = OutboxState::Delivering;
-            item.attempts += 1;
-            self.store
-                .save_outbox(item.clone(), now_ms())
-                .await
-                .map_err(error_string)?;
-            attempted += 1;
-            match self.channels.send(&item).await {
-                Ok(receipt) => {
-                    item.state = OutboxState::Delivered;
-                    item.external_receipt = Some(receipt.external_id);
-                    item.last_error = None;
-                }
-                Err(error) => {
-                    item.state = if error.retryable() {
-                        OutboxState::Pending
-                    } else {
-                        OutboxState::Failed
-                    };
-                    item.last_error = Some(error.to_string());
-                }
-            }
-            if item.attempts != expected_attempts + 1 {
-                return Err("outbox attempt accounting changed unexpectedly".into());
-            }
-            self.store
-                .save_outbox(item, now_ms())
-                .await
-                .map_err(error_string)?;
+        if item.attempts != expected_attempts + 1 {
+            return Err("outbox attempt accounting changed unexpectedly".into());
         }
-        Ok(attempted)
+        self.store
+            .save_outbox(item, now_ms())
+            .await
+            .map_err(error_string)?;
+        Ok(1)
     }
 
     pub async fn busy_once(&self) -> Result<usize, String> {
-        let _guard = self.effects.read().await;
-        let promotion = self.store.promotion_status().await.map_err(error_string)?;
-        if promotion.delivery_hold {
+        let workflows = self.store.awaiting_target().await.map_err(error_string)?;
+        if workflows.is_empty() {
             return Ok(0);
         }
+        let live = self.wakterm.live_routes().await.map_err(error_string)?;
         let mut attempted = 0;
-        for workflow in self.store.awaiting_target().await.map_err(error_string)? {
-            if !promotion.delivery_allowed(workflow.workflow.target_route_id) {
-                continue;
-            }
+        for workflow in workflows {
             let Some(route) = self
                 .store
                 .get_route(workflow.workflow.target_route_id)
@@ -244,10 +205,15 @@ impl ProductionService {
             else {
                 continue;
             };
+            let preferred = self.last_agents.read().await.get(&route.id).cloned();
+            let Some(binding) = resolve_live(&live, &route, preferred.as_ref())? else {
+                continue;
+            };
+            let live_route = route.with_agent(binding);
             attempted += 1;
             match self
                 .workflows
-                .retry_busy_target(workflow.command.id, &route, now_ms())
+                .retry_busy_target(workflow.command.id, &live_route, now_ms())
                 .await
             {
                 Ok(_) | Err(ServiceError::RouteUnavailable(_)) => {}
@@ -258,11 +224,6 @@ impl ProductionService {
     }
 
     pub async fn terminal_once(&self) -> Result<usize, String> {
-        let _guard = self.effects.read().await;
-        let promotion = self.store.promotion_status().await.map_err(error_string)?;
-        if promotion.delivery_hold {
-            return Ok(0);
-        }
         let cursor = self
             .store
             .get_metadata("wakterm_return_cursor".into())
@@ -333,12 +294,11 @@ impl ProductionService {
     }
 
     pub async fn pending_return_once(&self) -> Result<usize, String> {
-        let _guard = self.effects.read().await;
-        let promotion = self.store.promotion_status().await.map_err(error_string)?;
-        if promotion.delivery_hold {
+        let pending = self.store.pending_returns().await.map_err(error_string)?;
+        if pending.is_empty() {
             return Ok(0);
         }
-        let pending = self.store.pending_returns().await.map_err(error_string)?;
+        let live = self.wakterm.live_routes().await.map_err(error_string)?;
         let mut attempted = 0;
         for returned in pending {
             let workflow = self
@@ -347,19 +307,21 @@ impl ProductionService {
                 .await
                 .map_err(error_string)?
                 .ok_or_else(|| "pending return workflow is missing".to_string())?;
-            if !promotion.delivery_allowed(workflow.workflow.source_route_id) {
-                continue;
-            }
             let route = self
                 .store
                 .get_route(workflow.workflow.source_route_id)
                 .await
                 .map_err(error_string)?
                 .ok_or_else(|| "pending return source route is missing".to_string())?;
+            let preferred = self.last_agents.read().await.get(&route.id).cloned();
+            let live_route = match resolve_live(&live, &route, preferred.as_ref())? {
+                Some(binding) => route.with_agent(binding),
+                None => route,
+            };
             attempted += 1;
             match self
                 .workflows
-                .deliver_pending_return(returned.workflow_id, &route, now_ms())
+                .deliver_pending_return(returned.workflow_id, &live_route, now_ms())
                 .await
             {
                 Ok(_) | Err(ServiceError::RouteUnavailable(_)) => {}
@@ -370,14 +332,14 @@ impl ProductionService {
     }
 
     pub async fn inbox_once(&self) -> Result<usize, String> {
-        let _guard = self.effects.read().await;
-        let promotion = self.store.promotion_status().await.map_err(error_string)?;
-        if promotion.delivery_hold {
+        let pending = self.store.pending_inbox().await.map_err(error_string)?;
+        if pending.is_empty() {
             return Ok(0);
         }
         let routes = self.store.list_routes().await.map_err(error_string)?;
+        let live = self.wakterm.live_routes().await.map_err(error_string)?;
         let mut attempted = 0;
-        for mut item in self.store.pending_inbox().await.map_err(error_string)? {
+        for mut item in pending {
             let matching = routes
                 .iter()
                 .filter(|route| route_matches_inbox(route, &item))
@@ -385,10 +347,17 @@ impl ProductionService {
             let [route] = matching.as_slice() else {
                 continue;
             };
-            if !promotion.delivery_allowed(route.id) || route.status != RouteStatus::Available {
-                continue;
-            }
-            let Some(binding) = route.agent.as_ref() else {
+            let reply_agent = match item.reply_to_external_id.as_ref() {
+                Some(receipt) => self
+                    .store
+                    .find_outbox_agent(item.channel, item.destination.clone(), receipt.clone())
+                    .await
+                    .map_err(error_string)?,
+                None => None,
+            };
+            let last_agent = self.last_agents.read().await.get(&route.id).cloned();
+            let preferred = reply_agent.as_ref().or(last_agent.as_ref());
+            let Some(binding) = resolve_live(&live, route, preferred)? else {
                 continue;
             };
             attempted += 1;
@@ -397,10 +366,9 @@ impl ProductionService {
                 .save_inbox(item.clone(), "pending", None)
                 .await
                 .map_err(error_string)?;
-            let prompt = inbound_envelope(&item, route);
             let receipt = match self
                 .wakterm
-                .admit(item.id, binding, &prompt, false, 0)
+                .admit(item.id, &binding, &item.body, false, 0)
                 .await
             {
                 Ok(receipt) => receipt,
@@ -413,7 +381,7 @@ impl ProductionService {
                     return Err(error.to_string());
                 }
             };
-            receipt.validate(item.id, binding).map_err(error_string)?;
+            receipt.validate(item.id, &binding).map_err(error_string)?;
             item.state = match receipt.status {
                 AdmissionStatus::Accepted => "delivered",
                 AdmissionStatus::Indeterminate => "indeterminate",
@@ -447,11 +415,6 @@ impl ProductionService {
                 None,
             );
         }
-        let _guard = self.effects.read().await;
-        let promotion = match self.store.promotion_status().await {
-            Ok(status) => status,
-            Err(error) => return internal(id, error),
-        };
         let routes = match self.store.list_routes().await {
             Ok(routes) => routes,
             Err(error) => return internal(id, error),
@@ -464,19 +427,29 @@ impl ProductionService {
             Ok(route) => route,
             Err(response) => return route_error(id, "target", response),
         };
-        if !promotion.delivery_allowed(target.id)
-            || (params.return_final && !promotion.delivery_allowed(source.id))
-        {
-            return error_response(
-                id,
-                "delivery_held",
-                "delivery is held globally or for a requested route",
-                Some(json!({"promotion": promotion})),
-            );
-        }
+        let live = match self.wakterm.live_routes().await {
+            Ok(live) => live,
+            Err(error) => {
+                return error_response(id, "route_resolution_failed", error.to_string(), None);
+            }
+        };
+        let last_agents = self.last_agents.read().await;
+        let source_binding = match resolve_live(&live, source, last_agents.get(&source.id)) {
+            Ok(Some(binding)) => binding,
+            Ok(None) => return route_unavailable(id, "source", source),
+            Err(error) => return error_response(id, "route_resolution_failed", error, None),
+        };
+        let target_binding = match resolve_live(&live, target, last_agents.get(&target.id)) {
+            Ok(Some(binding)) => binding,
+            Ok(None) => return route_unavailable(id, "target", target),
+            Err(error) => return error_response(id, "route_resolution_failed", error, None),
+        };
+        drop(last_agents);
+        let source = source.with_agent(source_binding);
+        let target = target.with_agent(target_binding);
         match self
             .workflows
-            .submit(params.into_command(id), source, target, now_ms())
+            .submit(params.into_command(id), &source, &target, now_ms())
             .await
         {
             Ok(ack) => success_response(id, serde_json::to_value(ack).expect("ack serializes")),
@@ -499,275 +472,6 @@ impl ProductionService {
                 Some(json!({"durable": true})),
             ),
         }
-    }
-
-    async fn handle_operator(&self, request: ControlRequest) -> ControlResponse {
-        let id = request.id;
-        let intent = json!({"method": request.method.clone(), "params": request.params.clone()});
-        match self.store.operator_replay(id, intent.clone()).await {
-            Ok(Some(outcome)) => {
-                return success_response(
-                    id,
-                    serde_json::to_value(outcome).expect("operator outcome serializes"),
-                );
-            }
-            Ok(None) => {}
-            Err(error) => {
-                return error_response(id, "operator_conflict", error.to_string(), None);
-            }
-        }
-        let result = match request.method.as_str() {
-            "set_delivery_hold" => {
-                let params = match serde_json::from_value::<HoldParams>(request.params) {
-                    Ok(params) => params,
-                    Err(error) => return invalid(id, error),
-                };
-                let _guard = self.effects.write().await;
-                self.apply(
-                    id,
-                    OperatorAction::SetDeliveryHold { held: params.held },
-                    intent.clone(),
-                )
-                .await
-            }
-            "set_route_enabled" => {
-                let params = match serde_json::from_value::<RoutePolicyParams>(request.params) {
-                    Ok(params) => params,
-                    Err(error) => return invalid(id, error),
-                };
-                let route = match self.resolve_route(&params.route).await {
-                    Ok(route) => route,
-                    Err(error) => return route_error(id, "route", error),
-                };
-                self.apply(
-                    id,
-                    OperatorAction::SetRouteEnabled {
-                        route_id: route.id,
-                        enabled: params.enabled,
-                    },
-                    intent.clone(),
-                )
-                .await
-            }
-            "initialize_event_cursor" => {
-                let params = match serde_json::from_value::<CursorParams>(request.params) {
-                    Ok(params) => params,
-                    Err(error) => return invalid(id, error),
-                };
-                self.apply(
-                    id,
-                    OperatorAction::InitializeEventCursor {
-                        sequence: params.sequence,
-                    },
-                    intent.clone(),
-                )
-                .await
-            }
-            "baseline_event_cursor" => {
-                if !request.params.is_null() {
-                    return error_response(
-                        id,
-                        "invalid_request",
-                        "Wakterm event baseline takes no parameters",
-                        None,
-                    );
-                }
-                let _guard = self.effects.write().await;
-                let catalog = match self.wakterm.catalog().await {
-                    Ok(catalog) => catalog,
-                    Err(error) => {
-                        return error_response(id, "wakterm_unavailable", error.to_string(), None);
-                    }
-                };
-                self.apply(
-                    id,
-                    OperatorAction::InitializeEventCursor {
-                        sequence: catalog.as_of_event_sequence,
-                    },
-                    intent.clone(),
-                )
-                .await
-            }
-            "acknowledge_event_cursor_gap" => {
-                let params = match serde_json::from_value::<CursorGapAckParams>(request.params) {
-                    Ok(params) => params,
-                    Err(error) => return invalid(id, error),
-                };
-                let _guard = self.effects.write().await;
-                self.apply(
-                    id,
-                    OperatorAction::AcknowledgeEventCursorGap {
-                        requested_after_sequence: params.requested_after_sequence,
-                        evidence: params.evidence,
-                    },
-                    intent.clone(),
-                )
-                .await
-            }
-            "initialize_inbound_cursor" => {
-                let params = match serde_json::from_value::<InboundCursorParams>(request.params) {
-                    Ok(params) => params,
-                    Err(error) => return invalid(id, error),
-                };
-                self.apply(
-                    id,
-                    OperatorAction::InitializeInboundCursor {
-                        channel: params.channel,
-                        cursor: params.cursor,
-                    },
-                    intent.clone(),
-                )
-                .await
-            }
-            "baseline_telegram_cursor" => {
-                if !request.params.is_null() {
-                    return error_response(
-                        id,
-                        "invalid_request",
-                        "Telegram baseline takes no parameters",
-                        None,
-                    );
-                }
-                let Some(poller) = self.telegram_poller.as_ref() else {
-                    return error_response(
-                        id,
-                        "channel_unavailable",
-                        "Telegram is not configured",
-                        None,
-                    );
-                };
-                let _guard = self.effects.write().await;
-                let batch = match poller.poll(-1, 0).await {
-                    Ok(batch) => batch,
-                    Err(error) => {
-                        return error_response(id, "channel_unavailable", error.to_string(), None);
-                    }
-                };
-                self.apply(
-                    id,
-                    OperatorAction::InitializeInboundCursor {
-                        channel: ChannelKind::Telegram,
-                        cursor: batch.next_offset.max(0) as u64,
-                    },
-                    intent.clone(),
-                )
-                .await
-            }
-            "reconcile_route" => {
-                let params = match serde_json::from_value::<ReconcileParams>(request.params) {
-                    Ok(params) => params,
-                    Err(error) => return invalid(id, error),
-                };
-                let route = match self.resolve_route(&params.route).await {
-                    Ok(route) => route,
-                    Err(error) => return route_error(id, "route", error),
-                };
-                let binding = match self.wakterm.resolve_route_binding(&route.title).await {
-                    Ok(binding) => binding,
-                    Err(error) => {
-                        return error_response(
-                            id,
-                            "route_reconciliation_failed",
-                            error.to_string(),
-                            None,
-                        );
-                    }
-                };
-                self.apply(
-                    id,
-                    OperatorAction::ReconcileRoute {
-                        route_id: route.id,
-                        binding,
-                        replace_identity: params.replace_identity,
-                    },
-                    intent.clone(),
-                )
-                .await
-            }
-            "dispose_legacy" => {
-                let params = match serde_json::from_value::<DisposeLegacyParams>(request.params) {
-                    Ok(params) => params,
-                    Err(error) => return invalid(id, error),
-                };
-                let decision = match params.decision.as_str() {
-                    "no_replay" => LegacyDecision::NoReplay,
-                    "externally_verified" => LegacyDecision::ExternallyVerified,
-                    "map_debate_to_signal" => {
-                        let Some(route_name) = params.route else {
-                            return error_response(
-                                id,
-                                "invalid_request",
-                                "Signal mapping requires a route",
-                                None,
-                            );
-                        };
-                        let route = match self.resolve_route(&route_name).await {
-                            Ok(route) => route,
-                            Err(error) => return route_error(id, "route", error),
-                        };
-                        let Some(destination) = params.expected_legacy_destination else {
-                            return error_response(
-                                id,
-                                "invalid_request",
-                                "Signal mapping requires the expected legacy destination",
-                                None,
-                            );
-                        };
-                        LegacyDecision::MapDebateToSignal {
-                            route_id: route.id,
-                            expected_legacy_destination: destination,
-                        }
-                    }
-                    _ => {
-                        return error_response(
-                            id,
-                            "invalid_request",
-                            "unknown legacy disposition",
-                            None,
-                        );
-                    }
-                };
-                self.apply(
-                    id,
-                    OperatorAction::DisposeLegacy {
-                        record_kind: params.record_kind,
-                        record_id: params.record_id,
-                        decision,
-                        evidence: params.evidence,
-                    },
-                    intent.clone(),
-                )
-                .await
-            }
-            _ => unreachable!("operator method was prefiltered"),
-        };
-        match result {
-            Ok(outcome) => success_response(id, serde_json::to_value(outcome).expect("serializes")),
-            Err(error) => error_response(id, "operator_conflict", error.to_string(), None),
-        }
-    }
-
-    async fn apply(
-        &self,
-        operation_id: Uuid,
-        action: OperatorAction,
-        intent: Value,
-    ) -> Result<crate::promotion::OperatorOutcome, crate::store::StoreError> {
-        self.store
-            .apply_operator_mutation(
-                OperatorMutation {
-                    operation_id,
-                    intent: Some(intent),
-                    action,
-                },
-                now_ms(),
-            )
-            .await
-    }
-
-    async fn resolve_route(&self, name: &str) -> Result<Route, &'static str> {
-        let routes = self.store.list_routes().await.map_err(|_| "store_failed")?;
-        exact_route(&routes, name).cloned()
     }
 
     async fn status_response(&self, id: Uuid) -> ControlResponse {
@@ -795,6 +499,285 @@ impl ProductionService {
             Err(error) => internal(id, error),
         }
     }
+
+    async fn handle_route_inspect(&self, id: Uuid, params: RouteInspectParams) -> ControlResponse {
+        let routes = match self.store.list_routes().await {
+            Ok(routes) => routes,
+            Err(error) => return internal(id, error),
+        };
+        let route = match exact_route(&routes, &params.title) {
+            Ok(route) => route,
+            Err(detail) => return route_error(id, "", detail),
+        };
+        self.route_response(id, route, false, false, None).await
+    }
+
+    async fn handle_route_ensure(&self, id: Uuid, params: RouteEnsureParams) -> ControlResponse {
+        if params.title.is_empty()
+            || params.title.trim() != params.title
+            || params.title.chars().count() > 128
+            || params
+                .telegram_topic_id
+                .is_some_and(|topic_id| topic_id <= 0)
+        {
+            return error_response(
+                id,
+                "invalid_params",
+                "route title must be 1 to 128 characters without surrounding whitespace, and a Telegram topic ID must be positive",
+                None,
+            );
+        }
+        let _change = self.route_changes.lock().await;
+        let routes = match self.store.list_routes().await {
+            Ok(routes) => routes,
+            Err(error) => return internal(id, error),
+        };
+        let mut route = match exact_route(&routes, &params.title) {
+            Ok(route) => route.clone(),
+            Err("not_found") => {
+                let live = match self.wakterm.live_routes().await {
+                    Ok(live) => live,
+                    Err(error) => {
+                        return error_response(
+                            id,
+                            "route_resolution_failed",
+                            error.to_string(),
+                            None,
+                        );
+                    }
+                };
+                match live.route(&params.title) {
+                    Ok(_) => {}
+                    Err(
+                        WaktermCliError::RouteNotFound(_) | WaktermCliError::RouteUnavailable(_),
+                    ) => {
+                        return error_response(
+                            id,
+                            "route_unavailable",
+                            format!(
+                                "route {:?} cannot be created without one live Wakterm agent tab",
+                                params.title
+                            ),
+                            None,
+                        );
+                    }
+                    Err(WaktermCliError::RouteAmbiguous(_)) => {
+                        return error_response(
+                            id,
+                            "route_ambiguous",
+                            format!(
+                                "more than one live Wakterm tab matches route {:?}",
+                                params.title
+                            ),
+                            None,
+                        );
+                    }
+                    Err(error) => {
+                        return error_response(
+                            id,
+                            "route_resolution_failed",
+                            error.to_string(),
+                            None,
+                        );
+                    }
+                }
+                let topic_id = match params.telegram_topic_id {
+                    Some(topic_id) => topic_id,
+                    None => match self.channels.create_telegram_topic(&params.title).await {
+                        Ok(topic_id) => topic_id,
+                        Err(error) => {
+                            return error_response(
+                                id,
+                                "route_binding_failed",
+                                error.to_string(),
+                                None,
+                            );
+                        }
+                    },
+                };
+                let route = Route {
+                    id: RouteId::random(),
+                    title: params.title,
+                    channels: vec![ChannelBinding::Telegram { topic_id }],
+                    agent: None,
+                };
+                if let Err(error) = self.store.save_route(route.clone(), now_ms()).await {
+                    return internal(id, error);
+                }
+                return self
+                    .route_response(id, &route, true, true, Some(live))
+                    .await;
+            }
+            Err(detail) => return route_error(id, "", detail),
+        };
+
+        let existing_topic = route.channels.iter().find_map(|binding| match binding {
+            ChannelBinding::Telegram { topic_id } => Some(*topic_id),
+            _ => None,
+        });
+        if let (Some(existing), Some(requested)) = (existing_topic, params.telegram_topic_id)
+            && existing != requested
+        {
+            return error_response(
+                id,
+                "route_binding_conflict",
+                format!(
+                    "route {:?} is already bound to Telegram topic {existing}",
+                    route.title
+                ),
+                Some(json!({"telegram_topic_id": existing})),
+            );
+        }
+        let mut binding_created = false;
+        if existing_topic.is_none() {
+            let topic_id = match params.telegram_topic_id {
+                Some(topic_id) => topic_id,
+                None => match self.channels.create_telegram_topic(&route.title).await {
+                    Ok(topic_id) => topic_id,
+                    Err(error) => {
+                        return error_response(id, "route_binding_failed", error.to_string(), None);
+                    }
+                },
+            };
+            route.channels.push(ChannelBinding::Telegram { topic_id });
+            if let Err(error) = self.store.save_route(route.clone(), now_ms()).await {
+                return internal(id, error);
+            }
+            binding_created = true;
+        }
+        self.route_response(id, &route, false, binding_created, None)
+            .await
+    }
+
+    async fn route_response(
+        &self,
+        id: Uuid,
+        route: &Route,
+        created: bool,
+        binding_created: bool,
+        live: Option<LiveRouteSnapshot>,
+    ) -> ControlResponse {
+        let live = match live {
+            Some(live) => live,
+            None => match self.wakterm.live_routes().await {
+                Ok(live) => live,
+                Err(error) => {
+                    return error_response(id, "route_resolution_failed", error.to_string(), None);
+                }
+            },
+        };
+        let live = match live.route(&route.title) {
+            Ok(live) => json!({"status": "available", "agents": live.agents}),
+            Err(WaktermCliError::RouteNotFound(_) | WaktermCliError::RouteUnavailable(_)) => {
+                json!({"status": "unavailable", "agents": []})
+            }
+            Err(WaktermCliError::RouteAmbiguous(_)) => {
+                return error_response(
+                    id,
+                    "route_ambiguous",
+                    format!(
+                        "more than one live Wakterm tab matches route {:?}",
+                        route.title
+                    ),
+                    None,
+                );
+            }
+            Err(error) => {
+                return error_response(id, "route_resolution_failed", error.to_string(), None);
+            }
+        };
+        let event_cursor = match self.store.get_metadata("wakterm_event_cursor".into()).await {
+            Ok(Some(value)) => match value.parse::<u64>() {
+                Ok(value) => value,
+                Err(_) => return internal(id, "stored Wakterm event cursor is invalid"),
+            },
+            Ok(None) => return internal(id, "Wakterm event cursor is unavailable"),
+            Err(error) => return internal(id, error),
+        };
+        success_response(
+            id,
+            json!({
+                "created": created,
+                "binding_created": binding_created,
+                "route": route,
+                "live": live,
+                "event_cursor": event_cursor,
+            }),
+        )
+    }
+
+    async fn handle_output_disposition(
+        &self,
+        id: Uuid,
+        params: OutputDispositionParams,
+    ) -> ControlResponse {
+        if params.route.is_empty()
+            || params.agent_id.is_empty()
+            || params.incarnation_id.is_empty()
+            || params.expected_text.is_empty()
+        {
+            return error_response(
+                id,
+                "invalid_params",
+                "output disposition requires route, agent_id, incarnation_id, and expected_text",
+                None,
+            );
+        }
+        let routes = match self.store.list_routes().await {
+            Ok(routes) => routes,
+            Err(error) => return internal(id, error),
+        };
+        let route = match exact_route(&routes, &params.route) {
+            Ok(route) => route,
+            Err(detail) => return route_error(id, "", detail),
+        };
+        let snapshot = match self
+            .store
+            .output_disposition(
+                params.agent_id,
+                params.incarnation_id,
+                params.after_sequence,
+                params.expected_text,
+            )
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return internal(id, error),
+        };
+        let Some(output) = snapshot.output else {
+            return success_response(
+                id,
+                json!({
+                    "disposition": "pending",
+                    "event_cursor": snapshot.event_cursor,
+                    "route": route,
+                }),
+            );
+        };
+        let disposition = if output.disposition == "projected" && output.route_id == Some(route.id)
+        {
+            "projected"
+        } else if output.disposition == "unrouted" {
+            "unrouted"
+        } else if output.route_id.is_some() && output.route_id != Some(route.id) {
+            "misrouted"
+        } else {
+            output.disposition.as_str()
+        };
+        let actual_route = output
+            .route_id
+            .and_then(|route_id| routes.iter().find(|candidate| candidate.id == route_id));
+        success_response(
+            id,
+            json!({
+                "disposition": disposition,
+                "event_cursor": snapshot.event_cursor,
+                "route": route,
+                "actual_route": actual_route,
+                "event": output.event,
+            }),
+        )
+    }
 }
 
 impl ControlHandler for ProductionService {
@@ -817,15 +800,24 @@ impl ControlHandler for ProductionService {
                     Ok(params) => self.handle_send(request, params).await,
                     Err(error) => invalid(request.id, error),
                 },
-                "set_delivery_hold"
-                | "set_route_enabled"
-                | "initialize_event_cursor"
-                | "baseline_event_cursor"
-                | "acknowledge_event_cursor_gap"
-                | "initialize_inbound_cursor"
-                | "baseline_telegram_cursor"
-                | "reconcile_route"
-                | "dispose_legacy" => self.handle_operator(request).await,
+                "route.inspect" => {
+                    match serde_json::from_value::<RouteInspectParams>(request.params) {
+                        Ok(params) => self.handle_route_inspect(request.id, params).await,
+                        Err(error) => invalid(request.id, error),
+                    }
+                }
+                "route.ensure" => {
+                    match serde_json::from_value::<RouteEnsureParams>(request.params) {
+                        Ok(params) => self.handle_route_ensure(request.id, params).await,
+                        Err(error) => invalid(request.id, error),
+                    }
+                }
+                "output.disposition" => {
+                    match serde_json::from_value::<OutputDispositionParams>(request.params) {
+                        Ok(params) => self.handle_output_disposition(request.id, params).await,
+                        Err(error) => invalid(request.id, error),
+                    }
+                }
                 _ => error_response(
                     request.id,
                     "unknown_method",
@@ -849,6 +841,51 @@ fn exact_route<'a>(routes: &'a [Route], name: &str) -> Result<&'a Route, &'stati
     }
 }
 
+fn resolve_live(
+    live: &LiveRouteSnapshot,
+    route: &Route,
+    preferred: Option<&AgentBinding>,
+) -> Result<Option<AgentBinding>, String> {
+    match live.resolve(&route.title, preferred) {
+        Ok(binding) => Ok(Some(binding)),
+        Err(WaktermCliError::RouteNotFound(_) | WaktermCliError::RouteUnavailable(_)) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn project_live_routes(
+    routes: &[Route],
+    live: &LiveRouteSnapshot,
+) -> Result<Vec<RouteAgent>, String> {
+    let mut projected = Vec::<RouteAgent>::new();
+    for route in routes {
+        let live_route = match live.route(&route.title) {
+            Ok(live_route) => live_route,
+            Err(WaktermCliError::RouteNotFound(_) | WaktermCliError::RouteUnavailable(_)) => {
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        for agent in &live_route.agents {
+            if projected.iter().any(|candidate| {
+                candidate.route_id != route.id
+                    && candidate.agent.agent_id == agent.agent_id
+                    && candidate.agent.incarnation_id == agent.incarnation_id
+            }) {
+                return Err(format!(
+                    "live Wakterm agent {} matches more than one Panetone route",
+                    agent.agent_id
+                ));
+            }
+            projected.push(RouteAgent {
+                route_id: route.id,
+                agent: agent.clone(),
+            });
+        }
+    }
+    Ok(projected)
+}
+
 fn route_matches_inbox(route: &Route, item: &InboxItem) -> bool {
     route
         .channels
@@ -864,22 +901,29 @@ fn route_matches_inbox(route: &Route, item: &InboxItem) -> bool {
         })
 }
 
-fn inbound_envelope(item: &InboxItem, route: &Route) -> String {
-    format!(
-        "[Panetone channel message]\nChannel: {:?}\nRoute: {}\nFrom: {}\nMessage ID: {}\n\n{}",
-        item.channel,
-        route.title,
-        item.sender.as_deref().unwrap_or("unknown"),
-        item.external_id,
-        item.body
+fn route_error(id: Uuid, role: &str, detail: &'static str) -> ControlResponse {
+    let prefix = if role.is_empty() {
+        String::new()
+    } else {
+        format!("{role}_")
+    };
+    error_response(
+        id,
+        format!("{prefix}route_{detail}"),
+        if role.is_empty() {
+            format!("route is {detail}")
+        } else {
+            format!("{role} route is {detail}")
+        },
+        None,
     )
 }
 
-fn route_error(id: Uuid, role: &str, detail: &'static str) -> ControlResponse {
+fn route_unavailable(id: Uuid, role: &str, route: &Route) -> ControlResponse {
     error_response(
         id,
-        format!("{role}_route_{detail}"),
-        format!("{role} route is {detail}"),
+        format!("{role}_route_unavailable"),
+        format!("{role} route {:?} has no live agent pane", route.title),
         None,
     )
 }
@@ -913,15 +957,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::domain::{AgentBinding, ChannelBinding, RouteId};
-
-    fn mutation(action: OperatorAction) -> OperatorMutation {
-        OperatorMutation {
-            operation_id: Uuid::new_v4(),
-            intent: None,
-            action,
-        }
-    }
+    use crate::domain::{ChannelBinding, EffectId, RouteId};
+    use crate::store::InboxItem;
 
     #[tokio::test]
     async fn event_worker_drains_every_page_to_the_advertised_head() {
@@ -936,6 +973,10 @@ set -euo pipefail
 operation="$*"
 if [[ "$operation" == *"agent capabilities"* ]]; then
   echo '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
+elif [[ "$operation" == *"agent catalog"* ]]; then
+  echo '{{"schema":"wakterm.agent-api.v1","as_of_event_sequence":102,"agents":[{{"agent_id":"agent-route","incarnation_id":"inc-route","pane_id":1,"name":"route_codex","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"}}]}}'
+elif [[ "$operation" == *"list --format json"* ]]; then
+  echo '[{{"pane_id":1,"tab_id":2,"window_id":3,"effective_title":"route"}}]'
 elif [[ "$operation" == *"agent events"*"--after 100"* ]]; then
   echo 100 >> '{}'
   echo '{{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":100,"oldest_available_sequence":1,"latest_sequence":102,"next_after_sequence":101,"events":[{{"sequence":101,"event_id":"event-101","kind":"turn_started","agent_id":"agent-route","incarnation_id":"inc-route","turn_id":"turn-1"}}]}}'
@@ -959,28 +1000,10 @@ fi
             id: RouteId::new(Uuid::new_v4()),
             title: "route".into(),
             channels: vec![ChannelBinding::Telegram { topic_id: 10 }],
-            agent: Some(AgentBinding {
-                agent_id: "agent-route".into(),
-                incarnation_id: "inc-route".into(),
-                harness: "codex".into(),
-                pane_id: Some(1),
-            }),
-            status: RouteStatus::Available,
+            agent: None,
         };
         store.save_route(route.clone(), 1).await.unwrap();
-        for action in [
-            OperatorAction::InitializeEventCursor { sequence: 100 },
-            OperatorAction::SetRouteEnabled {
-                route_id: route.id,
-                enabled: true,
-            },
-            OperatorAction::SetDeliveryHold { held: false },
-        ] {
-            store
-                .apply_operator_mutation(mutation(action), 2)
-                .await
-                .unwrap();
-        }
+        store.initialize_event_cursor(100).await.unwrap();
         let service = ProductionService::new(
             store.clone(),
             WaktermCli::new(
@@ -989,18 +1012,94 @@ fi
                 Duration::from_secs(2),
             ),
             RealChannels::default(),
-            None,
             SupervisorHandle::default(),
             vec!["event_stream.v1".into()],
             directory.path().join("control.sock"),
         );
 
         assert_eq!(service.event_once().await.unwrap(), 2);
-        assert_eq!(
-            store.promotion_status().await.unwrap().event_cursor,
-            Some(102)
-        );
+        assert_eq!(store.status().await.unwrap().event_cursor, Some(102));
         assert_eq!(fs::read_to_string(log).unwrap(), "100\n101\n");
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authorized_channel_input_reaches_wakterm_without_transport_markup() {
+        let directory = tempdir().unwrap();
+        let prompt = directory.path().join("prompt.txt");
+        let binary = directory.path().join("wakterm-fake");
+        fs::write(
+            &binary,
+            format!(
+                r#"#!/bin/bash
+set -euo pipefail
+operation="$*"
+if [[ "$operation" == *"agent capabilities"* ]]; then
+  echo '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
+elif [[ "$operation" == *"agent catalog"* ]]; then
+  echo '{{"schema":"wakterm.agent-api.v1","as_of_event_sequence":10,"agents":[{{"agent_id":"agent-route","incarnation_id":"inc-route","pane_id":1,"name":"route","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"}}]}}'
+elif [[ "$operation" == *"list --format json"* ]]; then
+  echo '[{{"pane_id":1,"tab_id":2,"window_id":3,"effective_title":"route"}}]'
+elif [[ "$operation" == *"agent admit"* ]]; then
+  cat > '{}'
+  echo '{{"schema":"wakterm.agent-api.v1","request_id":"00000000-0000-0000-0000-00000000007b","status":"accepted","definitive":true,"prompt_written":true,"agent_id":"agent-route","incarnation_id":"inc-route","detail":null}}'
+else
+  echo "unexpected fake invocation: $operation" >&2
+  exit 9
+fi
+"#,
+                prompt.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        store
+            .save_route(
+                Route {
+                    id: RouteId::new(Uuid::new_v4()),
+                    title: "route".into(),
+                    channels: vec![ChannelBinding::Telegram { topic_id: 10 }],
+                    agent: None,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let body = "did the computer restart?\n\nAnswer directly.";
+        store
+            .accept_inbox(InboxItem {
+                id: EffectId::new(Uuid::from_u128(123)),
+                channel: ChannelKind::Telegram,
+                external_id: "update-1".into(),
+                destination: "10".into(),
+                sender_id: Some("42".into()),
+                sender: Some("Mihai".into()),
+                reply_to_external_id: None,
+                body: body.into(),
+                state: "pending".into(),
+                created_at_ms: 1,
+            })
+            .await
+            .unwrap();
+        let service = ProductionService::new(
+            store.clone(),
+            WaktermCli::new(
+                binary,
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            RealChannels::default(),
+            SupervisorHandle::default(),
+            vec!["event_stream.v1".into()],
+            directory.path().join("control.sock"),
+        );
+
+        assert_eq!(service.inbox_once().await.unwrap(), 1);
+        assert_eq!(fs::read_to_string(prompt).unwrap(), body);
+        assert_eq!(store.status().await.unwrap().pending_inbox, 0);
         drop(service);
         store.shutdown().await.unwrap();
     }

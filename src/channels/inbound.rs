@@ -21,6 +21,7 @@ pub struct InboundMessage {
     pub destination: String,
     pub sender_id: Option<String>,
     pub sender: Option<String>,
+    pub reply_to_external_id: Option<String>,
     pub body: String,
 }
 
@@ -133,6 +134,9 @@ impl TelegramPoller {
                 destination,
                 sender_id: message.from.as_ref().map(|user| user.id.to_string()),
                 sender: message.from.and_then(TelegramUser::display_name),
+                reply_to_external_id: message
+                    .reply_to_message
+                    .map(|reply| reply.message_id.to_string()),
                 body,
             });
         }
@@ -231,6 +235,7 @@ impl SignalSubscriber {
                     .as_str()
                     .or_else(|| envelope["sourceNumber"].as_str())
                     .map(str::to_owned),
+                reply_to_external_id: scalar_id(&data["quote"]["id"]),
                 body: body.into(),
             });
         }
@@ -256,7 +261,13 @@ struct TelegramMessage {
     chat: TelegramChat,
     message_thread_id: Option<i64>,
     from: Option<TelegramUser>,
+    reply_to_message: Option<TelegramReply>,
     text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TelegramReply {
+    message_id: i64,
 }
 
 #[derive(Deserialize)]
@@ -285,6 +296,14 @@ impl TelegramUser {
             Some(name)
         }
     }
+}
+
+fn scalar_id(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| value.as_i64().map(|value| value.to_string()))
+        .or_else(|| value.as_u64().map(|value| value.to_string()))
 }
 
 async fn read_bounded_line(

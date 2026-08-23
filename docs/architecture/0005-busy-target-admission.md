@@ -1,24 +1,30 @@
 # ADR 0005: Busy target admission
 
-Status: accepted for Phase 1 target semantics
+Status: implemented for local control sends; channel steering is separate
 
 ## Context
 
-Wakterm correctly refuses a return-correlated request when the target agent already has an active turn. Panetone currently treats that refusal as an indeterminate delivery failure after posting the Telegram audit. The visible failure and callback can make the source agent diagnose routing even though the route is healthy and only temporarily busy.
+Wakterm definitively refuses a new prompt when the target agent already has an
+active turn. Local control sends need a safe choice between rejection and
+waiting for the next turn.
 
-Writing a new prompt into the active turn would be worse. It can steer unrelated work, invalidate turn correlation, and make a later final belong to the wrong request.
+Steering an active turn is a different operation. It can be appropriate for a
+Telegram reply but cannot preserve new-turn return correlation.
 
 ## Decision
 
-Default `send` waits durably for a busy target to become idle. It never steers an active turn.
+The local control `send` method waits durably for a busy target to become idle.
+It never steers an active turn. Channel input requires an explicit steering
+contract and is not settled by this decision.
 
 The admission sequence is:
 
 1. claim and persist the idempotency key
-2. resolve one stable live target route and current Wakterm agent incarnation
+2. resolve the workspace title to one current live tab and agent incarnation
 3. establish a visible Telegram audit
 4. if the target is busy, persist `awaiting_target_idle` and return immediately
-5. after an authoritative idle observation, revalidate the route and incarnation, persist the delivery attempt boundary, and submit once through Wakterm
+5. after an authoritative idle observation, resolve the workspace again,
+   persist the delivery attempt boundary, and submit once through Wakterm
 6. edit the audit from queued to submitted, or visibly mark a definitive or indeterminate failure
 
 The structured queued acknowledgement is successful registration, not delivery confirmation. It includes `delivery_state: "queued"` and `submitted: false`. `reply_pending` continues to describe the optional final callback, not whether target delivery is pending.
@@ -27,7 +33,11 @@ The Telegram audit uses `[queued]` while waiting and `[submitted]` only after Wa
 
 Queued work survives Panetone and Wakterm restarts. It has no automatic expiry in control v1. It remains visible through future status and cancellation operations until submitted or explicitly cancelled. The worker uses bounded backoff or lifecycle notification rather than a tight poll.
 
-Before submission, Panetone resolves the persisted stable route again. A new agent incarnation may receive the work only when it is the unambiguous current binding of that same durable route. Panetone records both the originally observed and submitted incarnation. Missing, ambiguous, or conflicting reconciliation is explicit and never guessed.
+Before submission, Panetone resolves the persisted workspace title again. A
+new agent incarnation may receive the work when the title still identifies one
+live tab. Panetone records both the originally observed and submitted
+incarnation in the workflow audit. Missing or ambiguous live routes are not
+guessed.
 
 A target with no live agent pane is not the same as a busy target. Control v1 continues to return `route_unavailable` before external side effects for a genuinely agentless route. Waiting for a route that does not exist would require a separate bounded workflow and is not part of this decision.
 

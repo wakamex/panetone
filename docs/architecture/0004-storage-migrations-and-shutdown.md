@@ -1,6 +1,6 @@
-# ADR 0004: Durable storage, migrations, and shutdown
+# ADR 0004: Durable storage, schema upgrades, and shutdown
 
-Status: accepted and implemented through Phase 4
+Status: accepted and implemented through schema version 7
 
 ## Context
 
@@ -10,27 +10,19 @@ The Python service spreads durable truth across two JSON files and two SQLite da
 
 Rust Panetone owns one SQLite database with an explicit monotonic schema version and one dedicated blocking writer task. Domain and adapter tasks submit typed storage commands. Reads may gain a small pool only after measurement shows the single owner is insufficient.
 
-Startup applies migrations before accepting control requests or inbound channel work. Each migration is transactional and idempotent when possible. The daemon refuses a database with a newer unsupported schema. Migration logs and manifests contain schema versions, row counts, and hashes but no message bodies or credentials.
+Startup validates the schema before accepting control requests or inbound
+channel work. Fresh databases are created at schema version 7. Schema 6
+upgrades transactionally by removing persisted route agent and status fields.
+Older nonzero schemas are rejected.
 
-Legacy migration is offline and copy-first. It reads the JSON state, pending
-output, Signal database, and control journal without modifying them. One atomic
-private output bundle contains exact JSON copies, consistent SQLite backups,
-the new database written in one transaction, and a deterministic manifest.
-Rerunning against the same output verifies source, snapshot, and target hashes.
-A conflicting canonical route is an error. State that has only ephemeral legacy
-identity is retained as explicitly rollback-only or reconciliation-required
-data rather than guessed into a live route, agent, cursor, or callback.
+Schema version 7 is the current post-cutover boundary. Routes contain only
+their UUID, effective workspace title, and channel bindings. Debate is a named
+route with a Signal binding, not a separate transport.
 
-Imported Python control hashes retain a distinct provenance marker. The target
-accepts only the finite omitted or explicit default encodings that were
-semantically equivalent in the Python protocol. It never converts a provider
-file cursor into a Wakterm event cursor, and every nonterminal external control
-operation is migrated as indeterminate.
-
-Debate is a named Signal group, not a separate transport. Legacy rows labelled
-`debate` remain held with their original destination and payload until an
-operator can match them to the configured Signal group exactly. They are never
-reinterpreted as Telegram output.
+The original copy-first Python migration bundle remains a cold archive outside
+the runtime database. Its conversion implementation and CLI were removed after
+the owner permanently retired Python. Future upgrades migrate only supported
+Rust schemas.
 
 One supervisor owns every long-running task. It records handles, propagates fatal failures into health, and coordinates cancellation. Shutdown follows this order:
 
@@ -45,4 +37,6 @@ No async reactor task performs blocking SQLite or subprocess waits directly. Que
 
 ## Consequences
 
-The Python formats remain production truth until Phase 4 migration. Their inventory and restart behavior are frozen in the Phase 1 parity ledger. The Rust implementation must pass crash-boundary tests before it may read production state.
+The Rust database is the only production truth. Restoring the old Python
+snapshot after Rust-owned effects would lose or duplicate state. Old schema
+copies remain readable as cold archives but cannot be opened by Panetone.

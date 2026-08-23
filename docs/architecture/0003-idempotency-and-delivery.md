@@ -1,6 +1,6 @@
 # ADR 0003: Idempotency and delivery semantics
 
-Status: accepted for Phase 1
+Status: accepted and implemented
 
 ## Context
 
@@ -12,26 +12,37 @@ Every control request ID is an idempotency key. Panetone hashes the normalized s
 
 Reusing an ID with the same normalized request returns its durable result without repeating a side effect. Reusing it with different semantic content returns `id_conflict`. A request is recorded as in progress before prompt delivery. A crash after possible Wakterm acceptance but before a durable receipt makes the prompt indeterminate and Panetone never retries it automatically.
 
-Large completed records may be pruned after 30 days in the current Python journal. Pending and indeterminate records are never removed to meet the size target. The Rust store will retain compact request-ID and semantic-hash tombstones permanently after pruning payloads and response detail, so an expired retry can never become a new prompt. Until that migration, Python's completed UUID idempotency expires after 30 days.
+The current store retains completed workflow records and compact request-ID and
+semantic-hash tombstones. It has no production pruning policy. If pruning is
+added after measured growth, tombstones remain permanent so an expired retry
+cannot become a new prompt. Pending and indeterminate records must not be
+pruned.
 
 Delivery policies are:
 
 | Effect | Policy | Required behavior after uncertainty |
 | --- | --- | --- |
 | Target Telegram audit | At least once, but required before prompt | Fail closed if visibility cannot be established |
-| Wakterm target prompt | At most once | Persist indeterminate and require operator resolution |
+| Wakterm target prompt | At most once | Persist indeterminate and require manual resolution |
 | Audit failure annotation | At least once | Retry safely using the audit identity or add a linked failure |
 | Source-agent final callback | At most once | Persist per-destination indeterminate state |
 | Telegram or other final mirror | At least once | Retry durable chunks and tolerate recognizable duplicates |
-| Ordinary agent output | At least once | Retry from durable output and cursor state |
+| Ordinary agent output | Best effort across daemon restarts | Keep it durable during a run, then skip unsent and offline output at the next normal startup; replay only on an explicit catch-up start |
 | Topic or group reconciliation | Idempotent | Recreate or rebind through the durable route |
 
 Every durable destination has its own status, attempts, last error, timestamp, and external receipt where available. One destination cannot overwrite another destination's diagnostic.
+
+For launcher synchronization, a visible Wakterm event has a durable
+disposition in `agent_events`. `projected` means the event row, deterministic
+outbox effect, and consumed cursor were committed in one transaction.
+`unrouted` is stored explicitly. The supported disposition query reads this
+existing state; it does not create a second delivery receipt or cursor.
 
 A definitively busy target is not a failed or indeterminate prompt. It enters the durable `awaiting_target_idle` state described in ADR 0005. Panetone submits it only after authoritative idle admission and route revalidation.
 
 ## Consequences
 
-The existing Python hash distinguishes omitted defaults from explicit defaults. The conformance suite records both current behavior and the intended normalized behavior. Production compatibility must be handled deliberately before changing hashes for journal entries that already exist.
+Imported tombstones retain their hash provenance so old request UUIDs remain
+reserved. New requests use the normalized Rust hash.
 
 One-way `send` remains the default. `--return-final` registers an asynchronous callback and returns immediately. An explicit second `panetone send` back to the source remains the reliable semantic report-back pattern when the target should decide when work is complete.

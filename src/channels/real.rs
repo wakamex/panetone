@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::StatusCode;
@@ -8,11 +9,14 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::time::timeout;
+use tokio::sync::Mutex;
+use tokio::time::{Instant, sleep_until, timeout};
 
 use crate::domain::{ChannelKind, OutboxItem};
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const TELEGRAM_GROUP_INTERVAL: Duration = Duration::from_millis(3100);
+const TELEGRAM_RETRY_MARGIN: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeliveryReceipt {
@@ -57,6 +61,8 @@ pub struct TelegramClient {
     api_base: String,
     token: String,
     chat_id: i64,
+    minimum_interval: Duration,
+    next_send: Arc<Mutex<Instant>>,
 }
 
 impl TelegramClient {
@@ -66,11 +72,19 @@ impl TelegramClient {
         chat_id: i64,
         deadline: Duration,
     ) -> Result<Self, ChannelDeliveryError> {
+        let api_base = api_base.into().trim_end_matches('/').to_owned();
+        let minimum_interval = if api_base == "https://api.telegram.org" {
+            TELEGRAM_GROUP_INTERVAL
+        } else {
+            Duration::ZERO
+        };
         Ok(Self {
             http: http_client(deadline, ChannelKind::Telegram)?,
-            api_base: api_base.into().trim_end_matches('/').to_owned(),
+            api_base,
             token: token.into(),
             chat_id,
+            minimum_interval,
+            next_send: Arc::new(Mutex::new(Instant::now())),
         })
     }
 
@@ -82,7 +96,8 @@ impl TelegramClient {
             .destination
             .parse::<i64>()
             .map_err(|_| ChannelDeliveryError::InvalidDestination(item.kind))?;
-        telegram_send(
+        let mut next_send = self.wait_for_send().await;
+        let result = telegram_send(
             &self.http,
             &self.api_base,
             &self.token,
@@ -94,7 +109,42 @@ impl TelegramClient {
             }),
             item,
         )
-        .await
+        .await;
+        *next_send = Instant::now() + self.delay_after(result.as_ref().err());
+        result
+    }
+
+    pub async fn create_forum_topic(&self, name: &str) -> Result<i64, ChannelDeliveryError> {
+        let mut next_send = self.wait_for_send().await;
+        let result = telegram_create_forum_topic(
+            &self.http,
+            &self.api_base,
+            &self.token,
+            self.chat_id,
+            name,
+        )
+        .await;
+        *next_send = Instant::now() + self.delay_after(result.as_ref().err());
+        result
+    }
+
+    async fn wait_for_send(&self) -> tokio::sync::MutexGuard<'_, Instant> {
+        let next_send = self.next_send.lock().await;
+        if *next_send > Instant::now() {
+            sleep_until(*next_send).await;
+        }
+        next_send
+    }
+
+    fn delay_after(&self, error: Option<&ChannelDeliveryError>) -> Duration {
+        match error {
+            Some(ChannelDeliveryError::RateLimited {
+                retry_after_secs, ..
+            }) => Duration::from_secs(*retry_after_secs)
+                .saturating_add(TELEGRAM_RETRY_MARGIN)
+                .max(self.minimum_interval),
+            _ => self.minimum_interval,
+        }
     }
 }
 
@@ -225,6 +275,14 @@ impl RealChannels {
             }
         }
     }
+
+    pub async fn create_telegram_topic(&self, name: &str) -> Result<i64, ChannelDeliveryError> {
+        self.telegram
+            .as_ref()
+            .ok_or(ChannelDeliveryError::NotConfigured(ChannelKind::Telegram))?
+            .create_forum_topic(name)
+            .await
+    }
 }
 
 #[derive(Deserialize)]
@@ -239,6 +297,20 @@ struct TelegramResponse {
 #[derive(Deserialize)]
 struct TelegramMessage {
     message_id: i64,
+}
+
+#[derive(Deserialize)]
+struct TelegramTopicResponse {
+    ok: bool,
+    result: Option<TelegramForumTopic>,
+    description: Option<String>,
+    error_code: Option<u16>,
+    parameters: Option<TelegramParameters>,
+}
+
+#[derive(Deserialize)]
+struct TelegramForumTopic {
+    message_thread_id: i64,
 }
 
 #[derive(Deserialize)]
@@ -311,6 +383,51 @@ async fn telegram_send(
     }
 }
 
+async fn telegram_create_forum_topic(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    chat_id: i64,
+    name: &str,
+) -> Result<i64, ChannelDeliveryError> {
+    let kind = ChannelKind::Telegram;
+    let response = client
+        .post(format!("{base}/bot{token}/createForumTopic"))
+        .json(&json!({"chat_id": chat_id, "name": name}))
+        .send()
+        .await
+        .map_err(|error| map_http_error(kind, &error))?;
+    let status = response.status();
+    let body = response_body(response, kind).await?;
+    let parsed: TelegramTopicResponse =
+        serde_json::from_slice(&body).map_err(|_| ChannelDeliveryError::Malformed(kind))?;
+    if status.is_success() && parsed.ok {
+        return parsed
+            .result
+            .map(|topic| topic.message_thread_id)
+            .filter(|topic_id| *topic_id > 0)
+            .ok_or(ChannelDeliveryError::Malformed(kind));
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS || parsed.error_code == Some(429) {
+        return Err(ChannelDeliveryError::RateLimited {
+            kind,
+            retry_after_secs: parsed
+                .parameters
+                .and_then(|parameters| parameters.retry_after)
+                .unwrap_or(1),
+        });
+    }
+    Err(ChannelDeliveryError::Rejected {
+        kind,
+        detail: safe_remote_detail(
+            parsed
+                .description
+                .as_deref()
+                .unwrap_or("Telegram topic creation failed"),
+        ),
+    })
+}
+
 pub(super) fn http_client(
     deadline: Duration,
     kind: ChannelKind,
@@ -361,4 +478,36 @@ fn safe_remote_detail(detail: &str) -> String {
         .filter(|character| !character.is_control())
         .take(240)
         .collect::<String>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn official_client_paces_group_messages_and_honors_retry_after() {
+        let client = TelegramClient::new(
+            "https://api.telegram.org",
+            "test-token",
+            -1001,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(client.minimum_interval, TELEGRAM_GROUP_INTERVAL);
+
+        {
+            let mut next_send = client.next_send.lock().await;
+            *next_send = Instant::now() + TELEGRAM_GROUP_INTERVAL;
+        }
+        let started = Instant::now();
+        drop(client.wait_for_send().await);
+        assert_eq!(Instant::now() - started, TELEGRAM_GROUP_INTERVAL);
+
+        let error = ChannelDeliveryError::RateLimited {
+            kind: ChannelKind::Telegram,
+            retry_after_secs: 17,
+        };
+        let delay = client.delay_after(Some(&error));
+        assert_eq!(delay, Duration::from_millis(17_100));
+    }
 }
