@@ -105,6 +105,48 @@ async fn audit_is_visible_before_exact_target_admission() {
 }
 
 #[tokio::test]
+async fn long_audit_is_fully_delivered_in_durable_chunks_before_admission() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let service = OfflineService::new(
+        store.clone(),
+        FakeWakterm::new(contract()),
+        RecordingChannels::default(),
+    );
+    let (source, target) = routes();
+    let mut request = command(101, false);
+    request.message = "x".repeat(8000);
+    let expected_audit = format!(
+        "[pending] {} -> {}\nRequest ID: {}\n\n{}",
+        request.source, request.target, request.id, request.message
+    );
+
+    service
+        .submit(request, &source, &target, 100)
+        .await
+        .unwrap();
+
+    let calls = service.channels().calls();
+    assert_eq!(calls.len(), 4);
+    assert_eq!(
+        calls[..3]
+            .iter()
+            .map(|call| call.body.as_str())
+            .collect::<String>(),
+        expected_audit
+    );
+    assert!(
+        calls[..3]
+            .iter()
+            .all(|call| call.body.encode_utf16().count() <= 3900)
+    );
+    assert!(calls[3].body.starts_with("[submitted]"));
+    assert_eq!(service.wakterm().calls().len(), 1);
+    drop(service);
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn audit_failure_fails_closed_without_a_prompt_effect() {
     let directory = tempdir().unwrap();
     let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();

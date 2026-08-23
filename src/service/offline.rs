@@ -198,6 +198,56 @@ impl OfflineService {
         }
     }
 
+    async fn deliver_channel_effect(
+        &self,
+        workflow_id: WorkflowId,
+        item: OutboxItem,
+        now_ms: i64,
+        fault_after_send: Option<FaultPoint>,
+    ) -> Result<String, ServiceError> {
+        let chunks = self
+            .store
+            .enqueue_outbox(Some(workflow_id), item, now_ms)
+            .await?;
+        let mut last_receipt = String::new();
+        for mut chunk in chunks {
+            if chunk.state == OutboxState::Delivered {
+                if let Some(receipt) = chunk.external_receipt {
+                    last_receipt = receipt;
+                }
+                continue;
+            }
+            if chunk.state == OutboxState::Indeterminate {
+                return Err(ServiceError::Adapter(format!(
+                    "outbox chunk {} is indeterminate",
+                    chunk.id
+                )));
+            }
+            chunk.state = OutboxState::Delivering;
+            chunk.attempts += 1;
+            chunk.last_error = None;
+            self.store.save_outbox(chunk.clone(), now_ms).await?;
+            match self.channels.send(&chunk).await {
+                Ok(receipt) => {
+                    if let Some(point) = fault_after_send {
+                        self.faults.hit(point)?;
+                    }
+                    chunk.state = OutboxState::Delivered;
+                    chunk.external_receipt = Some(receipt.clone());
+                    self.store.save_outbox(chunk, now_ms).await?;
+                    last_receipt = receipt;
+                }
+                Err(error) => {
+                    chunk.state = OutboxState::Failed;
+                    chunk.last_error = Some(error.to_string());
+                    self.store.save_outbox(chunk, now_ms).await?;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(last_receipt)
+    }
+
     pub async fn consume_fixture_events(
         &self,
         after_sequence: u64,
@@ -307,7 +357,7 @@ impl OfflineService {
         self.faults.hit(FaultPoint::AfterClaim)?;
 
         let (audit_kind, audit_destination) = channel_destination(target)?;
-        let mut audit = OutboxItem {
+        let audit = OutboxItem {
             id: EffectId::named(record.command.id, "target-audit"),
             route_id: Some(record.workflow.target_route_id),
             sender_harness: Some(record.workflow.observed_source.harness.clone()),
@@ -326,26 +376,20 @@ impl OfflineService {
             last_error: None,
             external_receipt: None,
         };
-        self.store
-            .enqueue_outbox(Some(record.command.id), audit.clone(), now_ms)
-            .await?;
-        audit.state = OutboxState::Delivering;
-        audit.attempts += 1;
-        self.store.save_outbox(audit.clone(), now_ms).await?;
-        match self.channels.send(&audit).await {
-            Ok(receipt) => {
-                self.faults.hit(FaultPoint::AfterAuditEffect)?;
-                audit.state = OutboxState::Delivered;
-                audit.external_receipt = Some(receipt);
-                self.store.save_outbox(audit, now_ms).await?;
+        if let Err(error) = self
+            .deliver_channel_effect(
+                record.command.id,
+                audit,
+                now_ms,
+                Some(FaultPoint::AfterAuditEffect),
+            )
+            .await
+        {
+            if matches!(error, ServiceError::Injected(_)) {
+                return Err(error);
             }
-            Err(error) => {
-                audit.state = OutboxState::Failed;
-                audit.last_error = Some(error.to_string());
-                self.store.save_outbox(audit, now_ms).await?;
-                transition(&self.store, &mut record, WorkflowState::Failed, now_ms).await?;
-                return Err(ServiceError::AuditFailed(error.to_string()));
-            }
+            transition(&self.store, &mut record, WorkflowState::Failed, now_ms).await?;
+            return Err(ServiceError::AuditFailed(error.to_string()));
         }
 
         transition(&self.store, &mut record, WorkflowState::AuditPosted, now_ms).await?;
@@ -506,7 +550,7 @@ impl OfflineService {
         detail: &str,
         now_ms: i64,
     ) -> Result<(), ServiceError> {
-        let mut item = OutboxItem {
+        let item = OutboxItem {
             id: EffectId::named(record.command.id, &format!("target-{purpose}")),
             route_id: Some(record.workflow.target_route_id),
             sender_harness: Some(record.workflow.observed_source.harness.clone()),
@@ -526,23 +570,13 @@ impl OfflineService {
             last_error: None,
             external_receipt: None,
         };
-        self.store
-            .enqueue_outbox(Some(record.command.id), item.clone(), now_ms)
-            .await?;
-        item.state = OutboxState::Delivering;
-        item.attempts = 1;
-        self.store.save_outbox(item.clone(), now_ms).await?;
-        match self.channels.send(&item).await {
-            Ok(receipt) => {
-                item.state = OutboxState::Delivered;
-                item.external_receipt = Some(receipt);
-            }
-            Err(error) => {
-                item.state = OutboxState::Failed;
-                item.last_error = Some(error.to_string());
-            }
+        match self
+            .deliver_channel_effect(record.command.id, item, now_ms, None)
+            .await
+        {
+            Ok(_) | Err(ServiceError::Adapter(_)) => {}
+            Err(error) => return Err(error),
         }
-        self.store.save_outbox(item, now_ms).await?;
         Ok(())
     }
 
@@ -671,7 +705,7 @@ impl OfflineService {
             returned.mirror.state,
             DeliveryState::Pending | DeliveryState::Failed
         ) {
-            let mut mirror = OutboxItem {
+            let mirror = OutboxItem {
                 id: returned.mirror.effect_id,
                 route_id: Some(workflow.workflow.source_route_id),
                 sender_harness: workflow
@@ -688,31 +722,28 @@ impl OfflineService {
                 last_error: returned.mirror.last_error.clone(),
                 external_receipt: None,
             };
-            self.store
-                .enqueue_outbox(Some(workflow_id), mirror.clone(), now_ms)
-                .await?;
-            mirror.state = OutboxState::Delivering;
-            mirror.attempts += 1;
-            self.store.save_outbox(mirror.clone(), now_ms).await?;
             returned.mirror.state = DeliveryState::Pending;
             returned.mirror.attempts += 1;
-            match self.channels.send(&mirror).await {
+            match self
+                .deliver_channel_effect(
+                    workflow_id,
+                    mirror,
+                    now_ms,
+                    Some(FaultPoint::AfterMirrorEffect),
+                )
+                .await
+            {
                 Ok(receipt) => {
-                    self.faults.hit(FaultPoint::AfterMirrorEffect)?;
-                    mirror.state = OutboxState::Delivered;
-                    mirror.external_receipt = Some(receipt.clone());
                     returned.mirror.state = DeliveryState::Delivered;
                     returned.mirror.last_error = None;
                     returned.mirror.external_receipt = Some(receipt);
                 }
+                Err(error @ ServiceError::Injected(_)) => return Err(error),
                 Err(error) => {
-                    mirror.state = OutboxState::Failed;
-                    mirror.last_error = Some(error.to_string());
                     returned.mirror.state = DeliveryState::Failed;
                     returned.mirror.last_error = Some(error.to_string());
                 }
             }
-            self.store.save_outbox(mirror, now_ms).await?;
             returned.updated_at_ms = now_ms;
             self.store.save_return(returned.clone()).await?;
         }

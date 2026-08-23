@@ -181,6 +181,65 @@ async fn event_output_defaults_to_an_available_signal_binding() {
 }
 
 #[tokio::test]
+async fn long_telegram_output_is_durably_chunked_before_cursor_advance() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("state.sqlite3");
+    let store = StoreHandle::open(&path).unwrap();
+    let route = route();
+    store.save_route(route.clone(), 1).await.unwrap();
+    store
+        .set_metadata(
+            "route_output_preferences_v1".into(),
+            serde_json::json!({route.id.to_string(): "tg"}).to_string(),
+        )
+        .await
+        .unwrap();
+    let mut event = fixture_events()
+        .into_iter()
+        .find(|event| event.kind == "assistant_message")
+        .unwrap();
+    let expected = event.sequence - 1;
+    let body = "x".repeat(3900) + "tail";
+    event.fields.insert("text".into(), body.clone().into());
+    store.initialize_event_cursor(expected).await.unwrap();
+
+    store
+        .ingest_agent_events(
+            expected,
+            event.sequence,
+            vec![event],
+            live_agents(&route),
+            3,
+        )
+        .await
+        .unwrap();
+    let chunks = store.pending_outbox().await.unwrap();
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(
+        chunks
+            .iter()
+            .map(|chunk| chunk.body.as_str())
+            .collect::<String>(),
+        body
+    );
+    assert_ne!(chunks[0].id, chunks[1].id);
+    let mut delivered = chunks[0].clone();
+    delivered.state = panetone::domain::OutboxState::Delivered;
+    store.save_outbox(delivered, 4).await.unwrap();
+    store.shutdown().await.unwrap();
+
+    let reopened = StoreHandle::open(&path).unwrap();
+    let pending = reopened.pending_outbox().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].body, "tail");
+    assert_eq!(
+        reopened.status().await.unwrap().event_cursor,
+        Some(expected + 1)
+    );
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn invalid_visible_event_rolls_back_event_and_cursor_together() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("state.sqlite3");

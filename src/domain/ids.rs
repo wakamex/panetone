@@ -60,6 +60,17 @@ impl EffectId {
     pub fn callback_admission(workflow_id: WorkflowId) -> Self {
         Self::named(workflow_id, "return-agent-callback")
     }
+
+    pub fn chunk(parent: Self, index: usize) -> Self {
+        let namespace = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            b"https://panetone.dev/outbox/chunk/v1",
+        );
+        Self(Uuid::new_v5(
+            &namespace,
+            format!("{}:{index}", parent.0).as_bytes(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -86,5 +97,8 @@ mod tests {
             EffectId::named(workflow, "audit"),
             EffectId::named(workflow, "return-mirror")
         );
+        let parent = EffectId::named(workflow, "output");
+        assert_eq!(EffectId::chunk(parent, 0), EffectId::chunk(parent, 0));
+        assert_ne!(EffectId::chunk(parent, 0), EffectId::chunk(parent, 1));
     }
 }

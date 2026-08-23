@@ -216,7 +216,7 @@ enum Command {
         workflow_id: Option<WorkflowId>,
         item: OutboxItem,
         now_ms: i64,
-        reply: oneshot::Sender<StoreResult<()>>,
+        reply: oneshot::Sender<StoreResult<Vec<OutboxItem>>>,
     },
     SaveOutbox {
         item: OutboxItem,
@@ -421,7 +421,7 @@ impl StoreHandle {
         workflow_id: Option<WorkflowId>,
         item: OutboxItem,
         now_ms: i64,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<Vec<OutboxItem>> {
         self.request(|reply| Command::EnqueueOutbox {
             workflow_id,
             item,
@@ -635,7 +635,7 @@ fn handle_command(connection: &mut Connection, command: Command) {
             reply,
         } => send_reply(
             reply,
-            enqueue_outbox(connection, workflow_id, &item, now_ms),
+            enqueue_outbox_chunks(connection, workflow_id, item, now_ms),
         ),
         Command::SaveOutbox {
             item,
@@ -1281,7 +1281,9 @@ fn ingest_agent_events(
                 last_error: None,
                 external_receipt: None,
             };
-            enqueue_outbox(&transaction, None, &item, now_ms)?;
+            for chunk in crate::domain::chunk_outbox(item) {
+                enqueue_outbox(&transaction, None, &chunk, now_ms)?;
+            }
             state = "projected";
             outcome.visible_outputs += 1;
             if let Some(candidate) = route_agent
@@ -1547,6 +1549,31 @@ fn enqueue_outbox(
     Ok(())
 }
 
+fn enqueue_outbox_chunks(
+    connection: &Connection,
+    workflow_id: Option<WorkflowId>,
+    item: OutboxItem,
+    now_ms: i64,
+) -> StoreResult<Vec<OutboxItem>> {
+    let chunks = crate::domain::chunk_outbox(item);
+    for chunk in &chunks {
+        enqueue_outbox(connection, workflow_id, chunk, now_ms)?;
+    }
+    chunks
+        .into_iter()
+        .map(|chunk| {
+            connection
+                .query_row(
+                    "SELECT record_json FROM outbox WHERE effect_id = ?1",
+                    params![chunk.id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(StoreError::from)
+                .and_then(|json| serde_json::from_str(&json).map_err(StoreError::from))
+        })
+        .collect()
+}
+
 fn save_outbox(connection: &Connection, item: &OutboxItem, now_ms: i64) -> StoreResult<()> {
     let changed = connection.execute(
         "UPDATE outbox SET state = ?2, record_json = ?3, updated_at_ms = ?4
@@ -1568,8 +1595,10 @@ fn save_outbox(connection: &Connection, item: &OutboxItem, now_ms: i64) -> Store
 }
 
 fn pending_outbox(connection: &Connection) -> StoreResult<Vec<OutboxItem>> {
-    let mut statement = connection
-        .prepare("SELECT record_json FROM outbox WHERE state = 'pending' ORDER BY created_at_ms")?;
+    let mut statement = connection.prepare(
+        "SELECT record_json FROM outbox
+         WHERE state = 'pending' ORDER BY created_at_ms, rowid",
+    )?;
     let json = statement
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;

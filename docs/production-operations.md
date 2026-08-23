@@ -156,6 +156,10 @@ Telegram sends through each bot token are serialized at one message every 3.1
 seconds, below Telegram's 20-per-minute group limit. A Telegram 429 response
 extends the pause by the returned `retry_after` interval. Each outbox worker
 pass attempts one item, so a flood cannot monopolize shutdown or other workers.
+Visible agent output is split before persistence using Telegram's UTF-16 limit
+or Signal's text limit. Every chunk has a deterministic effect ID and is
+committed with the source event cursor, so restart resumes at the first unsent
+chunk.
 
 ## Durable failure rules
 
