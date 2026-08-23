@@ -74,9 +74,6 @@ impl ProductionService {
         else {
             return Err("Wakterm event cursor has not been initialized".into());
         };
-        let routes = self.store.list_routes().await.map_err(error_string)?;
-        let live = self.wakterm.live_routes().await.map_err(error_string)?;
-        let route_agents = project_live_routes(&routes, &live)?;
         let mut recorded = 0usize;
         loop {
             match self
@@ -90,13 +87,23 @@ impl ProductionService {
                     next_after_sequence,
                     latest_sequence,
                 } => {
+                    let route_agents = if events
+                        .iter()
+                        .any(|event| matches!(event.kind.as_str(), "assistant_message" | "plan"))
+                    {
+                        let routes = self.store.list_routes().await.map_err(error_string)?;
+                        let live = self.wakterm.live_routes().await.map_err(error_string)?;
+                        project_live_routes(&routes, &live)?
+                    } else {
+                        Vec::new()
+                    };
                     let outcome = self
                         .store
                         .ingest_agent_events(
                             cursor,
                             next_after_sequence,
                             events,
-                            route_agents.clone(),
+                            route_agents,
                             now_ms(),
                         )
                         .await
@@ -974,8 +981,10 @@ operation="$*"
 if [[ "$operation" == *"agent capabilities"* ]]; then
   echo '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
 elif [[ "$operation" == *"agent catalog"* ]]; then
+  echo catalog >> '{}'
   echo '{{"schema":"wakterm.agent-api.v1","as_of_event_sequence":102,"agents":[{{"agent_id":"agent-route","incarnation_id":"inc-route","pane_id":1,"name":"route_codex","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"}}]}}'
 elif [[ "$operation" == *"list --format json"* ]]; then
+  echo list >> '{}'
   echo '[{{"pane_id":1,"tab_id":2,"window_id":3,"effective_title":"route"}}]'
 elif [[ "$operation" == *"agent events"*"--after 100"* ]]; then
   echo 100 >> '{}'
@@ -988,6 +997,8 @@ else
   exit 9
 fi
 "#,
+                log.display(),
+                log.display(),
                 log.display(),
                 log.display(),
             ),
