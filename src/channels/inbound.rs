@@ -201,9 +201,10 @@ impl SignalSubscriber {
 
     pub async fn next(&mut self) -> Result<InboundMessage, ChannelDeliveryError> {
         loop {
-            let line = timeout(self.deadline, read_bounded_line(&mut self.reader))
-                .await
-                .map_err(|_| ChannelDeliveryError::Timeout(ChannelKind::Signal))??;
+            let line = match timeout(self.deadline, read_bounded_line(&mut self.reader)).await {
+                Ok(line) => line?,
+                Err(_) => continue,
+            };
             let notification: Value = serde_json::from_slice(&line)
                 .map_err(|_| ChannelDeliveryError::Malformed(ChannelKind::Signal))?;
             if notification.get("method").is_none() {

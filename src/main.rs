@@ -300,7 +300,7 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
     ] {
         let service = handler.clone();
         let shutdown = supervisor.shutdown_receiver();
-        supervisor.spawn(name, TaskPolicy::Degraded, async move {
+        supervisor.spawn(name, TaskPolicy::Critical, async move {
             production_worker_loop(service, worker, worker_period, shutdown).await
         });
     }
@@ -308,14 +308,14 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
         let ingestor = InboundIngestor::new(store.clone());
         let channel_store = store.clone();
         let shutdown = supervisor.shutdown_receiver();
-        supervisor.spawn("telegram-inbound", TaskPolicy::Degraded, async move {
+        supervisor.spawn("telegram-inbound", TaskPolicy::Critical, async move {
             telegram_loop(poller, owner, ingestor, channel_store, shutdown).await
         });
     }
     if let Some((socket, account, owner)) = signal {
         let ingestor = InboundIngestor::new(store.clone());
         let shutdown = supervisor.shutdown_receiver();
-        supervisor.spawn("signal-inbound", TaskPolicy::Degraded, async move {
+        supervisor.spawn("signal-inbound", TaskPolicy::Critical, async move {
             signal_loop(socket, account, owner, ingestor, shutdown).await
         });
     }

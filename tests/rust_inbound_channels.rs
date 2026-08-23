@@ -186,3 +186,47 @@ async fn signal_notifications_are_normalized_and_deduplicated_durably() {
     );
     store.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn signal_receive_deadlines_are_idle_polls() {
+    let directory = tempdir().unwrap();
+    let socket_path = directory.path().join("signal-idle.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut request = String::new();
+        reader.read_line(&mut request).await.unwrap();
+        reader
+            .get_mut()
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"panetone-subscribe\",\"result\":{}}\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "receive",
+            "params": {"result": {"envelope": {
+                "sourceNumber": "+15551111",
+                "timestamp": 9002,
+                "dataMessage": {
+                    "message": "after idle",
+                    "groupInfo": {"groupId": "group-one=="}
+                }
+            }}}
+        });
+        reader
+            .get_mut()
+            .write_all(format!("{notification}\n").as_bytes())
+            .await
+            .unwrap();
+    });
+
+    let mut subscriber =
+        SignalSubscriber::connect(&socket_path, "+15550000", Duration::from_millis(20))
+            .await
+            .unwrap();
+    let message = subscriber.next().await.unwrap();
+    assert_eq!(message.body, "after idle");
+    server.await.unwrap();
+}

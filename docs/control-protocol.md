@@ -247,5 +247,6 @@ The `status` method takes null parameters. Its result includes:
 - control socket path
 - named supervisor task health
 
-Task health reports a degraded worker that exited, but the current supervisor
-does not restart it. Production loops need a local transient retry policy.
+Every production task is critical. An unexpected task exit shuts down the
+daemon with a failure so the systemd user unit can restart the complete durable
+process. An idle Signal receive deadline is handled as a normal empty poll.
