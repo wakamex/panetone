@@ -30,6 +30,34 @@ fn binding() -> AgentBinding {
 }
 
 #[tokio::test]
+async fn capabilities_are_cached_across_cli_clones() {
+    let directory = tempdir().unwrap();
+    let log = directory.path().join("capabilities.log");
+    let script = format!(
+        r#"
+operation="$*"
+if [[ "$operation" == *"agent capabilities"* ]]; then
+  echo call >> '{}'
+  printf '%s\n' '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1"]}}'
+elif [[ "$operation" == *"agent catalog"* ]]; then
+  printf '%s\n' '{{"schema":"wakterm.agent-api.v1","agents":[]}}'
+else
+  exit 9
+fi
+"#,
+        log.display()
+    );
+    let (_script_directory, binary) = fake_cli(&script);
+    let cli = WaktermCli::new(binary, "/tmp/non-production.sock", Duration::from_secs(2));
+
+    cli.capabilities().await.unwrap();
+    cli.clone().catalog().await.unwrap();
+    cli.capabilities().await.unwrap();
+
+    assert_eq!(fs::read_to_string(log).unwrap(), "call\n");
+}
+
+#[tokio::test]
 async fn real_cli_boundary_negotiates_joins_admits_and_resumes_terminals() {
     let (_directory, binary) = fake_cli(
         r#"

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -8,6 +9,7 @@ use serde::de::DeserializeOwned;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -66,6 +68,7 @@ pub struct WaktermCli {
     binary: PathBuf,
     socket: PathBuf,
     deadline: Duration,
+    capabilities: Arc<OnceCell<AgentApiCapabilities>>,
 }
 
 #[derive(Debug, Error)]
@@ -213,6 +216,7 @@ impl WaktermCli {
             binary: binary.into(),
             socket: socket.into(),
             deadline,
+            capabilities: Arc::new(OnceCell::new()),
         }
     }
 
@@ -233,10 +237,15 @@ impl WaktermCli {
     }
 
     pub async fn capabilities(&self) -> Result<AgentApiCapabilities, WaktermCliError> {
-        let capabilities: AgentApiCapabilities =
-            self.run_json(&["agent", "capabilities"], None).await?;
-        capabilities.validate_current()?;
-        Ok(capabilities)
+        self.capabilities
+            .get_or_try_init(|| async {
+                let capabilities: AgentApiCapabilities =
+                    self.run_json(&["agent", "capabilities"], None).await?;
+                capabilities.validate_current()?;
+                Ok(capabilities)
+            })
+            .await
+            .cloned()
     }
 
     pub async fn catalog(&self) -> Result<AgentCatalog, WaktermCliError> {
