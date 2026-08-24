@@ -10,8 +10,16 @@ use tokio::net::{TcpListener, UnixListener};
 async fn telegram_server(
     response_body: &str,
 ) -> (String, tokio::task::JoinHandle<serde_json::Value>) {
+    telegram_server_response("200 OK", response_body).await
+}
+
+async fn telegram_server_response(
+    status: &str,
+    response_body: &str,
+) -> (String, tokio::task::JoinHandle<serde_json::Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
+    let status = status.to_owned();
     let response_body = response_body.to_owned();
     let task = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -41,7 +49,7 @@ async fn telegram_server(
             received.extend_from_slice(&chunk[..read]);
         }
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             response_body.len(),
             response_body
         );
@@ -49,6 +57,49 @@ async fn telegram_server(
         serde_json::from_slice(&received[header_end..header_end + content_length]).unwrap()
     });
     (format!("http://{address}"), task)
+}
+
+#[tokio::test]
+async fn telegram_polling_classifies_rate_limits_and_server_errors_as_retryable() {
+    let response = serde_json::json!({
+        "ok": false,
+        "error_code": 429,
+        "description": "Too Many Requests",
+        "parameters": {"retry_after": 5}
+    })
+    .to_string();
+    let (base, request) = telegram_server_response("429 Too Many Requests", &response).await;
+    let poller =
+        TelegramPoller::telegram(&base, "fake-token", -1001, Duration::from_secs(2)).unwrap();
+    let error = poller.poll(10, 0).await.unwrap_err();
+    assert!(matches!(
+        error,
+        panetone::channels::ChannelDeliveryError::RateLimited {
+            retry_after_secs: 5,
+            ..
+        }
+    ));
+    assert!(error.retryable());
+    request.await.unwrap();
+
+    let response = serde_json::json!({
+        "ok": false,
+        "error_code": 502,
+        "description": "Bad Gateway"
+    })
+    .to_string();
+    let (base, request) = telegram_server_response("502 Bad Gateway", &response).await;
+    let poller =
+        TelegramPoller::telegram(&base, "fake-token", -1001, Duration::from_secs(2)).unwrap();
+    let error = poller.poll(10, 0).await.unwrap_err();
+    assert_eq!(
+        error,
+        panetone::channels::ChannelDeliveryError::Transport(
+            panetone::domain::ChannelKind::Telegram
+        )
+    );
+    assert!(error.retryable());
+    request.await.unwrap();
 }
 
 #[tokio::test]

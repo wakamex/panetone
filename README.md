@@ -74,6 +74,8 @@ startup. Accepted channel input, explicit workflows, and final returns remain
 durable and replay normally. Set `PANETONE_REPLAY_OFFLINE_OUTPUT=true` before a
 deliberate catch-up start. Telegram output is paced per bot token at one message
 every 3.1 seconds and honors longer server `retry_after` responses.
+Telegram polling retries rate limits and temporary transport or upstream errors
+inside the inbound worker, so those failures do not restart Panetone.
 
 Signal is optional. All three variables are required when it is enabled:
 

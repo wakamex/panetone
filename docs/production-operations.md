@@ -161,6 +161,11 @@ or Signal's text limit. Every chunk has a deterministic effect ID and is
 committed with the source event cursor, so restart resumes at the first unsent
 chunk.
 
+Telegram inbound polling retries timeouts, transport failures, rate limits, and
+upstream 5xx responses in place. Backoff starts at one second, caps at 30
+seconds, and honors a longer Telegram `retry_after`. Other polling errors still
+terminate the critical worker and fail the daemon.
+
 ## Durable failure rules
 
 - Never replay an indeterminate prompt merely because the daemon restarted.

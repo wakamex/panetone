@@ -102,10 +102,28 @@ impl TelegramPoller {
                     ChannelDeliveryError::Transport(self.kind)
                 }
             })?;
+        let status = response.status();
         let body = response_body(response, self.kind).await?;
-        let response: TelegramUpdates = serde_json::from_slice(&body)
-            .map_err(|_| ChannelDeliveryError::Malformed(self.kind))?;
-        if !response.ok {
+        let response: TelegramUpdates = serde_json::from_slice(&body).map_err(|_| {
+            if status.is_server_error() {
+                ChannelDeliveryError::Transport(self.kind)
+            } else {
+                ChannelDeliveryError::Malformed(self.kind)
+            }
+        })?;
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS || response.error_code == Some(429) {
+            return Err(ChannelDeliveryError::RateLimited {
+                kind: self.kind,
+                retry_after_secs: response
+                    .parameters
+                    .and_then(|parameters| parameters.retry_after)
+                    .unwrap_or(1),
+            });
+        }
+        if status.is_server_error() {
+            return Err(ChannelDeliveryError::Transport(self.kind));
+        }
+        if !status.is_success() || !response.ok {
             return Err(ChannelDeliveryError::Rejected {
                 kind: self.kind,
                 detail: safe_detail(response.description.as_deref().unwrap_or("poll rejected")),
@@ -249,6 +267,13 @@ struct TelegramUpdates {
     #[serde(default)]
     result: Vec<TelegramUpdate>,
     description: Option<String>,
+    error_code: Option<u16>,
+    parameters: Option<TelegramUpdateParameters>,
+}
+
+#[derive(Deserialize)]
+struct TelegramUpdateParameters {
+    retry_after: Option<u64>,
 }
 
 #[derive(Deserialize)]

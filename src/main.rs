@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use panetone::channels::{
-    RealChannels, SignalClient, SignalSubscriber, TelegramClient, TelegramPoller,
+    ChannelDeliveryError, RealChannels, SignalClient, SignalSubscriber, TelegramClient,
+    TelegramPoller,
 };
 use panetone::control::{
     CONTROL_SCHEMA, ControlRequest, ControlServer, OutputDispositionParams, RouteEnsureParams,
@@ -439,6 +440,7 @@ async fn telegram_loop(
     store: StoreHandle,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
+    let mut consecutive_failures = 0_u32;
     loop {
         if *shutdown.borrow() {
             return Ok(());
@@ -459,10 +461,34 @@ async fn telegram_loop(
             .unwrap_or_default()
             .parse::<i64>()
             .map_err(|_| "stored Telegram update offset is invalid".to_string())?;
-        let mut batch = poller
-            .poll(offset, 1)
-            .await
-            .map_err(|error| error.to_string())?;
+        let mut batch = match poller.poll(offset, 1).await {
+            Ok(batch) => {
+                consecutive_failures = 0;
+                batch
+            }
+            Err(error) => {
+                let Some(delay) =
+                    telegram_poll_retry_delay(&error, consecutive_failures.saturating_add(1))
+                else {
+                    return Err(error.to_string());
+                };
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                tracing::warn!(
+                    error = %error,
+                    retry_after_ms = delay.as_millis(),
+                    "Telegram polling failed; retrying"
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            return Ok(());
+                        }
+                    }
+                }
+                continue;
+            }
+        };
         batch
             .messages
             .retain(|message| message.sender_id.as_deref() == Some(owner.as_str()));
@@ -470,6 +496,21 @@ async fn telegram_loop(
             .persist_telegram_batch("telegram_update_offset", batch, wall_now_ms())
             .await
             .map_err(|error| error.to_string())?;
+    }
+}
+
+fn telegram_poll_retry_delay(
+    error: &ChannelDeliveryError,
+    consecutive_failures: u32,
+) -> Option<Duration> {
+    let exponent = consecutive_failures.saturating_sub(1).min(5);
+    let backoff = Duration::from_secs((1_u64 << exponent).min(30));
+    match error {
+        ChannelDeliveryError::RateLimited {
+            retry_after_secs, ..
+        } => Some(backoff.max(Duration::from_secs(*retry_after_secs))),
+        ChannelDeliveryError::Timeout(_) | ChannelDeliveryError::Transport(_) => Some(backoff),
+        _ => None,
     }
 }
 
@@ -771,6 +812,7 @@ fn private_directory_check(path: &Path) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use panetone::domain::ChannelKind;
 
     fn production_args() -> ProductionArgs {
         ProductionArgs {
@@ -806,5 +848,34 @@ mod tests {
 
         args.telegram_owner = Some("42".into());
         assert!(production_channels(&args, Duration::from_secs(1)).is_ok());
+    }
+
+    #[test]
+    fn telegram_poll_retries_use_bounded_backoff_and_honor_rate_limits() {
+        let transport = ChannelDeliveryError::Transport(ChannelKind::Telegram);
+        assert_eq!(
+            telegram_poll_retry_delay(&transport, 1),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            telegram_poll_retry_delay(&transport, 6),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            telegram_poll_retry_delay(&transport, u32::MAX),
+            Some(Duration::from_secs(30))
+        );
+
+        let limited = ChannelDeliveryError::RateLimited {
+            kind: ChannelKind::Telegram,
+            retry_after_secs: 45,
+        };
+        assert_eq!(
+            telegram_poll_retry_delay(&limited, 1),
+            Some(Duration::from_secs(45))
+        );
+
+        let malformed = ChannelDeliveryError::Malformed(ChannelKind::Telegram);
+        assert_eq!(telegram_poll_retry_delay(&malformed, 1), None);
     }
 }
