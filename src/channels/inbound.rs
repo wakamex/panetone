@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -168,6 +169,7 @@ impl TelegramPoller {
 pub struct SignalSubscriber {
     reader: BufReader<UnixStream>,
     deadline: Duration,
+    attachment_directory: PathBuf,
 }
 
 impl SignalSubscriber {
@@ -214,7 +216,11 @@ impl SignalSubscriber {
                 detail: "Signal subscription was rejected".into(),
             });
         }
-        Ok(Self { reader, deadline })
+        Ok(Self {
+            reader,
+            deadline,
+            attachment_directory: signal_attachment_directory(),
+        })
     }
 
     pub async fn next(&mut self) -> Result<InboundMessage, ChannelDeliveryError> {
@@ -230,7 +236,7 @@ impl SignalSubscriber {
             }
             let envelope = &notification["params"]["result"]["envelope"];
             let data = &envelope["dataMessage"];
-            let Some(body) = data["message"].as_str() else {
+            let Some(body) = signal_body(data, &self.attachment_directory) else {
                 continue;
             };
             let destination = data["groupInfo"]["groupId"]
@@ -255,10 +261,42 @@ impl SignalSubscriber {
                     .or_else(|| envelope["sourceNumber"].as_str())
                     .map(str::to_owned),
                 reply_to_external_id: scalar_id(&data["quote"]["id"]),
-                body: body.into(),
+                body,
             });
         }
     }
+}
+
+fn signal_attachment_directory() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from(".local/share"))
+        .join("signal-cli/attachments")
+}
+
+fn signal_body(data: &Value, attachment_directory: &Path) -> Option<String> {
+    let mut body = data["message"].as_str().unwrap_or_default().to_owned();
+    for attachment in data["attachments"].as_array().into_iter().flatten() {
+        let Some(id) = attachment["id"]
+            .as_str()
+            .filter(|id| Path::new(id).file_name() == Some(OsStr::new(id)))
+        else {
+            continue;
+        };
+        let content_type = attachment["contentType"]
+            .as_str()
+            .filter(|value| !value.contains(['\r', '\n']))
+            .unwrap_or("application/octet-stream");
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&format!(
+            "[attached {content_type}: {}]",
+            attachment_directory.join(id).display()
+        ));
+    }
+    (!body.is_empty()).then_some(body)
 }
 
 #[derive(Deserialize)]

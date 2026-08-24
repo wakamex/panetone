@@ -204,6 +204,9 @@ async fn signal_notifications_are_normalized_and_deduplicated_durably() {
                         "timestamp": 9001,
                         "dataMessage": {
                             "message": "signal hello",
+                            "attachments": [
+                                {"id": "photo.jpg", "contentType": "image/jpeg"}
+                            ],
                             "quote": {"id": 8001},
                             "groupInfo": {"groupId": "group-one=="}
                         }
@@ -229,13 +232,67 @@ async fn signal_notifications_are_normalized_and_deduplicated_durably() {
     );
     server.await.unwrap();
     assert_eq!(store.status().await.unwrap().pending_inbox, 1);
-    assert_eq!(
-        store.pending_inbox().await.unwrap()[0]
-            .reply_to_external_id
-            .as_deref(),
-        Some("8001")
+    let item = &store.pending_inbox().await.unwrap()[0];
+    assert_eq!(item.reply_to_external_id.as_deref(), Some("8001"));
+    assert!(
+        item.body
+            .starts_with("signal hello\n[attached image/jpeg: ")
     );
+    assert!(item.body.ends_with("/signal-cli/attachments/photo.jpg]"));
     store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn signal_attachment_only_notifications_are_delivered() {
+    let directory = tempdir().unwrap();
+    let socket_path = directory.path().join("signal-attachment.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut request = String::new();
+        reader.read_line(&mut request).await.unwrap();
+        reader
+            .get_mut()
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"panetone-subscribe\",\"result\":{}}\n")
+            .await
+            .unwrap();
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "receive",
+            "params": {"result": {"envelope": {
+                "sourceNumber": "+15551111",
+                "timestamp": 9003,
+                "dataMessage": {
+                    "attachments": [
+                        {"id": "first.jpg", "contentType": "image/jpeg"},
+                        {"id": "second.png", "contentType": "image/png"}
+                    ],
+                    "groupInfo": {"groupId": "group-one=="}
+                }
+            }}}
+        });
+        reader
+            .get_mut()
+            .write_all(format!("{notification}\n").as_bytes())
+            .await
+            .unwrap();
+    });
+
+    let mut subscriber =
+        SignalSubscriber::connect(&socket_path, "+15550000", Duration::from_secs(2))
+            .await
+            .unwrap();
+    let message = subscriber.next().await.unwrap();
+    assert!(message.body.contains("[attached image/jpeg: "));
+    assert!(message.body.contains("/signal-cli/attachments/first.jpg]"));
+    assert!(message.body.contains("[attached image/png: "));
+    assert!(
+        message
+            .body
+            .ends_with("/signal-cli/attachments/second.png]")
+    );
+    server.await.unwrap();
 }
 
 #[tokio::test]

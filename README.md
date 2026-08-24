@@ -90,7 +90,9 @@ idle agent receives a normal admitted prompt. A busy agent receives immediate
 active-turn steering after Wakterm definitively confirms that admission did not
 write the prompt. Channel, topic, sender, update, and reply metadata remain
 internal and do not alter what the harness sees. Local `panetone send` retains
-its separate queue-until-idle behavior.
+its separate queue-until-idle behavior. Signal attachments are downloaded by
+signal-cli; Panetone appends their absolute local paths to the message so the
+harness can inspect them. Attachment-only Signal messages are supported.
 
 ## Commands
 
