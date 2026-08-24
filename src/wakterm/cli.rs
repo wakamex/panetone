@@ -63,6 +63,35 @@ pub struct ReturnTerminal {
     pub terminal_event_sequence: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct SteeringReceipt {
+    agent_id: String,
+    pane_id: u64,
+    submitted: bool,
+    acknowledgement: SteeringAcknowledgement,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+struct SteeringAcknowledgement {
+    acknowledged: bool,
+}
+
+impl SteeringReceipt {
+    pub fn validate(&self, binding: &AgentBinding) -> Result<(), WaktermCliError> {
+        if self.agent_id != binding.agent_id
+            || binding.pane_id != Some(self.pane_id)
+            || !self.submitted
+        {
+            return Err(WaktermCliError::InvalidSteeringReceipt);
+        }
+        Ok(())
+    }
+
+    pub fn acknowledged(&self) -> bool {
+        self.acknowledgement.acknowledged
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct WaktermCli {
     binary: PathBuf,
@@ -93,6 +122,8 @@ pub enum WaktermCliError {
     MissingCapability(&'static str),
     #[error("Wakterm Agent API response has an unexpected schema")]
     UnexpectedSchema,
+    #[error("Wakterm steering receipt does not match the requested agent pane")]
+    InvalidSteeringReceipt,
     #[error("no live Wakterm agent pane matches route title {0:?}")]
     RouteNotFound(String),
     #[error("more than one live Wakterm tab matches route title {0:?}")]
@@ -351,6 +382,25 @@ impl WaktermCli {
             return Err(WaktermCliError::UnexpectedSchema);
         }
         Ok(wire.receipt)
+    }
+
+    pub async fn steer(
+        &self,
+        binding: &AgentBinding,
+        prompt: &str,
+    ) -> Result<SteeringReceipt, WaktermCliError> {
+        if prompt.len() > MAX_PROMPT_BYTES {
+            return Err(WaktermCliError::InputTooLarge(MAX_PROMPT_BYTES));
+        }
+        self.capabilities().await?;
+        let receipt: SteeringReceipt = self
+            .run_json(
+                &["agent", "send", binding.agent_id.as_str()],
+                Some(prompt.as_bytes()),
+            )
+            .await?;
+        receipt.validate(binding)?;
+        Ok(receipt)
     }
 
     pub async fn terminal_events(

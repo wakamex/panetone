@@ -399,6 +399,27 @@ impl ProductionService {
             receipt.validate(item.id, &binding).map_err(error_string)?;
             item.state = match receipt.status {
                 AdmissionStatus::Accepted => "delivered",
+                AdmissionStatus::Busy => {
+                    let steering = match self.wakterm.steer(&binding, &item.body).await {
+                        Ok(steering) => steering,
+                        Err(error) => {
+                            item.state = "indeterminate".into();
+                            self.store
+                                .save_inbox(item, "admission_prepared", None)
+                                .await
+                                .map_err(error_string)?;
+                            return Err(error.to_string());
+                        }
+                    };
+                    if !steering.acknowledged() {
+                        tracing::warn!(
+                            agent_id = %binding.agent_id,
+                            pane_id = ?binding.pane_id,
+                            "Wakterm submitted channel steering without observer acknowledgement"
+                        );
+                    }
+                    "delivered"
+                }
                 AdmissionStatus::Indeterminate => "indeterminate",
                 _ => "pending",
             }
@@ -1152,6 +1173,95 @@ fi
 
         assert_eq!(service.inbox_once().await.unwrap(), 1);
         assert_eq!(fs::read_to_string(prompt).unwrap(), body);
+        assert_eq!(store.status().await.unwrap().pending_inbox, 0);
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn busy_channel_input_steers_the_active_turn_instead_of_waiting() {
+        let directory = tempdir().unwrap();
+        let calls = directory.path().join("calls.log");
+        let prompt = directory.path().join("prompt.txt");
+        let binary = directory.path().join("wakterm-fake");
+        fs::write(
+            &binary,
+            format!(
+                r#"#!/bin/bash
+set -euo pipefail
+operation="$*"
+if [[ "$operation" == *"agent capabilities"* ]]; then
+  echo '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
+elif [[ "$operation" == *"agent catalog"* ]]; then
+  echo '{{"schema":"wakterm.agent-api.v1","as_of_event_sequence":10,"agents":[{{"agent_id":"agent-route","incarnation_id":"inc-route","pane_id":1,"name":"route","harness":"codex","status":"busy","turn_state":"waiting_on_agent","alive":true,"observed_at":"2026-08-17T00:00:00Z"}}]}}'
+elif [[ "$operation" == *"list --format json"* ]]; then
+  echo '[{{"pane_id":1,"tab_id":2,"window_id":3,"effective_title":"route"}}]'
+elif [[ "$operation" == *"agent admit"* ]]; then
+  cat >/dev/null
+  echo admit >> '{}'
+  echo '{{"schema":"wakterm.agent-api.v1","request_id":"00000000-0000-0000-0000-00000000007c","status":"busy","definitive":true,"prompt_written":false,"agent_id":"agent-route","incarnation_id":"inc-route","detail":"target is busy"}}'
+elif [[ "$operation" == *"agent send agent-route"* ]]; then
+  cat > '{}'
+  echo steer >> '{}'
+  echo '{{"agent_id":"agent-route","agent_name":"route","pane_id":1,"transport":"observed_pty","submitted":true,"acknowledgement":{{"kind":"session_observer","acknowledged":true,"latency_ms":10,"session_path":"/tmp/session","detail":null}}}}'
+else
+  echo "unexpected fake invocation: $operation" >&2
+  exit 9
+fi
+"#,
+                calls.display(),
+                prompt.display(),
+                calls.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        store
+            .save_route(
+                Route {
+                    id: RouteId::new(Uuid::new_v4()),
+                    title: "route".into(),
+                    channels: vec![ChannelBinding::Telegram { topic_id: 10 }],
+                    agent: None,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let body = "change the active plan now";
+        store
+            .accept_inbox(InboxItem {
+                id: EffectId::new(Uuid::from_u128(124)),
+                channel: ChannelKind::Telegram,
+                external_id: "update-2".into(),
+                destination: "10".into(),
+                sender_id: Some("42".into()),
+                sender: Some("Mihai".into()),
+                reply_to_external_id: None,
+                body: body.into(),
+                state: "pending".into(),
+                created_at_ms: 2,
+            })
+            .await
+            .unwrap();
+        let service = ProductionService::new(
+            store.clone(),
+            WaktermCli::new(
+                binary,
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            RealChannels::default(),
+            SupervisorHandle::default(),
+            vec!["event_stream.v1".into()],
+            directory.path().join("control.sock"),
+        );
+
+        assert_eq!(service.inbox_once().await.unwrap(), 1);
+        assert_eq!(fs::read_to_string(prompt).unwrap(), body);
+        assert_eq!(fs::read_to_string(calls).unwrap(), "admit\nsteer\n");
         assert_eq!(store.status().await.unwrap().pending_inbox, 0);
         drop(service);
         store.shutdown().await.unwrap();

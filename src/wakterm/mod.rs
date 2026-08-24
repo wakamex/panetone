@@ -3,7 +3,8 @@ mod contract;
 mod fake;
 
 pub use cli::{
-    AgentApiCapabilities, LiveRoute, LiveRouteSnapshot, ReturnTerminal, WaktermCli, WaktermCliError,
+    AgentApiCapabilities, LiveRoute, LiveRouteSnapshot, ReturnTerminal, SteeringReceipt,
+    WaktermCli, WaktermCliError,
 };
 pub use contract::{
     AgentCatalog, CatalogAgent, ContractError, EventRead, EventRecord, ProfileKind,

@@ -85,9 +85,12 @@ WAK_SIG_ACCOUNT=+15550000000
 WAK_SIG_OWNER=+15551111111
 ```
 
-After authorization and routing, Panetone admits the message body unchanged.
-Channel, topic, sender, update, and reply metadata remain internal and do not
-alter what the harness sees.
+After authorization and routing, Panetone sends the message body unchanged. An
+idle agent receives a normal admitted prompt. A busy agent receives immediate
+active-turn steering after Wakterm definitively confirms that admission did not
+write the prompt. Channel, topic, sender, update, and reply metadata remain
+internal and do not alter what the harness sees. Local `panetone send` retains
+its separate queue-until-idle behavior.
 
 ## Commands
 

@@ -84,6 +84,9 @@ elif [[ "$operation" == *"agent admit"* ]]; then
     shift
   done
   printf '{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"accepted","definitive":true,"prompt_written":true,"agent_id":"agent-zola","incarnation_id":"incarnation-zola-7","return_final":true,"request":null,"detail":null}\n' "$request_id"
+elif [[ "$operation" == *"agent send agent-zola"* ]]; then
+  [[ "$(cat)" == "steer this turn" ]]
+  printf '%s\n' '{"agent_id":"agent-zola","agent_name":"renamed display","pane_id":9,"transport":"observed_pty","submitted":true,"acknowledgement":{"kind":"session_observer","acknowledged":true,"latency_ms":10,"session_path":"/tmp/session","detail":null}}'
 elif [[ "$operation" == *"agent request watch"* ]]; then
   [[ "$operation" == *"--after 40 --once"* ]]
   printf '%s\n' '{"request_id":"11111111-1111-4111-8111-111111111111","target_agent_id":"agent-zola","state":"completed","final_message":"done","detail":null,"terminal_event_sequence":41}'
@@ -131,6 +134,9 @@ fi
     assert_eq!(receipt.status, AdmissionStatus::Accepted);
     assert_eq!(receipt.request_id, request_id);
     assert_eq!(receipt.prompt_written, Some(true));
+
+    let steering = cli.steer(&resolved, "steer this turn").await.unwrap();
+    assert!(steering.acknowledged());
 
     let events = cli.terminal_events(40).await.unwrap();
     assert_eq!(events.len(), 1);

@@ -68,7 +68,7 @@ The live Rust trial demonstrated:
 - startup and understandable status
 - Wakterm agent discovery
 - agent output delivered to Telegram
-- Telegram replies admitted to the intended agent
+- Telegram replies admitted when idle and steered into active turns when busy
 - durable outbox recovery after a Wakterm interruption
 - restart without duplicate prompt admission
 - fresh route establishment without legacy JSON or direct SQLite access
@@ -83,7 +83,6 @@ must be verified in the binary actually loaded by the service.
 
 - Verify the loaded Wakterm build contains the subscriber-lifetime fix before
   the next long Panetone run.
-- Verify active-turn Telegram replies have the intended steering behavior.
 - Exercise Signal and Debate when they are next wanted.
 - Exercise `--return-final` when it is next wanted.
 - Resolve or discard stale current-Rust inbox or outbox records when they no

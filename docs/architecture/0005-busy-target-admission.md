@@ -1,6 +1,6 @@
 # ADR 0005: Busy target admission
 
-Status: implemented for local control sends; channel steering is separate
+Status: implemented
 
 ## Context
 
@@ -14,10 +14,15 @@ Telegram reply but cannot preserve new-turn return correlation.
 ## Decision
 
 The local control `send` method waits durably for a busy target to become idle.
-It never steers an active turn. Channel input requires an explicit steering
-contract and is not settled by this decision.
+It never steers an active turn.
 
-The admission sequence is:
+Authorized Telegram and Signal input has different semantics. Panetone first
+uses authoritative admission against the exact current agent identity. An idle
+agent accepts the message as a new prompt. A definitive `busy` receipt proves
+that no prompt was written, so Panetone immediately sends the unchanged body
+through Wakterm's active-turn steering command instead of queueing it.
+
+The local control admission sequence is:
 
 1. claim and persist the idempotency key
 2. resolve the workspace title to one current live tab and agent incarnation
@@ -47,4 +52,8 @@ Wakterm must classify `busy` as a definitive non-acceptance result. Panetone may
 
 Audit failure still fails closed. A crash after a queued audit but before its durable queued checkpoint is indeterminate and receives a visible failure annotation. A crash after the queued checkpoint resumes the queue without adding another audit.
 
-An explicit active-turn steering or interrupt operation may be designed later, but it must use a different command or flag and an unmistakable audit label.
+Before either channel path, Panetone persists `admission_prepared`. A steering
+command or receipt failure changes the inbox item to `indeterminate` and is not
+retried automatically. This avoids duplicate steering when it is unknown
+whether the pane write occurred. Local queued work continues to use the durable
+workflow and audit states described above.
