@@ -59,6 +59,67 @@ async fn telegram_server_response(
     (format!("http://{address}"), task)
 }
 
+async fn telegram_document_server(
+    update_response: String,
+    document: Vec<u8>,
+) -> (String, tokio::task::JoinHandle<Vec<(String, Vec<u8>)>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let file_response = serde_json::json!({
+        "ok": true,
+        "result": {"file_path": "documents/remote.md"}
+    })
+    .to_string();
+    let task = tokio::spawn(async move {
+        let responses = [
+            update_response.into_bytes(),
+            file_response.into_bytes(),
+            document,
+        ];
+        let mut requests = Vec::new();
+        for response_body in responses {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0_u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0);
+                received.extend_from_slice(&chunk[..read]);
+                if let Some(position) = received.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let header = String::from_utf8(received[..header_end].to_vec()).unwrap();
+            let content_length = header
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while received.len() - header_end < content_length {
+                let mut chunk = [0_u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0);
+                received.extend_from_slice(&chunk[..read]);
+            }
+            requests.push((
+                header.lines().next().unwrap().to_owned(),
+                received[header_end..header_end + content_length].to_vec(),
+            ));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(&response_body).await.unwrap();
+        }
+        requests
+    });
+    (format!("http://{address}"), task)
+}
+
 #[tokio::test]
 async fn telegram_polling_classifies_rate_limits_and_server_errors_as_retryable() {
     let response = serde_json::json!({
@@ -69,8 +130,15 @@ async fn telegram_polling_classifies_rate_limits_and_server_errors_as_retryable(
     })
     .to_string();
     let (base, request) = telegram_server_response("429 Too Many Requests", &response).await;
-    let poller =
-        TelegramPoller::telegram(&base, "fake-token", -1001, Duration::from_secs(2)).unwrap();
+    let directory = tempdir().unwrap();
+    let poller = TelegramPoller::telegram(
+        &base,
+        "fake-token",
+        -1001,
+        directory.path(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
     let error = poller.poll(10, 0).await.unwrap_err();
     assert!(matches!(
         error,
@@ -89,8 +157,14 @@ async fn telegram_polling_classifies_rate_limits_and_server_errors_as_retryable(
     })
     .to_string();
     let (base, request) = telegram_server_response("502 Bad Gateway", &response).await;
-    let poller =
-        TelegramPoller::telegram(&base, "fake-token", -1001, Duration::from_secs(2)).unwrap();
+    let poller = TelegramPoller::telegram(
+        &base,
+        "fake-token",
+        -1001,
+        directory.path(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
     let error = poller.poll(10, 0).await.unwrap_err();
     assert_eq!(
         error,
@@ -130,8 +204,15 @@ async fn telegram_updates_are_durable_before_the_confirmation_cursor_advances() 
     })
     .to_string();
     let (base, request) = telegram_server(&response).await;
-    let poller =
-        TelegramPoller::telegram(&base, "fake-token", -1001, Duration::from_secs(2)).unwrap();
+    let directory = tempdir().unwrap();
+    let poller = TelegramPoller::telegram(
+        &base,
+        "fake-token",
+        -1001,
+        directory.path(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
     let batch = poller.poll(10, 0).await.unwrap();
     let request = request.await.unwrap();
     assert_eq!(request["offset"], 10);
@@ -174,6 +255,64 @@ async fn telegram_updates_are_durable_before_the_confirmation_cursor_advances() 
         Some("501")
     );
     store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn telegram_document_is_downloaded_before_the_update_is_returned() {
+    let response = serde_json::json!({
+        "ok": true,
+        "result": [{
+            "update_id": 100,
+            "message": {
+                "chat": {"id": -1001},
+                "message_thread_id": 77,
+                "from": {"id": 42, "first_name": "Alice"},
+                "document": {
+                    "file_id": "remote-file-id",
+                    "file_unique_id": "stable-file-id",
+                    "file_name": "../plan.md",
+                    "mime_type": "text/markdown",
+                    "file_size": 16
+                }
+            }
+        }]
+    })
+    .to_string();
+    let contents = b"# Durable plan\n".to_vec();
+    let (base, requests) = telegram_document_server(response, contents.clone()).await;
+    let directory = tempdir().unwrap();
+    let attachment_directory = directory.path().join("attachments");
+    let poller = TelegramPoller::telegram(
+        &base,
+        "fake-token",
+        -1001,
+        &attachment_directory,
+        Duration::from_secs(2),
+    )
+    .unwrap();
+
+    let batch = poller.poll(100, 0).await.unwrap();
+    assert_eq!(batch.next_offset, 101);
+    assert_eq!(batch.messages.len(), 1);
+    let attachment = attachment_directory.join("100-plan.md");
+    assert_eq!(
+        batch.messages[0].body,
+        format!("[attached text/markdown: {}]", attachment.display())
+    );
+    assert_eq!(tokio::fs::read(&attachment).await.unwrap(), contents);
+
+    let requests = requests.await.unwrap();
+    assert!(requests[0].0.contains("/botfake-token/getUpdates "));
+    assert!(requests[1].0.contains("/botfake-token/getFile "));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&requests[1].1).unwrap()["file_id"],
+        "remote-file-id"
+    );
+    assert!(
+        requests[2]
+            .0
+            .contains("/file/botfake-token/documents/remote.md ")
+    );
 }
 
 #[tokio::test]

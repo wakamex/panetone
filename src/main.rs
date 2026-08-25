@@ -363,6 +363,7 @@ fn production_channels(args: &ProductionArgs, deadline: Duration) -> Result<Prod
                     &args.telegram_api_base,
                     primary,
                     chat,
+                    args.database.with_file_name("attachments").join("telegram"),
                     Duration::from_secs(35),
                 )?,
                 owner.clone(),

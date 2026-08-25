@@ -92,7 +92,10 @@ write the prompt. Channel, topic, sender, update, and reply metadata remain
 internal and do not alter what the harness sees. Local `panetone send` retains
 its separate queue-until-idle behavior. Signal attachments are downloaded by
 signal-cli; Panetone appends their absolute local paths to the message so the
-harness can inspect them. Attachment-only Signal messages are supported.
+harness can inspect them. Telegram documents up to 20 MB are downloaded into
+an `attachments/telegram` directory beside the database before the update
+cursor advances, and their absolute paths are appended the same way.
+Attachment-only Signal and Telegram messages are supported.
 
 ## Commands
 

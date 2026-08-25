@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use crate::domain::{ChannelKind, EffectId};
 use super::real::{ChannelDeliveryError, http_client, response_body};
 
 const MAX_INBOUND_BYTES: usize = 1024 * 1024;
+const MAX_TELEGRAM_DOCUMENT_BYTES: u64 = 20 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InboundMessage {
@@ -52,6 +54,7 @@ pub struct TelegramPoller {
     token: String,
     kind: ChannelKind,
     chat_id: i64,
+    attachment_directory: PathBuf,
 }
 
 impl TelegramPoller {
@@ -59,9 +62,17 @@ impl TelegramPoller {
         api_base: impl Into<String>,
         token: impl Into<String>,
         chat_id: i64,
+        attachment_directory: impl Into<PathBuf>,
         deadline: Duration,
     ) -> Result<Self, ChannelDeliveryError> {
-        Self::new(api_base, token, ChannelKind::Telegram, chat_id, deadline)
+        Self::new(
+            api_base,
+            token,
+            ChannelKind::Telegram,
+            chat_id,
+            attachment_directory,
+            deadline,
+        )
     }
 
     fn new(
@@ -69,6 +80,7 @@ impl TelegramPoller {
         token: impl Into<String>,
         kind: ChannelKind,
         chat_id: i64,
+        attachment_directory: impl Into<PathBuf>,
         deadline: Duration,
     ) -> Result<Self, ChannelDeliveryError> {
         Ok(Self {
@@ -77,6 +89,7 @@ impl TelegramPoller {
             token: token.into(),
             kind,
             chat_id,
+            attachment_directory: attachment_directory.into(),
         })
     }
 
@@ -140,12 +153,19 @@ impl TelegramPoller {
             if message.chat.id != self.chat_id {
                 continue;
             }
-            let Some(body) = message.text else {
-                continue;
-            };
             let Some(topic) = message.message_thread_id else {
                 continue;
             };
+            let mut body = message.text.or(message.caption).unwrap_or_default();
+            if let Some(document) = message.document {
+                if !body.is_empty() {
+                    body.push('\n');
+                }
+                body.push_str(&self.document_line(update.update_id, document).await?);
+            }
+            if body.is_empty() {
+                continue;
+            }
             let destination = topic.to_string();
             messages.push(InboundMessage {
                 channel: self.kind,
@@ -163,6 +183,162 @@ impl TelegramPoller {
             messages,
             next_offset,
         })
+    }
+
+    async fn document_line(
+        &self,
+        update_id: i64,
+        document: TelegramDocument,
+    ) -> Result<String, ChannelDeliveryError> {
+        let content_type =
+            single_line(document.mime_type.as_deref()).unwrap_or("application/octet-stream");
+        if document
+            .file_size
+            .is_some_and(|size| size > MAX_TELEGRAM_DOCUMENT_BYTES)
+        {
+            return Ok(format!(
+                "[attached {content_type} unavailable: exceeds Telegram's 20 MB bot download limit]"
+            ));
+        }
+        let filename = safe_filename(document.file_name.as_deref().unwrap_or("document"));
+        let destination = self
+            .attachment_directory
+            .join(format!("{update_id}-{filename}"));
+        if tokio::fs::metadata(&destination).await.is_err() {
+            self.download_document(&document.file_id, update_id, &destination)
+                .await?;
+        }
+        Ok(format!(
+            "[attached {content_type}: {}]",
+            destination.display()
+        ))
+    }
+
+    async fn download_document(
+        &self,
+        file_id: &str,
+        update_id: i64,
+        destination: &Path,
+    ) -> Result<(), ChannelDeliveryError> {
+        let response = self
+            .http
+            .post(format!("{}/bot{}/getFile", self.api_base, self.token))
+            .json(&json!({"file_id": file_id}))
+            .send()
+            .await
+            .map_err(|error| map_telegram_http_error(&error))?;
+        let status = response.status();
+        let body = response_body(response, self.kind).await?;
+        let response: TelegramFileResponse = serde_json::from_slice(&body)
+            .map_err(|_| ChannelDeliveryError::Malformed(self.kind))?;
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS || response.error_code == Some(429) {
+            return Err(ChannelDeliveryError::RateLimited {
+                kind: self.kind,
+                retry_after_secs: response
+                    .parameters
+                    .and_then(|parameters| parameters.retry_after)
+                    .unwrap_or(1),
+            });
+        }
+        if status.is_server_error() {
+            return Err(ChannelDeliveryError::Transport(self.kind));
+        }
+        let file_path = response
+            .ok
+            .then_some(response.result)
+            .flatten()
+            .map(|file| file.file_path)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| ChannelDeliveryError::Rejected {
+                kind: self.kind,
+                detail: safe_detail(
+                    response
+                        .description
+                        .as_deref()
+                        .unwrap_or("getFile rejected"),
+                ),
+            })?;
+
+        let response = self
+            .http
+            .get(format!(
+                "{}/file/bot{}/{}",
+                self.api_base,
+                self.token,
+                file_path.trim_start_matches('/')
+            ))
+            .send()
+            .await
+            .map_err(|error| map_telegram_http_error(&error))?;
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(ChannelDeliveryError::RateLimited {
+                kind: self.kind,
+                retry_after_secs: 1,
+            });
+        }
+        if response.status().is_server_error() {
+            return Err(ChannelDeliveryError::Transport(self.kind));
+        }
+        if !response.status().is_success()
+            || response
+                .content_length()
+                .is_some_and(|size| size > MAX_TELEGRAM_DOCUMENT_BYTES)
+        {
+            return Err(ChannelDeliveryError::Rejected {
+                kind: self.kind,
+                detail: "Telegram document download was rejected".into(),
+            });
+        }
+
+        let parent = destination
+            .parent()
+            .ok_or(ChannelDeliveryError::Transport(self.kind))?;
+        std::fs::create_dir_all(parent).map_err(|_| ChannelDeliveryError::Transport(self.kind))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .map_err(|_| ChannelDeliveryError::Transport(self.kind))?;
+            let temporary = parent.join(format!(".{update_id}.part"));
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(&temporary)
+                .map_err(|_| ChannelDeliveryError::Transport(self.kind))?;
+            let mut file = tokio::fs::File::from_std(file);
+            let mut response = response;
+            let mut written = 0_u64;
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| ChannelDeliveryError::Transport(self.kind))?
+            {
+                written = written.saturating_add(chunk.len() as u64);
+                if written > MAX_TELEGRAM_DOCUMENT_BYTES {
+                    drop(file);
+                    let _ = tokio::fs::remove_file(&temporary).await;
+                    return Err(ChannelDeliveryError::Rejected {
+                        kind: self.kind,
+                        detail: "Telegram document exceeds the download limit".into(),
+                    });
+                }
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|_| ChannelDeliveryError::Transport(self.kind))?;
+            }
+            file.sync_all()
+                .await
+                .map_err(|_| ChannelDeliveryError::Transport(self.kind))?;
+            drop(file);
+            tokio::fs::rename(temporary, destination)
+                .await
+                .map_err(|_| ChannelDeliveryError::Transport(self.kind))?;
+        }
+        #[cfg(not(unix))]
+        return Err(ChannelDeliveryError::Transport(self.kind));
+        Ok(())
     }
 }
 
@@ -327,6 +503,30 @@ struct TelegramMessage {
     from: Option<TelegramUser>,
     reply_to_message: Option<TelegramReply>,
     text: Option<String>,
+    caption: Option<String>,
+    document: Option<TelegramDocument>,
+}
+
+#[derive(Deserialize)]
+struct TelegramDocument {
+    file_id: String,
+    file_name: Option<String>,
+    mime_type: Option<String>,
+    file_size: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct TelegramFileResponse {
+    ok: bool,
+    result: Option<TelegramFile>,
+    description: Option<String>,
+    error_code: Option<u16>,
+    parameters: Option<TelegramUpdateParameters>,
+}
+
+#[derive(Deserialize)]
+struct TelegramFile {
+    file_path: String,
 }
 
 #[derive(Deserialize)]
@@ -368,6 +568,38 @@ fn scalar_id(value: &Value) -> Option<String> {
         .map(str::to_owned)
         .or_else(|| value.as_i64().map(|value| value.to_string()))
         .or_else(|| value.as_u64().map(|value| value.to_string()))
+}
+
+fn safe_filename(filename: &str) -> String {
+    let filename = Path::new(filename)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("document");
+    let sanitized = filename
+        .chars()
+        .take(160)
+        .map(|character| match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' => character,
+            _ => '_',
+        })
+        .collect::<String>();
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        "document".into()
+    } else {
+        sanitized
+    }
+}
+
+fn single_line(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.is_empty() && !value.contains(['\r', '\n']))
+}
+
+fn map_telegram_http_error(error: &reqwest::Error) -> ChannelDeliveryError {
+    if error.is_timeout() {
+        ChannelDeliveryError::Timeout(ChannelKind::Telegram)
+    } else {
+        ChannelDeliveryError::Transport(ChannelKind::Telegram)
+    }
 }
 
 async fn read_bounded_line(
