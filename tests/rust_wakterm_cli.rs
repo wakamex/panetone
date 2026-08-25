@@ -58,6 +58,45 @@ fi
 }
 
 #[tokio::test]
+async fn event_pages_reuse_one_follow_process() {
+    let directory = tempdir().unwrap();
+    let log = directory.path().join("events.log");
+    let script = format!(
+        r#"
+operation="$*"
+if [[ "$operation" == *"agent capabilities"* ]]; then
+  printf '%s\n' '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
+elif [[ "$operation" == *"agent events"*"--follow --wait-ms 1000"* ]]; then
+  echo call >> '{}'
+  printf '%s\n' '{{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":5,"oldest_available_sequence":1,"latest_sequence":6,"next_after_sequence":6,"events":[{{"sequence":6,"event_id":"event-6","kind":"turn_started","agent_id":"agent-zola","incarnation_id":"incarnation-zola-7","observed_at":"2026-08-24T00:00:00Z"}}]}}'
+  printf '%s\n' '{{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":6,"oldest_available_sequence":1,"latest_sequence":6,"next_after_sequence":6,"events":[]}}'
+else
+  exit 9
+fi
+"#,
+        log.display()
+    );
+    let (_script_directory, binary) = fake_cli(&script);
+    let cli = WaktermCli::new(binary, "/tmp/non-production.sock", Duration::from_secs(2));
+
+    assert!(matches!(
+        cli.event_page(5, 100).await.unwrap(),
+        EventRead::Events {
+            next_after_sequence: 6,
+            ..
+        }
+    ));
+    assert!(matches!(
+        cli.clone().event_page(6, 100).await.unwrap(),
+        EventRead::Events {
+            next_after_sequence: 6,
+            ..
+        }
+    ));
+    assert_eq!(fs::read_to_string(log).unwrap(), "call\n");
+}
+
+#[tokio::test]
 async fn real_cli_boundary_negotiates_joins_admits_and_resumes_terminals() {
     let (_directory, binary) = fake_cli(
         r#"

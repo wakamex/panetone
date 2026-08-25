@@ -7,9 +7,9 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
-use tokio::sync::OnceCell;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::{Child, ChildStdout, Command};
+use tokio::sync::{Mutex, OnceCell};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -98,6 +98,15 @@ pub struct WaktermCli {
     socket: PathBuf,
     deadline: Duration,
     capabilities: Arc<OnceCell<AgentApiCapabilities>>,
+    event_follower: Arc<Mutex<Option<EventFollower>>>,
+}
+
+#[derive(Debug)]
+struct EventFollower {
+    after_sequence: u64,
+    limit: u32,
+    _child: Child,
+    lines: Lines<BufReader<ChildStdout>>,
 }
 
 #[derive(Debug, Error)]
@@ -248,6 +257,7 @@ impl WaktermCli {
             socket: socket.into(),
             deadline,
             capabilities: Arc::new(OnceCell::new()),
+            event_follower: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -432,65 +442,109 @@ impl WaktermCli {
         if !capabilities.general_event_consumer_enabled() {
             return Ok(EventRead::Unsupported);
         }
-        let after = after_sequence.to_string();
-        let limit = limit.clamp(1, 1000).to_string();
-        let page: WireEventPage = self
-            .run_json(
-                &["agent", "events", "--after", &after, "--limit", &limit],
-                None,
+        let limit = limit.clamp(1, 1000);
+        let mut follower = self.event_follower.lock().await;
+        for _ in 0..2 {
+            let needs_follower = follower
+                .as_ref()
+                .map(|follower| {
+                    follower.after_sequence != after_sequence || follower.limit != limit
+                })
+                .unwrap_or(true);
+            if needs_follower {
+                *follower = Some(self.spawn_event_follower(after_sequence, limit)?);
+            }
+
+            let line = timeout(
+                self.deadline,
+                follower
+                    .as_mut()
+                    .expect("event follower was initialized")
+                    .lines
+                    .next_line(),
             )
-            .await?;
-        if page.schema != "wakterm.agent-events.v1"
-            || page.requested_after_sequence != after_sequence
-            || page.oldest_available_sequence > page.latest_sequence.saturating_add(1)
-        {
-            return Err(WaktermCliError::InvalidEventPage(
-                "schema, request cursor, or retention bounds are invalid",
-            ));
-        }
-        match page.status.as_str() {
-            "cursor_too_old" if page.events.is_empty() && page.next_after_sequence.is_none() => {
-                let recovery = page.recovery.ok_or(WaktermCliError::InvalidEventPage(
-                    "cursor gap has no catalog-snapshot recovery",
-                ))?;
-                if recovery.kind != "catalog_snapshot" {
-                    return Err(WaktermCliError::InvalidEventPage(
-                        "cursor gap has an unknown recovery kind",
-                    ));
-                }
-                Ok(EventRead::CursorTooOld {
-                    requested_after_sequence: after_sequence,
-                    oldest_available_sequence: page.oldest_available_sequence,
-                    latest_sequence: page.latest_sequence,
-                    catalog_as_of_sequence: recovery.catalog_as_of_sequence,
-                })
+            .await
+            .map_err(|_| WaktermCliError::Timeout)??;
+            let Some(line) = line else {
+                *follower = None;
+                continue;
+            };
+            if line.len() > MAX_OUTPUT_BYTES {
+                *follower = None;
+                return Err(WaktermCliError::OutputTooLarge(MAX_OUTPUT_BYTES));
             }
-            "ok" => {
-                validate_live_events(after_sequence, page.latest_sequence, &page.events)?;
-                let expected_next = page
-                    .events
-                    .last()
-                    .map_or(after_sequence, |event| event.sequence);
-                if page.next_after_sequence != Some(expected_next) {
-                    return Err(WaktermCliError::InvalidEventPage(
-                        "next cursor does not equal the last returned event sequence",
-                    ));
+            let page: WireEventPage = match serde_json::from_str(&line) {
+                Ok(page) => page,
+                Err(error) => {
+                    *follower = None;
+                    return Err(error.into());
                 }
-                if expected_next < page.latest_sequence && page.events.is_empty() {
-                    return Err(WaktermCliError::InvalidEventPage(
-                        "an empty page did not reach the advertised stream head",
-                    ));
+            };
+            let read = match parse_event_page(page, after_sequence) {
+                Ok(read) => read,
+                Err(error) => {
+                    *follower = None;
+                    return Err(error);
                 }
-                Ok(EventRead::Events {
-                    events: page.events,
-                    next_after_sequence: expected_next,
-                    latest_sequence: page.latest_sequence,
-                })
+            };
+            match &read {
+                EventRead::Events {
+                    next_after_sequence,
+                    ..
+                } => {
+                    follower
+                        .as_mut()
+                        .expect("event follower remains live")
+                        .after_sequence = *next_after_sequence;
+                }
+                EventRead::CursorTooOld { .. } | EventRead::Unsupported => {
+                    *follower = None;
+                }
             }
-            _ => Err(WaktermCliError::InvalidEventPage(
-                "event page status or payload is invalid",
-            )),
+            return Ok(read);
         }
+        Err(WaktermCliError::Rejected(
+            "Wakterm event follower exited before producing a page".into(),
+        ))
+    }
+
+    fn spawn_event_follower(
+        &self,
+        after_sequence: u64,
+        limit: u32,
+    ) -> Result<EventFollower, WaktermCliError> {
+        let wait_ms = (self.deadline.as_millis() / 2).max(1).to_string();
+        let mut command = Command::new(&self.binary);
+        command
+            .arg("--skip-config")
+            .args(["cli", "--prefer-mux", "--no-auto-start"])
+            .args([
+                "agent",
+                "events",
+                "--after",
+                &after_sequence.to_string(),
+                "--limit",
+                &limit.to_string(),
+                "--follow",
+                "--wait-ms",
+                &wait_ms,
+            ])
+            .env("WAKTERM_UNIX_SOCKET", &self.socket)
+            .env_remove("WAKTERM_CONFIG_DIR")
+            .env_remove("WAKTERM_CONFIG_FILE")
+            .env_remove("WAKTERM_PANE")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn()?;
+        let stdout = child.stdout.take().expect("Wakterm stdout was piped");
+        Ok(EventFollower {
+            after_sequence,
+            limit,
+            _child: child,
+            lines: BufReader::new(stdout).lines(),
+        })
     }
 
     async fn run_json<T: DeserializeOwned>(
@@ -563,6 +617,63 @@ impl WaktermCli {
             return Err(WaktermCliError::Rejected(safe_detail(&stderr)));
         }
         Ok(stdout)
+    }
+}
+
+fn parse_event_page(
+    page: WireEventPage,
+    after_sequence: u64,
+) -> Result<EventRead, WaktermCliError> {
+    if page.schema != "wakterm.agent-events.v1"
+        || page.requested_after_sequence != after_sequence
+        || page.oldest_available_sequence > page.latest_sequence.saturating_add(1)
+    {
+        return Err(WaktermCliError::InvalidEventPage(
+            "schema, request cursor, or retention bounds are invalid",
+        ));
+    }
+    match page.status.as_str() {
+        "cursor_too_old" if page.events.is_empty() && page.next_after_sequence.is_none() => {
+            let recovery = page.recovery.ok_or(WaktermCliError::InvalidEventPage(
+                "cursor gap has no catalog-snapshot recovery",
+            ))?;
+            if recovery.kind != "catalog_snapshot" {
+                return Err(WaktermCliError::InvalidEventPage(
+                    "cursor gap has an unknown recovery kind",
+                ));
+            }
+            Ok(EventRead::CursorTooOld {
+                requested_after_sequence: after_sequence,
+                oldest_available_sequence: page.oldest_available_sequence,
+                latest_sequence: page.latest_sequence,
+                catalog_as_of_sequence: recovery.catalog_as_of_sequence,
+            })
+        }
+        "ok" => {
+            validate_live_events(after_sequence, page.latest_sequence, &page.events)?;
+            let expected_next = page
+                .events
+                .last()
+                .map_or(after_sequence, |event| event.sequence);
+            if page.next_after_sequence != Some(expected_next) {
+                return Err(WaktermCliError::InvalidEventPage(
+                    "next cursor does not equal the last returned event sequence",
+                ));
+            }
+            if expected_next < page.latest_sequence && page.events.is_empty() {
+                return Err(WaktermCliError::InvalidEventPage(
+                    "an empty page did not reach the advertised stream head",
+                ));
+            }
+            Ok(EventRead::Events {
+                events: page.events,
+                next_after_sequence: expected_next,
+                latest_sequence: page.latest_sequence,
+            })
+        }
+        _ => Err(WaktermCliError::InvalidEventPage(
+            "event page status or payload is invalid",
+        )),
     }
 }
 

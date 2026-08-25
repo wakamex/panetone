@@ -23,7 +23,7 @@ Keep:
 
 Change, in order:
 
-1. Stop the measured idle Wakterm subprocess storm.
+1. Deploy the persistent Wakterm event reader now implemented in source.
 2. Make unexpected worker death restart the daemon.
 3. Restore durable outbound message chunking lost in the Rust rewrite.
 4. Keep `--return-final` through a real end-to-end test, but stop paying its
@@ -129,7 +129,13 @@ Apply the smallest fixes first:
   feature.
 - After collapsing route lookup to one command, keep the one-second retry if it
   is cheap; add backoff only if measurement still justifies it.
-- Measure again before adding a persistent client or shared cache.
+
+The event path now runs `wakterm agent events --follow` and retains that child
+across event passes. A controlled 20-poll comparison reduced Wakterm launches
+and mux connections from 20 to 1. Client CPU fell from 3.36 seconds to 0.59
+seconds even though follow mode returned 22 pages in the comparison window.
+Catalog, admission, and terminal commands remain one-shot because they are
+demand-driven after the earlier polling reductions.
 
 The cleaner Wakterm boundary is one catalog response containing each agent's
 server-computed effective title, window, tab, and pane. Panetone could replace
