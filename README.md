@@ -14,8 +14,9 @@ than a rollback target.
 
 - Observe agent lifecycle and output through Wakterm Agent API v1.
 - Deliver output to Telegram and Signal.
-- Establish and inspect fresh title-to-Telegram routes through the supported
-  control API.
+- Create a durable route and Telegram topic when a live Wakterm agent title is
+  first discovered, including agents started manually in a shell.
+- Establish or inspect routes synchronously through the supported control API.
 - Expose whether exact Wakterm assistant output was durably projected or left
   unrouted.
 - Resolve routes from Wakterm's current effective tab titles.
@@ -112,7 +113,9 @@ target/release/panetone status \
   --socket /run/user/1000/panetone/control.sock
 ```
 
-Ensure a fresh live workspace has a durable route and Telegram topic:
+Manual Wakterm agents are discovered automatically from their effective title.
+Use `route ensure` when a launcher needs synchronous confirmation that the
+route exists before it sends a bootstrap prompt:
 
 ```sh
 target/release/panetone route ensure infobase \

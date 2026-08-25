@@ -87,12 +87,15 @@ impl ProductionService {
                     next_after_sequence,
                     latest_sequence,
                 } => {
-                    let route_agents = if events
-                        .iter()
-                        .any(|event| matches!(event.kind.as_str(), "assistant_message" | "plan"))
-                    {
-                        let routes = self.store.list_routes().await.map_err(error_string)?;
+                    let route_agents = if events.iter().any(|event| {
+                        matches!(
+                            event.kind.as_str(),
+                            "agent_lifecycle" | "assistant_message" | "plan"
+                        )
+                    }) {
                         let live = self.wakterm.live_routes().await.map_err(error_string)?;
+                        self.reconcile_live_routes(&live).await?;
+                        let routes = self.store.list_routes().await.map_err(error_string)?;
                         project_live_routes(&routes, &live)?
                     } else {
                         Vec::new()
@@ -151,6 +154,68 @@ impl ProductionService {
                 }
             }
         }
+    }
+
+    pub async fn reconcile_live_routes(&self, live: &LiveRouteSnapshot) -> Result<usize, String> {
+        if self.channels.telegram.is_none() {
+            return Ok(0);
+        }
+        let _change = self.route_changes.lock().await;
+        let mut routes = self.store.list_routes().await.map_err(error_string)?;
+        let mut created = 0;
+        for live_route in live.routes() {
+            if live_route.agents.is_empty() {
+                continue;
+            }
+            if !valid_route_title(&live_route.title) {
+                tracing::warn!(
+                    title = %live_route.title,
+                    "live Wakterm title cannot be used as a Panetone route"
+                );
+                continue;
+            }
+            if live
+                .routes()
+                .iter()
+                .filter(|candidate| candidate.title.eq_ignore_ascii_case(&live_route.title))
+                .count()
+                != 1
+            {
+                tracing::warn!(
+                    title = %live_route.title,
+                    "duplicate live Wakterm title cannot be routed automatically"
+                );
+                continue;
+            }
+            match exact_route(&routes, &live_route.title) {
+                Ok(_) => continue,
+                Err("not_found") => {}
+                Err(detail) => {
+                    return Err(format!(
+                        "cannot reconcile live Wakterm route {:?}: {detail}",
+                        live_route.title
+                    ));
+                }
+            }
+            let topic_id = self
+                .channels
+                .create_telegram_topic(&live_route.title)
+                .await
+                .map_err(error_string)?;
+            let route = telegram_route(live_route.title.clone(), topic_id);
+            self.store
+                .save_route(route.clone(), now_ms())
+                .await
+                .map_err(error_string)?;
+            tracing::info!(
+                title = %route.title,
+                topic_id,
+                "created route for live Wakterm agent"
+            );
+            routes.push(route);
+            created += 1;
+        }
+        Ok(created)
     }
 
     pub async fn outbox_once(&self) -> Result<usize, String> {
@@ -549,9 +614,7 @@ impl ProductionService {
     }
 
     async fn handle_route_ensure(&self, id: Uuid, params: RouteEnsureParams) -> ControlResponse {
-        if params.title.is_empty()
-            || params.title.trim() != params.title
-            || params.title.chars().count() > 128
+        if !valid_route_title(&params.title)
             || params
                 .telegram_topic_id
                 .is_some_and(|topic_id| topic_id <= 0)
@@ -631,12 +694,7 @@ impl ProductionService {
                         }
                     },
                 };
-                let route = Route {
-                    id: RouteId::random(),
-                    title: params.title,
-                    channels: vec![ChannelBinding::Telegram { topic_id }],
-                    agent: None,
-                };
+                let route = telegram_route(params.title, topic_id);
                 if let Err(error) = self.store.save_route(route.clone(), now_ms()).await {
                     return internal(id, error);
                 }
@@ -874,6 +932,19 @@ fn exact_route<'a>(routes: &'a [Route], name: &str) -> Result<&'a Route, &'stati
         [] => Err("not_found"),
         [route] => Ok(route),
         _ => Err("ambiguous"),
+    }
+}
+
+fn valid_route_title(title: &str) -> bool {
+    !title.is_empty() && title.trim() == title && title.chars().count() <= 128
+}
+
+fn telegram_route(title: String, topic_id: i64) -> Route {
+    Route {
+        id: RouteId::random(),
+        title,
+        channels: vec![ChannelBinding::Telegram { topic_id }],
+        agent: None,
     }
 }
 

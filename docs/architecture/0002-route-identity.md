@@ -46,3 +46,8 @@ when Wakterm currently exposes exactly one matching effective title. It creates
 or accepts a Telegram topic binding, persists only the stable route data, and
 returns the current live agents plus Panetone's event-cursor baseline. Repeating
 the method inspects the same binding without creating another topic.
+
+Panetone also establishes missing Telegram routes automatically for unique live
+agent titles at startup and on Wakterm lifecycle or visible-output events. This
+restores manual shell launches without the Python bridge's periodic full
+catalog scan. `route.ensure` remains the synchronous launcher handshake.

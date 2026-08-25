@@ -281,6 +281,11 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
         capabilities.capabilities.iter().cloned().collect(),
         args.socket.clone(),
     ));
+    let created_routes = handler
+        .reconcile_live_routes(&live_routes)
+        .await
+        .map_err(|error| anyhow::anyhow!("reconcile live Wakterm routes: {error}"))?;
+    tracing::info!(created_routes, "live Wakterm routes are reconciled");
 
     let control_shutdown = supervisor.shutdown_receiver();
     let control_handler = handler.clone();

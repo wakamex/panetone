@@ -161,9 +161,17 @@ if [[ "$operation" == *"--version"* ]]; then
 elif [[ "$operation" == *"agent capabilities"* ]]; then
   echo '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
 elif [[ "$operation" == *"agent catalog"* ]]; then
-  echo '{{"schema":"wakterm.agent-api.v1","as_of_event_sequence":500,"agents":[{{"agent_id":"agent-infobase","incarnation_id":"inc-infobase","pane_id":14,"name":"infobase","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-23T00:00:00Z"}},{{"agent_id":"agent-other","incarnation_id":"inc-other","pane_id":15,"name":"other","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-23T00:00:00Z"}}]}}'
+  if [[ -e '{}' ]]; then
+    echo '{{"schema":"wakterm.agent-api.v1","as_of_event_sequence":500,"agents":[{{"agent_id":"agent-infobase","incarnation_id":"inc-infobase","pane_id":14,"name":"infobase","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-23T00:00:00Z"}},{{"agent_id":"agent-other","incarnation_id":"inc-other","pane_id":15,"name":"other","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-23T00:00:00Z"}}]}}'
+  else
+    echo '{{"schema":"wakterm.agent-api.v1","as_of_event_sequence":500,"agents":[{{"agent_id":"agent-infobase","incarnation_id":"inc-infobase","pane_id":14,"name":"infobase","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-23T00:00:00Z"}}]}}'
+  fi
 elif [[ "$operation" == *"list --format json"* ]]; then
-  echo '[{{"pane_id":14,"tab_id":14,"window_id":1,"effective_title":"infobase"}},{{"pane_id":15,"tab_id":15,"window_id":1,"effective_title":"other"}}]'
+  if [[ -e '{}' ]]; then
+    echo '[{{"pane_id":14,"tab_id":14,"window_id":1,"effective_title":"infobase"}},{{"pane_id":15,"tab_id":15,"window_id":1,"effective_title":"other"}}]'
+  else
+    echo '[{{"pane_id":14,"tab_id":14,"window_id":1,"effective_title":"infobase"}}]'
+  fi
 elif [[ "$operation" == *"agent events"* ]]; then
   after=500
   previous=""
@@ -172,9 +180,9 @@ elif [[ "$operation" == *"agent events"* ]]; then
     previous="$argument"
   done
   if [[ -e '{}' && "$after" -eq 500 ]]; then
-    echo '{{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":500,"oldest_available_sequence":1,"latest_sequence":502,"next_after_sequence":502,"events":[{{"sequence":501,"event_id":"bootstrap-ready","kind":"assistant_message","agent_id":"agent-infobase","incarnation_id":"inc-infobase","turn_id":"turn-bootstrap","text":"READY"}},{{"sequence":502,"event_id":"other-output","kind":"assistant_message","agent_id":"agent-other","incarnation_id":"inc-other","turn_id":"turn-other","text":"OTHER"}}]}}'
+    echo '{{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":500,"oldest_available_sequence":1,"latest_sequence":503,"next_after_sequence":503,"events":[{{"sequence":501,"event_id":"bootstrap-ready","kind":"assistant_message","agent_id":"agent-infobase","incarnation_id":"inc-infobase","turn_id":"turn-bootstrap","text":"READY"}},{{"sequence":502,"event_id":"other-available","kind":"agent_lifecycle","agent_id":"agent-other","incarnation_id":"inc-other","lifecycle":"available"}},{{"sequence":503,"event_id":"other-output","kind":"assistant_message","agent_id":"agent-other","incarnation_id":"inc-other","turn_id":"turn-other","text":"OTHER"}}]}}'
   elif [[ -e '{}' ]]; then
-    printf '{{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":%s,"oldest_available_sequence":1,"latest_sequence":502,"next_after_sequence":%s,"events":[]}}\n' "$after" "$after"
+    printf '{{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":%s,"oldest_available_sequence":1,"latest_sequence":503,"next_after_sequence":%s,"events":[]}}\n' "$after" "$after"
   else
     printf '{{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":%s,"oldest_available_sequence":1,"latest_sequence":500,"next_after_sequence":%s,"events":[]}}\n' "$after" "$after"
   fi
@@ -185,6 +193,8 @@ else
   exit 93
 fi
 "#,
+            ready.display(),
+            ready.display(),
             ready.display(),
             ready.display()
         ),
@@ -459,8 +469,8 @@ async fn launcher_can_ensure_a_route_and_wait_for_exact_durable_output() {
         String::from_utf8_lossy(&ensured.stderr)
     );
     let ensured: Value = serde_json::from_slice(&ensured.stdout).unwrap();
-    assert_eq!(ensured["result"]["created"], true);
-    assert_eq!(ensured["result"]["binding_created"], true);
+    assert_eq!(ensured["result"]["created"], false);
+    assert_eq!(ensured["result"]["binding_created"], false);
     assert_eq!(ensured["result"]["event_cursor"], 500);
     assert_eq!(ensured["result"]["route"]["title"], "infobase");
     assert_eq!(ensured["result"]["route"]["channels"][0]["topic_id"], 777);
@@ -483,7 +493,9 @@ async fn launcher_can_ensure_a_route_and_wait_for_exact_durable_output() {
     let ensured_again: Value = serde_json::from_slice(&ensured_again.stdout).unwrap();
     assert_eq!(ensured_again["result"]["created"], false);
     assert_eq!(ensured_again["result"]["binding_created"], false);
-    assert_eq!(telegram.created_topics().len(), 1);
+    let created_topics = telegram.created_topics();
+    assert_eq!(created_topics.len(), 1);
+    assert_eq!(created_topics[0]["name"], "infobase");
 
     fs::write(&ready, b"ready").unwrap();
     let projected = cli(
@@ -518,8 +530,16 @@ async fn launcher_can_ensure_a_route_and_wait_for_exact_durable_output() {
     assert_eq!(projected["result"]["event"]["event_id"], "bootstrap-ready");
     assert_eq!(projected["result"]["event"]["text"], "READY");
     assert_eq!(projected["result"]["actual_route"]["title"], "infobase");
+    let created_topics = telegram.created_topics();
+    assert_eq!(created_topics.len(), 2);
+    assert!(created_topics.iter().any(|topic| topic["name"] == "other"));
+    assert!(
+        cli(&daemon.socket, &["route", "inspect", "other"])
+            .status
+            .success()
+    );
 
-    let unrouted = cli(
+    let misrouted = cli(
         &daemon.socket,
         &[
             "output",
@@ -540,10 +560,11 @@ async fn launcher_can_ensure_a_route_and_wait_for_exact_durable_output() {
             "20",
         ],
     );
-    assert!(!unrouted.status.success());
-    let unrouted: Value = serde_json::from_slice(&unrouted.stdout).unwrap();
-    assert_eq!(unrouted["result"]["disposition"], "unrouted");
-    assert_eq!(unrouted["result"]["event"]["event_id"], "other-output");
+    assert!(!misrouted.status.success());
+    let misrouted: Value = serde_json::from_slice(&misrouted.stdout).unwrap();
+    assert_eq!(misrouted["result"]["disposition"], "misrouted");
+    assert_eq!(misrouted["result"]["event"]["event_id"], "other-output");
+    assert_eq!(misrouted["result"]["actual_route"]["title"], "other");
 
     daemon.stop();
 }
