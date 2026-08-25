@@ -534,9 +534,10 @@ async fn signal_loop(
             }
             message = subscriber.next() => {
                 let message = message.map_err(|error| error.to_string())?;
-                if message.sender_id.as_deref() == Some(owner.as_str()) {
-                    ingestor.persist(message, wall_now_ms()).await.map_err(|error| error.to_string())?;
-                }
+                ingestor
+                    .persist_signal(message, &owner, wall_now_ms())
+                    .await
+                    .map_err(|error| error.to_string())?;
             }
         }
     }

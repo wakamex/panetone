@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 use crate::channels::{ChannelDeliveryError, InboundBatch, InboundMessage, SignalSubscriber};
+use crate::domain::ChannelBinding;
 use crate::store::{InboxItem, StoreError, StoreHandle};
 
 #[derive(Debug, Error)]
@@ -57,12 +58,50 @@ impl InboundIngestor {
         Ok(inserted)
     }
 
+    pub async fn persist_signal(
+        &self,
+        mut message: InboundMessage,
+        owner: &str,
+        now_ms: i64,
+    ) -> Result<bool, InboundIngestError> {
+        let routes = self.store.list_routes().await?;
+        let matching = routes
+            .iter()
+            .filter(|route| {
+                route.channels.iter().any(|binding| match binding {
+                    ChannelBinding::Signal { group_id } => {
+                        group_id.trim_end_matches('=') == message.destination.trim_end_matches('=')
+                    }
+                    ChannelBinding::Telegram { .. } => false,
+                })
+            })
+            .collect::<Vec<_>>();
+        let [route] = matching.as_slice() else {
+            return Ok(false);
+        };
+        let is_debate = route.title.eq_ignore_ascii_case("debate");
+        if message.sender_id.as_deref() != Some(owner) && !is_debate {
+            return Ok(false);
+        }
+        if is_debate {
+            let sender = message
+                .sender
+                .as_deref()
+                .and_then(|name| name.split_whitespace().next())
+                .filter(|name| !name.is_empty())
+                .unwrap_or("Unknown");
+            message.body = format!("{sender} says: {}", message.body);
+        }
+        self.persist(message, now_ms).await
+    }
+
     pub async fn ingest_signal_once(
         &self,
         subscriber: &mut SignalSubscriber,
+        owner: &str,
         now_ms: i64,
     ) -> Result<bool, InboundIngestError> {
         let message = subscriber.next().await?;
-        self.persist(message, now_ms).await
+        self.persist_signal(message, owner, now_ms).await
     }
 }

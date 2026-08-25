@@ -85,17 +85,22 @@ WAK_SIG_ACCOUNT=+15550000000
 WAK_SIG_OWNER=+15551111111
 ```
 
-After authorization and routing, Panetone sends the message body unchanged. An
-idle agent receives a normal admitted prompt. A busy agent receives immediate
-active-turn steering after Wakterm definitively confirms that admission did not
-write the prompt. Channel, topic, sender, update, and reply metadata remain
-internal and do not alter what the harness sees. Local `panetone send` retains
-its separate queue-until-idle behavior. Signal attachments are downloaded by
-signal-cli; Panetone appends their absolute local paths to the message so the
-harness can inspect them. Telegram documents up to 20 MB are downloaded into
-an `attachments/telegram` directory beside the database before the update
-cursor advances, and their absolute paths are appended the same way.
-Attachment-only Signal and Telegram messages are supported.
+After authorization and routing, Panetone sends the message body unchanged
+except for Debate's sender label and attachment paths. An idle agent receives a
+normal admitted prompt. A busy agent receives immediate active-turn steering
+after Wakterm definitively confirms that admission did not write the prompt.
+Channel, topic, update, and reply metadata remain internal and do not alter what
+the harness sees. Local `panetone send` retains its separate queue-until-idle
+behavior. Signal attachments are downloaded by signal-cli; Panetone appends
+their absolute local paths to the message so the harness can inspect them.
+Telegram documents up to 20 MB are downloaded into an `attachments/telegram`
+directory beside the database before the update cursor advances, and their
+absolute paths are appended the same way. Attachment-only Signal and Telegram
+messages are supported.
+
+Signal routes are owner-only except for the route titled `debate`. Every member
+of that Signal group is accepted, and the harness receives the minimal sender
+context `<first name> says: <message>`. Unknown groups remain ignored.
 
 ## Commands
 

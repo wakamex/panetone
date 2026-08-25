@@ -1,11 +1,13 @@
 use std::time::Duration;
 
-use panetone::channels::{SignalSubscriber, TelegramPoller};
+use panetone::channels::{InboundMessage, SignalSubscriber, TelegramPoller};
+use panetone::domain::{ChannelBinding, ChannelKind, Route, RouteId};
 use panetone::service::InboundIngestor;
 use panetone::store::StoreHandle;
 use tempfile::tempdir;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener};
+use uuid::Uuid;
 
 async fn telegram_server(
     response_body: &str,
@@ -362,10 +364,24 @@ async fn signal_notifications_are_normalized_and_deduplicated_durably() {
             .await
             .unwrap();
     let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    store
+        .save_route(
+            Route {
+                id: RouteId::new(Uuid::new_v4()),
+                title: "private".into(),
+                channels: vec![ChannelBinding::Signal {
+                    group_id: "group-one".into(),
+                }],
+                agent: None,
+            },
+            1,
+        )
+        .await
+        .unwrap();
     let ingestor = InboundIngestor::new(store.clone());
     assert!(
         ingestor
-            .ingest_signal_once(&mut subscriber, 300)
+            .ingest_signal_once(&mut subscriber, "+15551111", 300)
             .await
             .unwrap()
     );
@@ -378,6 +394,98 @@ async fn signal_notifications_are_normalized_and_deduplicated_durably() {
             .starts_with("signal hello\n[attached image/jpeg: ")
     );
     assert!(item.body.ends_with("/signal-cli/attachments/photo.jpg]"));
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn signal_debate_accepts_group_members_and_adds_first_name_only() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    store
+        .save_route(
+            Route {
+                id: RouteId::new(Uuid::new_v4()),
+                title: "debate".into(),
+                channels: vec![ChannelBinding::Signal {
+                    group_id: "debate-group==".into(),
+                }],
+                agent: None,
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    store
+        .save_route(
+            Route {
+                id: RouteId::new(Uuid::new_v4()),
+                title: "private".into(),
+                channels: vec![ChannelBinding::Signal {
+                    group_id: "private-group".into(),
+                }],
+                agent: None,
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    let ingestor = InboundIngestor::new(store.clone());
+    let message =
+        |external_id: &str, destination: &str, sender_id: &str, sender: &str| InboundMessage {
+            channel: ChannelKind::Signal,
+            external_id: external_id.into(),
+            destination: destination.into(),
+            sender_id: Some(sender_id.into()),
+            sender: Some(sender.into()),
+            reply_to_external_id: None,
+            body: "hello".into(),
+        };
+
+    assert!(
+        ingestor
+            .persist_signal(
+                message("friend-debate", "debate-group", "friend", "Andrew RM"),
+                "owner",
+                10,
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        !ingestor
+            .persist_signal(
+                message("friend-private", "private-group", "friend", "Andrew RM"),
+                "owner",
+                11,
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        ingestor
+            .persist_signal(
+                message("owner-private", "private-group", "owner", "Mihai Cosma"),
+                "owner",
+                12,
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        !ingestor
+            .persist_signal(
+                message("friend-unknown", "unknown-group", "friend", "Andrew RM"),
+                "owner",
+                13,
+            )
+            .await
+            .unwrap()
+    );
+
+    let pending = store.pending_inbox().await.unwrap();
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0].body, "Andrew says: hello");
+    assert_eq!(pending[1].body, "hello");
     store.shutdown().await.unwrap();
 }
 
