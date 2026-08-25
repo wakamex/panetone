@@ -218,6 +218,36 @@ fi
 }
 
 #[tokio::test]
+async fn incomplete_agent_incarnation_does_not_block_other_live_routes() {
+    let (_directory, binary) = fake_cli(
+        r#"
+operation="$*"
+if [[ "$operation" == *"agent capabilities"* ]]; then
+  printf '%s\n' '{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1"]}'
+elif [[ "$operation" == *"agent catalog"* ]]; then
+  printf '%s\n' '{"schema":"wakterm.agent-api.v1","as_of_event_sequence":12,"agents":[{"agent_id":"agent-starting","incarnation_id":null,"pane_id":4,"name":"starting","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"},{"agent_id":"agent-ready","incarnation_id":"inc-ready","pane_id":9,"name":"ready","harness":"claude","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"}]}'
+elif [[ "$operation" == *"list --format json"* ]]; then
+  printf '%s\n' '[{"pane_id":4,"tab_id":3,"window_id":1,"effective_title":"starting"},{"pane_id":9,"tab_id":4,"window_id":1,"effective_title":"ready"}]'
+else
+  exit 9
+fi
+"#,
+    );
+    let cli = WaktermCli::new(binary, "/tmp/non-production.sock", Duration::from_secs(2));
+
+    let live = cli.live_routes().await.unwrap();
+    assert_eq!(live.routes().len(), 2);
+    assert!(matches!(
+        live.resolve("starting", None),
+        Err(WaktermCliError::RouteUnavailable(_))
+    ));
+    assert_eq!(
+        live.resolve("ready", None).unwrap().incarnation_id,
+        "inc-ready"
+    );
+}
+
+#[tokio::test]
 async fn real_cli_boundary_preserves_structured_observer_failure() {
     let (_directory, binary) = fake_cli(
         r#"

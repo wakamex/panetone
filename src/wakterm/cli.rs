@@ -328,7 +328,11 @@ impl WaktermCli {
                     agents.push(binding);
                 }
                 Ok(_) => {}
-                Err(ContractError::MissingPane(_)) => {}
+                Err(
+                    ContractError::MissingPane(_)
+                    | ContractError::MissingIncarnation(_)
+                    | ContractError::UnstableCatalog,
+                ) => {}
                 Err(error) => return Err(error.into()),
             }
         }
