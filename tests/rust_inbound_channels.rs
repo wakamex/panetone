@@ -61,22 +61,23 @@ async fn telegram_server_response(
     (format!("http://{address}"), task)
 }
 
-async fn telegram_document_server(
+async fn telegram_attachment_server(
     update_response: String,
-    document: Vec<u8>,
+    remote_path: &str,
+    attachment: Vec<u8>,
 ) -> (String, tokio::task::JoinHandle<Vec<(String, Vec<u8>)>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let file_response = serde_json::json!({
         "ok": true,
-        "result": {"file_path": "documents/remote.md"}
+        "result": {"file_path": remote_path}
     })
     .to_string();
     let task = tokio::spawn(async move {
         let responses = [
             update_response.into_bytes(),
             file_response.into_bytes(),
-            document,
+            attachment,
         ];
         let mut requests = Vec::new();
         for response_body in responses {
@@ -281,7 +282,8 @@ async fn telegram_document_is_downloaded_before_the_update_is_returned() {
     })
     .to_string();
     let contents = b"# Durable plan\n".to_vec();
-    let (base, requests) = telegram_document_server(response, contents.clone()).await;
+    let (base, requests) =
+        telegram_attachment_server(response, "documents/remote.md", contents.clone()).await;
     let directory = tempdir().unwrap();
     let attachment_directory = directory.path().join("attachments");
     let poller = TelegramPoller::telegram(
@@ -314,6 +316,76 @@ async fn telegram_document_is_downloaded_before_the_update_is_returned() {
         requests[2]
             .0
             .contains("/file/botfake-token/documents/remote.md ")
+    );
+}
+
+#[tokio::test]
+async fn telegram_photo_uses_the_largest_available_size() {
+    let response = serde_json::json!({
+        "ok": true,
+        "result": [{
+            "update_id": 200,
+            "message": {
+                "chat": {"id": -1001},
+                "message_thread_id": 77,
+                "from": {"id": 42, "first_name": "Alice"},
+                "caption": "compare this",
+                "photo": [
+                    {
+                        "file_id": "small-photo-id",
+                        "file_unique_id": "small-stable-id",
+                        "width": 90,
+                        "height": 90,
+                        "file_size": 2000
+                    },
+                    {
+                        "file_id": "large-photo-id",
+                        "file_unique_id": "large-stable-id",
+                        "width": 1280,
+                        "height": 960,
+                        "file_size": 16000
+                    }
+                ]
+            }
+        }]
+    })
+    .to_string();
+    let contents = b"large jpeg bytes".to_vec();
+    let (base, requests) =
+        telegram_attachment_server(response, "photos/remote.jpg", contents.clone()).await;
+    let directory = tempdir().unwrap();
+    let attachment_directory = directory.path().join("attachments");
+    let poller = TelegramPoller::telegram(
+        &base,
+        "fake-token",
+        -1001,
+        &attachment_directory,
+        Duration::from_secs(2),
+    )
+    .unwrap();
+
+    let batch = poller.poll(200, 0).await.unwrap();
+    assert_eq!(batch.next_offset, 201);
+    assert_eq!(batch.messages.len(), 1);
+    let attachment = attachment_directory.join("200-photo.jpg");
+    assert_eq!(
+        batch.messages[0].body,
+        format!(
+            "compare this\n[attached image/jpeg: {}]",
+            attachment.display()
+        )
+    );
+    assert_eq!(tokio::fs::read(&attachment).await.unwrap(), contents);
+
+    let requests = requests.await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&requests[1].1).unwrap()["file_id"],
+        "large-photo-id"
+    );
+    assert!(
+        requests[2]
+            .0
+            .contains("/file/botfake-token/photos/remote.jpg ")
     );
 }
 

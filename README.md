@@ -94,9 +94,10 @@ the harness sees. Local `panetone send` retains its separate queue-until-idle
 behavior. Signal attachments are downloaded by signal-cli; Panetone appends
 their absolute local paths to the message so the harness can inspect them.
 Telegram documents up to 20 MB are downloaded into an `attachments/telegram`
-directory beside the database before the update cursor advances, and their
-absolute paths are appended the same way. Attachment-only Signal and Telegram
-messages are supported.
+directory beside the database before the update cursor advances. Telegram
+photos use the largest available image size and the same durable download path.
+Their absolute paths are appended to the message. Attachment-only Signal and
+Telegram messages are supported.
 
 Signal routes are owner-only except for the route titled `debate`. Every member
 of that Signal group is accepted, and the harness receives the minimal sender

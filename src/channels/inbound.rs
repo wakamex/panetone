@@ -161,7 +161,36 @@ impl TelegramPoller {
                 if !body.is_empty() {
                     body.push('\n');
                 }
-                body.push_str(&self.document_line(update.update_id, document).await?);
+                body.push_str(
+                    &self
+                        .attachment_line(
+                            update.update_id,
+                            &document.file_id,
+                            document.file_name.as_deref().unwrap_or("document"),
+                            document
+                                .mime_type
+                                .as_deref()
+                                .unwrap_or("application/octet-stream"),
+                            document.file_size,
+                        )
+                        .await?,
+                );
+            } else if let Some(photo) = message.photo.into_iter().max_by_key(TelegramPhoto::quality)
+            {
+                if !body.is_empty() {
+                    body.push('\n');
+                }
+                body.push_str(
+                    &self
+                        .attachment_line(
+                            update.update_id,
+                            &photo.file_id,
+                            "photo.jpg",
+                            "image/jpeg",
+                            photo.file_size,
+                        )
+                        .await?,
+                );
             }
             if body.is_empty() {
                 continue;
@@ -185,27 +214,26 @@ impl TelegramPoller {
         })
     }
 
-    async fn document_line(
+    async fn attachment_line(
         &self,
         update_id: i64,
-        document: TelegramDocument,
+        file_id: &str,
+        filename: &str,
+        content_type: &str,
+        file_size: Option<u64>,
     ) -> Result<String, ChannelDeliveryError> {
-        let content_type =
-            single_line(document.mime_type.as_deref()).unwrap_or("application/octet-stream");
-        if document
-            .file_size
-            .is_some_and(|size| size > MAX_TELEGRAM_DOCUMENT_BYTES)
-        {
+        let content_type = single_line(Some(content_type)).unwrap_or("application/octet-stream");
+        if file_size.is_some_and(|size| size > MAX_TELEGRAM_DOCUMENT_BYTES) {
             return Ok(format!(
                 "[attached {content_type} unavailable: exceeds Telegram's 20 MB bot download limit]"
             ));
         }
-        let filename = safe_filename(document.file_name.as_deref().unwrap_or("document"));
+        let filename = safe_filename(filename);
         let destination = self
             .attachment_directory
             .join(format!("{update_id}-{filename}"));
         if tokio::fs::metadata(&destination).await.is_err() {
-            self.download_document(&document.file_id, update_id, &destination)
+            self.download_attachment(file_id, update_id, &destination)
                 .await?;
         }
         Ok(format!(
@@ -214,7 +242,7 @@ impl TelegramPoller {
         ))
     }
 
-    async fn download_document(
+    async fn download_attachment(
         &self,
         file_id: &str,
         update_id: i64,
@@ -505,6 +533,8 @@ struct TelegramMessage {
     text: Option<String>,
     caption: Option<String>,
     document: Option<TelegramDocument>,
+    #[serde(default)]
+    photo: Vec<TelegramPhoto>,
 }
 
 #[derive(Deserialize)]
@@ -513,6 +543,23 @@ struct TelegramDocument {
     file_name: Option<String>,
     mime_type: Option<String>,
     file_size: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct TelegramPhoto {
+    file_id: String,
+    width: u64,
+    height: u64,
+    file_size: Option<u64>,
+}
+
+impl TelegramPhoto {
+    fn quality(&self) -> (u64, u64) {
+        (
+            self.width.saturating_mul(self.height),
+            self.file_size.unwrap_or_default(),
+        )
+    }
 }
 
 #[derive(Deserialize)]
