@@ -14,7 +14,7 @@ use super::{ControlRequest, ControlResponse, error_response};
 
 const MAX_REQUEST_BYTES: u64 = 256 * 1024;
 const CONNECTION_LIMIT: usize = 64;
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub trait ControlHandler: Send + Sync + 'static {
     fn handle(
@@ -85,10 +85,7 @@ impl ControlServer {
                     let handler = handler.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let _ = tokio::time::timeout(
-                            CLIENT_TIMEOUT,
-                            serve_connection(stream, handler),
-                        ).await;
+                        let _ = serve_connection(stream, handler, IO_TIMEOUT).await;
                     });
                 }
             }
@@ -147,6 +144,7 @@ async fn prepare_socket_path(path: &Path) -> Result<(), ControlServerError> {
 async fn serve_connection(
     stream: UnixStream,
     handler: Arc<dyn ControlHandler>,
+    io_timeout: Duration,
 ) -> Result<(), std::io::Error> {
     #[cfg(target_os = "linux")]
     if stream.peer_cred()?.uid() != unsafe_free_uid() {
@@ -155,7 +153,9 @@ async fn serve_connection(
     let (read_half, mut write_half) = stream.into_split();
     let mut bytes = Vec::new();
     let mut reader = BufReader::new(read_half).take(MAX_REQUEST_BYTES + 1);
-    reader.read_until(b'\n', &mut bytes).await?;
+    tokio::time::timeout(io_timeout, reader.read_until(b'\n', &mut bytes))
+        .await
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
     let response = if bytes.len() as u64 > MAX_REQUEST_BYTES {
         error_response(
             uuid::Uuid::nil(),
@@ -176,8 +176,12 @@ async fn serve_connection(
     };
     let mut encoded = serde_json::to_vec(&response).map_err(std::io::Error::other)?;
     encoded.push(b'\n');
-    write_half.write_all(&encoded).await?;
-    write_half.shutdown().await
+    tokio::time::timeout(io_timeout, async {
+        write_half.write_all(&encoded).await?;
+        write_half.shutdown().await
+    })
+    .await
+    .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?
 }
 
 #[cfg(target_os = "linux")]
@@ -185,4 +189,51 @@ fn unsafe_free_uid() -> u32 {
     std::fs::metadata("/proc/self")
         .map(|metadata| metadata.uid())
         .unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::{CONTROL_SCHEMA, success_response};
+    use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    struct SlowHandler;
+
+    impl ControlHandler for SlowHandler {
+        fn handle(
+            &self,
+            request: ControlRequest,
+        ) -> Pin<Box<dyn Future<Output = ControlResponse> + Send + '_>> {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                success_response(request.id, json!({"handled": true}))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_runtime_is_not_limited_by_socket_io_timeout() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(serve_connection(
+            server,
+            Arc::new(SlowHandler),
+            Duration::from_millis(5),
+        ));
+        let request = ControlRequest {
+            schema: CONTROL_SCHEMA.into(),
+            id: uuid::Uuid::new_v4(),
+            method: "slow".into(),
+            params: json!({}),
+        };
+        let mut encoded = serde_json::to_vec(&request).unwrap();
+        encoded.push(b'\n');
+        client.write_all(&encoded).await.unwrap();
+
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).await.unwrap();
+        let response: ControlResponse = serde_json::from_str(&line).unwrap();
+        assert_eq!(response.result, Some(json!({"handled": true})));
+        task.await.unwrap().unwrap();
+    }
 }
