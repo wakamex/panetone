@@ -13,7 +13,7 @@ use crate::control::{
 };
 use crate::domain::{
     AdmissionStatus, AgentBinding, ChannelBinding, ChannelKind, OutboxState, Route, RouteId,
-    WorkflowId,
+    WorkflowId, WorkflowState,
 };
 use crate::store::{EventCursorGap, InboxItem, RouteAgent, StoreHandle};
 use crate::supervisor::SupervisorHandle;
@@ -288,7 +288,11 @@ impl ProductionService {
                 .retry_busy_target(workflow.command.id, &live_route, now_ms())
                 .await
             {
-                Ok(_) | Err(ServiceError::RouteUnavailable(_)) => {}
+                Ok(_)
+                | Err(ServiceError::RouteUnavailable(_))
+                | Err(ServiceError::AdmissionFailed(
+                    WorkflowState::Failed | WorkflowState::Indeterminate,
+                )) => {}
                 Err(error) => return Err(error.to_string()),
             }
         }
@@ -1064,8 +1068,18 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::domain::{ChannelBinding, EffectId, RouteId};
+    use crate::channels::RecordingChannels;
+    use crate::domain::{ChannelBinding, EffectId, RouteId, SendCommand};
     use crate::store::InboxItem;
+    use crate::wakterm::{FakeWakterm, ProfileKind, WaktermContract};
+
+    fn current_contract() -> WaktermContract {
+        WaktermContract::from_golden_json(
+            &fs::read_to_string("/code/wakterm/docs/agent-api/v1/golden-fixtures.json").unwrap(),
+            ProfileKind::Current,
+        )
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn event_worker_drains_every_page_to_the_advertised_head() {
@@ -1166,6 +1180,143 @@ fi
         assert_eq!(service.terminal_once().await.unwrap(), 0);
         assert!(!log.exists());
         drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn definitive_busy_target_failure_does_not_stop_the_batch() {
+        let directory = tempdir().unwrap();
+        let binary = directory.path().join("wakterm-fake");
+        fs::write(
+            &binary,
+            r#"#!/bin/bash
+set -euo pipefail
+operation="$*"
+if [[ "$operation" == *"agent capabilities"* ]]; then
+  printf '%s\n' '{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}'
+elif [[ "$operation" == *"agent catalog"* ]]; then
+  printf '%s\n' '{"schema":"wakterm.agent-api.v1","as_of_event_sequence":10,"agents":[{"agent_id":"agent-failure","incarnation_id":"inc-failure","pane_id":11,"name":"failure","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-27T00:00:00Z"},{"agent_id":"agent-success","incarnation_id":"inc-success","pane_id":12,"name":"success","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-27T00:00:00Z"}]}'
+elif [[ "$operation" == *"list --format json"* ]]; then
+  printf '%s\n' '[{"pane_id":11,"tab_id":11,"window_id":1,"effective_title":"failure"},{"pane_id":12,"tab_id":12,"window_id":1,"effective_title":"success"}]'
+else
+  echo "unexpected fake invocation: $operation" >&2
+  exit 9
+fi
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let source = Route {
+            id: RouteId::new(Uuid::from_u128(900)),
+            title: "source".into(),
+            channels: vec![ChannelBinding::Signal {
+                group_id: "source-group".into(),
+            }],
+            agent: Some(AgentBinding {
+                agent_id: "agent-source".into(),
+                incarnation_id: "inc-source".into(),
+                harness: "codex".into(),
+                pane_id: Some(1),
+            }),
+        };
+        let target = |id: u128, title: &str, pane_id: u64| Route {
+            id: RouteId::new(Uuid::from_u128(id)),
+            title: title.into(),
+            channels: vec![ChannelBinding::Telegram {
+                topic_id: pane_id as i64,
+            }],
+            agent: Some(AgentBinding {
+                agent_id: format!("agent-{title}"),
+                incarnation_id: format!("inc-{title}"),
+                harness: "codex".into(),
+                pane_id: Some(pane_id),
+            }),
+        };
+        let failed_target = target(901, "failure", 11);
+        let submitted_target = target(902, "success", 12);
+        let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        store.save_route(failed_target.clone(), 1).await.unwrap();
+        store.save_route(submitted_target.clone(), 1).await.unwrap();
+        let workflows = Arc::new(OfflineService::new(
+            store.clone(),
+            FakeWakterm::new(current_contract()),
+            RecordingChannels::default(),
+        ));
+        workflows.wakterm().script_receipts([
+            AdmissionStatus::Busy,
+            AdmissionStatus::Busy,
+            AdmissionStatus::ObserverFailure,
+            AdmissionStatus::Accepted,
+        ]);
+        let command = |id, target: &Route| SendCommand {
+            id: WorkflowId::new(Uuid::from_u128(id)),
+            source: source.title.clone(),
+            target: target.title.clone(),
+            message: format!("request {id}"),
+            return_final: false,
+            timeout_ms: 0,
+        };
+        let failed_id = WorkflowId::new(Uuid::from_u128(903));
+        let submitted_id = WorkflowId::new(Uuid::from_u128(904));
+        workflows
+            .submit(command(903, &failed_target), &source, &failed_target, 10)
+            .await
+            .unwrap();
+        workflows
+            .submit(
+                command(904, &submitted_target),
+                &source,
+                &submitted_target,
+                20,
+            )
+            .await
+            .unwrap();
+        let service = ProductionService {
+            store: store.clone(),
+            wakterm: WaktermCli::new(
+                binary,
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            channels: RealChannels::default(),
+            workflows: workflows.clone(),
+            health: SupervisorHandle::default(),
+            capabilities: vec!["event_stream.v1".into()],
+            control_socket: directory.path().join("control.sock"),
+            started_at: Instant::now(),
+            last_agents: tokio::sync::RwLock::new(HashMap::new()),
+            route_changes: tokio::sync::Mutex::new(()),
+        };
+
+        assert_eq!(service.busy_once().await.unwrap(), 2);
+        assert_eq!(
+            store
+                .get_workflow(failed_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .workflow
+                .state,
+            WorkflowState::Failed
+        );
+        assert_eq!(
+            store
+                .get_workflow(submitted_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .workflow
+                .state,
+            WorkflowState::Completed
+        );
+        let channel_calls = workflows.channels().calls();
+        assert_eq!(channel_calls.len(), 6);
+        assert!(channel_calls[4].body.starts_with("[delivery-failed]"));
+        assert!(channel_calls[5].body.starts_with("[submitted]"));
+        assert_eq!(store.status().await.unwrap().awaiting_target_idle, 0);
+        drop(service);
+        drop(workflows);
         store.shutdown().await.unwrap();
     }
 
