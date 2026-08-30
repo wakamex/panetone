@@ -261,9 +261,9 @@ enum Command {
         sequence: u64,
         reply: oneshot::Sender<StoreResult<u64>>,
     },
-    RebaselinePassiveOutput {
+    RebaselineEventCursor {
         sequence: u64,
-        reply: oneshot::Sender<StoreResult<u64>>,
+        reply: oneshot::Sender<StoreResult<()>>,
     },
     IngestAgentEvents {
         expected: u64,
@@ -506,8 +506,8 @@ impl StoreHandle {
             .await
     }
 
-    pub async fn rebaseline_passive_output(&self, sequence: u64) -> StoreResult<u64> {
-        self.request(|reply| Command::RebaselinePassiveOutput { sequence, reply })
+    pub async fn rebaseline_event_cursor(&self, sequence: u64) -> StoreResult<()> {
+        self.request(|reply| Command::RebaselineEventCursor { sequence, reply })
             .await
     }
 
@@ -681,8 +681,8 @@ fn handle_command(connection: &mut Connection, command: Command) {
         Command::InitializeEventCursor { sequence, reply } => {
             send_reply(reply, initialize_event_cursor(connection, sequence))
         }
-        Command::RebaselinePassiveOutput { sequence, reply } => {
-            send_reply(reply, rebaseline_passive_output(connection, sequence))
+        Command::RebaselineEventCursor { sequence, reply } => {
+            send_reply(reply, rebaseline_event_cursor(connection, sequence))
         }
         Command::IngestAgentEvents {
             expected,
@@ -1639,16 +1639,8 @@ fn pending_outbox(connection: &Connection) -> StoreResult<Vec<OutboxItem>> {
         .collect()
 }
 
-fn rebaseline_passive_output(connection: &mut Connection, sequence: u64) -> StoreResult<u64> {
-    let transaction = connection.transaction()?;
-    let discarded = transaction.execute(
-        "DELETE FROM outbox
-         WHERE request_id IS NULL AND state IN ('pending', 'delivering')",
-        [],
-    )?;
-    set_metadata(&transaction, "wakterm_event_cursor", &sequence.to_string())?;
-    transaction.commit()?;
-    Ok(discarded as u64)
+fn rebaseline_event_cursor(connection: &Connection, sequence: u64) -> StoreResult<()> {
+    set_metadata(connection, "wakterm_event_cursor", &sequence.to_string())
 }
 
 fn find_outbox_agent(

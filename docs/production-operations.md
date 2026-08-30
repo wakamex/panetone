@@ -148,10 +148,7 @@ before the real prompt, not remote delivery confirmation.
 
 ## Offline output and Telegram pacing
 
-Normal startup discards unsent passive agent-output notifications and advances
-the Wakterm event cursor to the current catalog head. It does not discard
-accepted Telegram or Signal input, explicit workflow effects, busy work, or
-pending final returns.
+Normal startup preserves already captured outbox effects and advances the Wakterm event cursor to the current catalog head, skipping only agent output first observed while Panetone was stopped. It also preserves accepted Telegram or Signal input, explicit workflow effects, busy work, and pending final returns.
 
 For a deliberate catch-up start, set
 `PANETONE_REPLAY_OFFLINE_OUTPUT=true` in `/code/panetone/.env`, restart the
@@ -171,6 +168,8 @@ Telegram inbound polling retries timeouts, transport failures, rate limits, and
 upstream 5xx responses in place. Backoff starts at one second, caps at 30
 seconds, and honors a longer Telegram `retry_after`. Other polling errors still
 terminate the critical worker and fail the daemon.
+
+Signal inbound reconnects after subscription timeouts and transport disconnects with the same one-to-30-second bounded backoff. A signal-cli restart therefore does not restart Panetone or interrupt its other workers.
 
 ## Durable failure rules
 

@@ -506,7 +506,7 @@ async fn routes_outbox_inbox_and_metadata_are_durable_and_deduplicated() {
 }
 
 #[tokio::test]
-async fn passive_output_rebaseline_discards_only_unrequested_delivery_work() {
+async fn event_cursor_rebaseline_preserves_captured_delivery_work() {
     let directory = tempdir().unwrap();
     let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
     let passive = OutboxItem {
@@ -527,15 +527,21 @@ async fn passive_output_rebaseline_discards_only_unrequested_delivery_work() {
         body: "explicit workflow delivery".into(),
         ..passive.clone()
     };
-    store.enqueue_outbox(None, passive, 100).await.unwrap();
+    store
+        .enqueue_outbox(None, passive.clone(), 100)
+        .await
+        .unwrap();
     store
         .enqueue_outbox(Some(id(503)), requested.clone(), 100)
         .await
         .unwrap();
     store.initialize_event_cursor(10).await.unwrap();
 
-    assert_eq!(store.rebaseline_passive_output(99).await.unwrap(), 1);
-    assert_eq!(store.pending_outbox().await.unwrap(), vec![requested]);
+    store.rebaseline_event_cursor(99).await.unwrap();
+    assert_eq!(
+        store.pending_outbox().await.unwrap(),
+        vec![passive, requested]
+    );
     assert_eq!(
         store
             .get_metadata("wakterm_event_cursor".into())

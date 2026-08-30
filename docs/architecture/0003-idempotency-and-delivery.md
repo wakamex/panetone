@@ -27,7 +27,7 @@ Delivery policies are:
 | Audit failure annotation | At least once | Retry safely using the audit identity or add a linked failure |
 | Source-agent final callback | At most once | Persist per-destination indeterminate state |
 | Telegram or other final mirror | At least once | Retry durable chunks and tolerate recognizable duplicates |
-| Ordinary agent output | Best effort across daemon restarts | Keep it durable during a run, then skip unsent and offline output at the next normal startup; replay only on an explicit catch-up start |
+| Ordinary agent output | Durable after capture | Retry captured outbox effects across daemon restarts; skip only Wakterm output first observed while Panetone was stopped unless an explicit catch-up start requests replay |
 | Topic or group reconciliation | Idempotent | Recreate or rebind through the durable route |
 
 Every durable destination has its own status, attempts, last error, timestamp, and external receipt where available. One destination cannot overwrite another destination's diagnostic.

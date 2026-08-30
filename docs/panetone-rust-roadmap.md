@@ -48,13 +48,7 @@ Wakterm agent bindings and route status. Schema 6 databases upgrade in place;
 older schema copies are rejected. The cold migration bundle is not a runtime
 input.
 
-Normal production startup rebases the passive Wakterm event cursor to the
-catalog head and discards unsent passive output. A deliberate
-`PANETONE_REPLAY_OFFLINE_OUTPUT=true` start resumes from the stored cursor.
-Accepted channel input and explicit workflow effects remain durable in either
-mode. A missing Telegram update offset initializes from Telegram and existing
-offsets are never overwritten. Routes resolve from Wakterm's current effective
-titles, so ordinary agent restarts need no operator reconciliation.
+Normal production startup rebases the passive Wakterm event cursor to the catalog head while preserving output already captured in the outbox. A deliberate `PANETONE_REPLAY_OFFLINE_OUTPUT=true` start resumes from the stored cursor. Accepted channel input and explicit workflow effects remain durable in either mode. A missing Telegram update offset initializes from Telegram and existing offsets are never overwritten. Routes resolve from Wakterm's current effective titles, so ordinary agent restarts need no operator reconciliation.
 
 The retired Python runtime, Python parity suite, hidden conformance daemon,
 root-owned deployment path, phase reports, and unused store compaction API are

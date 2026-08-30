@@ -70,13 +70,7 @@ WAK_TG_TOKEN_OPENCODE=...
 WAK_TG_OWNER=123456789
 ```
 
-Passive agent output produced while Panetone is stopped is skipped on the next
-startup. Accepted channel input, explicit workflows, and final returns remain
-durable and replay normally. Set `PANETONE_REPLAY_OFFLINE_OUTPUT=true` before a
-deliberate catch-up start. Telegram output is paced per bot token at one message
-every 3.1 seconds and honors longer server `retry_after` responses.
-Telegram polling retries rate limits and temporary transport or upstream errors
-inside the inbound worker, so those failures do not restart Panetone.
+Passive agent output produced while Panetone is stopped is skipped on the next startup. Output already captured in the outbox, accepted channel input, explicit workflows, and final returns remain durable and replay normally. Set `PANETONE_REPLAY_OFFLINE_OUTPUT=true` before a deliberate catch-up start. Telegram output is paced per bot token at one message every 3.1 seconds and honors longer server `retry_after` responses. Telegram polling retries rate limits and temporary transport or upstream errors inside the inbound worker, so those failures do not restart Panetone.
 
 Signal is optional. All three variables are required when it is enabled:
 
@@ -85,6 +79,8 @@ WAK_SIG_SOCKET=/run/signal-cli/socket
 WAK_SIG_ACCOUNT=+15550000000
 WAK_SIG_OWNER=+15551111111
 ```
+
+Signal subscription timeouts and transport disconnects reconnect inside the inbound worker, so a signal-cli restart does not take down Panetone's control, Telegram, or outbound workers.
 
 After authorization and routing, Panetone sends the message body unchanged
 except for Debate's sender label and attachment paths. An idle agent receives a

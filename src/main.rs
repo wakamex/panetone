@@ -227,22 +227,17 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
 
     let (channels, telegram, signal) = production_channels(&args, deadline)?;
     let store = StoreHandle::open(&args.database).context("open production store")?;
-    let (event_cursor, discarded_passive_output) = if args.replay_offline_output {
-        (
-            store
-                .initialize_event_cursor(catalog.as_of_event_sequence)
-                .await
-                .context("initialize Wakterm event cursor")?,
-            0,
-        )
+    let event_cursor = if args.replay_offline_output {
+        store
+            .initialize_event_cursor(catalog.as_of_event_sequence)
+            .await
+            .context("initialize Wakterm event cursor")?
     } else {
-        (
-            catalog.as_of_event_sequence,
-            store
-                .rebaseline_passive_output(catalog.as_of_event_sequence)
-                .await
-                .context("skip offline Wakterm output")?,
-        )
+        store
+            .rebaseline_event_cursor(catalog.as_of_event_sequence)
+            .await
+            .context("skip offline Wakterm output")?;
+        catalog.as_of_event_sequence
     };
     if let Some((poller, _)) = telegram.as_ref()
         && store
@@ -266,7 +261,6 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
     tracing::info!(
         event_cursor,
         replay_offline_output = args.replay_offline_output,
-        discarded_passive_output,
         "durable cursors are initialized"
     );
     let server = ControlServer::bind(&args.socket)
@@ -527,24 +521,89 @@ async fn signal_loop(
     ingestor: InboundIngestor,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
-    let mut subscriber = SignalSubscriber::connect(&socket, &account, Duration::from_secs(35))
-        .await
-        .map_err(|error| error.to_string())?;
+    let mut subscriber = None;
+    let mut consecutive_failures = 0_u32;
     loop {
+        if subscriber.is_none() {
+            match SignalSubscriber::connect(&socket, &account, Duration::from_secs(35)).await {
+                Ok(connected) => {
+                    subscriber = Some(connected);
+                    consecutive_failures = 0;
+                }
+                Err(error) => {
+                    let Some(delay) =
+                        signal_retry_delay(&error, consecutive_failures.saturating_add(1))
+                    else {
+                        return Err(error.to_string());
+                    };
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    tracing::warn!(
+                        error = %error,
+                        retry_after_ms = delay.as_millis(),
+                        "Signal subscription failed; retrying"
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     return Ok(());
                 }
             }
-            message = subscriber.next() => {
-                let message = message.map_err(|error| error.to_string())?;
-                ingestor
-                    .persist_signal(message, &owner, wall_now_ms())
-                    .await
-                    .map_err(|error| error.to_string())?;
+            message = subscriber.as_mut().expect("subscriber was connected").next() => {
+                match message {
+                    Ok(message) => {
+                        consecutive_failures = 0;
+                        ingestor
+                            .persist_signal(message, &owner, wall_now_ms())
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Err(error) => {
+                        let Some(delay) = signal_retry_delay(
+                            &error,
+                            consecutive_failures.saturating_add(1),
+                        ) else {
+                            return Err(error.to_string());
+                        };
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        subscriber = None;
+                        tracing::warn!(
+                            error = %error,
+                            retry_after_ms = delay.as_millis(),
+                            "Signal subscription disconnected; retrying"
+                        );
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            changed = shutdown.changed() => {
+                                if changed.is_err() || *shutdown.borrow() {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
+    }
+}
+
+fn signal_retry_delay(error: &ChannelDeliveryError, consecutive_failures: u32) -> Option<Duration> {
+    let exponent = consecutive_failures.saturating_sub(1).min(5);
+    let backoff = Duration::from_secs((1_u64 << exponent).min(30));
+    match error {
+        ChannelDeliveryError::Timeout(_) | ChannelDeliveryError::Transport(_) => Some(backoff),
+        _ => None,
     }
 }
 
@@ -884,5 +943,31 @@ mod tests {
 
         let malformed = ChannelDeliveryError::Malformed(ChannelKind::Telegram);
         assert_eq!(telegram_poll_retry_delay(&malformed, 1), None);
+    }
+
+    #[test]
+    fn signal_subscription_retries_only_temporary_failures() {
+        let transport = ChannelDeliveryError::Transport(ChannelKind::Signal);
+        assert_eq!(
+            signal_retry_delay(&transport, 1),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            signal_retry_delay(&transport, 6),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            signal_retry_delay(&transport, u32::MAX),
+            Some(Duration::from_secs(30))
+        );
+
+        let timeout = ChannelDeliveryError::Timeout(ChannelKind::Signal);
+        assert_eq!(
+            signal_retry_delay(&timeout, 2),
+            Some(Duration::from_secs(2))
+        );
+
+        let malformed = ChannelDeliveryError::Malformed(ChannelKind::Signal);
+        assert_eq!(signal_retry_delay(&malformed, 1), None);
     }
 }
