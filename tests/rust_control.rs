@@ -11,6 +11,7 @@ use serde_json::json;
 use tempfile::tempdir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::process::Command;
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -156,4 +157,87 @@ async fn runtime_directory_must_not_be_group_or_world_accessible() {
         ControlServer::bind(directory.path().join("control.sock")).await,
         Err(ControlServerError::UnsafeDirectory)
     ));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires the installed Codex sandbox helper"]
+async fn real_codex_workspace_sandbox_can_inspect_but_cannot_send() {
+    let directory = private_directory();
+    let socket = directory.path().join("control.sock");
+    let server = ControlServer::bind(&socket).await.unwrap();
+    let (shutdown, receiver) = watch::channel(false);
+    let task = tokio::spawn(server.run(Arc::new(Echo), receiver));
+    let binary = env!("CARGO_BIN_EXE_panetone");
+    let manifest = env!("CARGO_MANIFEST_DIR");
+
+    let status = Command::new("codex")
+        .args([
+            "sandbox",
+            "-P",
+            "workspace-git",
+            "-C",
+            manifest,
+            "--",
+            binary,
+            "status",
+            "--socket",
+            socket.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "sandboxed status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    let send = Command::new("codex")
+        .args([
+            "sandbox",
+            "-P",
+            "workspace-git",
+            "-C",
+            manifest,
+            "--",
+            binary,
+            "send",
+            "--socket",
+            socket.to_str().unwrap(),
+            "--from",
+            "source",
+            "--to",
+            "target",
+            "test",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        !send.status.success(),
+        "sandboxed send unexpectedly succeeded"
+    );
+    let response: ControlResponse = serde_json::from_slice(&send.stdout).unwrap();
+    assert_eq!(response.error.unwrap().code, "permission_denied");
+
+    let host_send = Command::new(binary)
+        .args([
+            "send",
+            "--socket",
+            socket.to_str().unwrap(),
+            "--from",
+            "source",
+            "--to",
+            "target",
+            "test",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(host_send.status.success());
+
+    shutdown.send(true).unwrap();
+    task.await.unwrap().unwrap();
 }

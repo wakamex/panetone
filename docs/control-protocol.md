@@ -15,10 +15,11 @@ The socket normally lives at:
 $XDG_RUNTIME_DIR/panetone/control.sock
 ```
 
-Its parent is a real mode `0700` directory and the socket is mode `0600`. On
-Linux, the server accepts only the same UID. Startup refuses symlinks, regular
-files, and active sockets. It removes a stale socket only after a failed
-connection probe and an inode recheck.
+Its parent is a real mode `0700` directory and the socket is mode `0600`. On Linux, the server accepts only the same UID and classifies the peer from its Unix credentials, pidfd, and user, mount, PID, and IPC namespaces before parsing the request. A same-UID peer in different namespaces may call the read-only `status`, `route.inspect`, and `output.disposition` methods. `send`, `route.ensure`, and unknown future methods are denied before any workflow, channel, route, or Wakterm side effect. Client-supplied route names and request IDs never establish authority.
+
+The namespace check detects a known Linux sandbox boundary but does not prove that a same-namespace process is unrestricted. Inherited descriptors, proxies, readable credentials, confinement without distinct namespaces, and non-Linux systems require enforcement by the sandbox or credential owner. Sending to a more privileged agent is privilege delegation, so a restricted caller cannot use the host Panetone daemon as an authority broker.
+
+Startup refuses symlinks, regular files, and active sockets. It removes a stale socket only after a failed connection probe and an inode recheck.
 
 ## Envelope
 

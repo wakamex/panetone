@@ -16,6 +16,37 @@ const MAX_REQUEST_BYTES: u64 = 256 * 1024;
 const CONNECTION_LIMIT: usize = 64;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlAuthority {
+    Host,
+    RestrictedLocal { peer_pid: u32 },
+}
+
+impl ControlAuthority {
+    fn permits(self, method: &str) -> bool {
+        match self {
+            Self::Host => true,
+            Self::RestrictedLocal { .. } => {
+                matches!(method, "status" | "route.inspect" | "output.disposition")
+            }
+        }
+    }
+
+    fn denial(self, request: &ControlRequest) -> ControlResponse {
+        let Self::RestrictedLocal { peer_pid } = self else {
+            unreachable!("host authority permits every control request")
+        };
+        error_response(
+            request.id,
+            "permission_denied",
+            format!(
+                "local client PID {peer_pid} is confined by a different OS sandbox; this control method is denied"
+            ),
+            None,
+        )
+    }
+}
+
 pub trait ControlHandler: Send + Sync + 'static {
     fn handle(
         &self,
@@ -146,10 +177,9 @@ async fn serve_connection(
     handler: Arc<dyn ControlHandler>,
     io_timeout: Duration,
 ) -> Result<(), std::io::Error> {
-    #[cfg(target_os = "linux")]
-    if stream.peer_cred()?.uid() != unsafe_free_uid() {
+    let Some(authority) = connection_authority(&stream)? else {
         return Ok(());
-    }
+    };
     let (read_half, mut write_half) = stream.into_split();
     let mut bytes = Vec::new();
     let mut reader = BufReader::new(read_half).take(MAX_REQUEST_BYTES + 1);
@@ -165,7 +195,8 @@ async fn serve_connection(
         )
     } else {
         match serde_json::from_slice::<ControlRequest>(&bytes) {
-            Ok(request) => handler.handle(request).await,
+            Ok(request) if authority.permits(&request.method) => handler.handle(request).await,
+            Ok(request) => authority.denial(&request),
             Err(_) => error_response(
                 uuid::Uuid::nil(),
                 "invalid_request",
@@ -182,6 +213,96 @@ async fn serve_connection(
     })
     .await
     .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NamespaceIdentity {
+    user: (u64, u64),
+    mount: (u64, u64),
+    pid: (u64, u64),
+    ipc: (u64, u64),
+}
+
+#[cfg(target_os = "linux")]
+fn namespace_identity(pid: &str) -> std::io::Result<NamespaceIdentity> {
+    fn identity(path: impl AsRef<Path>) -> std::io::Result<(u64, u64)> {
+        let metadata = std::fs::metadata(path)?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+
+    let root = format!("/proc/{pid}/ns");
+    Ok(NamespaceIdentity {
+        user: identity(format!("{root}/user"))?,
+        mount: identity(format!("{root}/mnt"))?,
+        pid: identity(format!("{root}/pid"))?,
+        ipc: identity(format!("{root}/ipc"))?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_is_alive(pidfd: &std::os::fd::OwnedFd) -> std::io::Result<bool> {
+    use std::os::fd::AsFd;
+
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+
+    let mut pollfds = [PollFd::new(pidfd.as_fd(), PollFlags::POLLIN)];
+    poll(&mut pollfds, PollTimeout::ZERO)
+        .map(|ready| ready == 0)
+        .map_err(|error| std::io::Error::from_raw_os_error(error as i32))
+}
+
+#[cfg(target_os = "linux")]
+fn classify_linux_peer(
+    peer_pid: u32,
+    peer_uid: u32,
+    host_uid: u32,
+    host_namespaces: Option<NamespaceIdentity>,
+    peer_namespaces: Option<NamespaceIdentity>,
+) -> Option<ControlAuthority> {
+    if peer_uid != host_uid {
+        None
+    } else if host_namespaces == peer_namespaces && host_namespaces.is_some() {
+        Some(ControlAuthority::Host)
+    } else {
+        Some(ControlAuthority::RestrictedLocal { peer_pid })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn connection_authority(stream: &UnixStream) -> std::io::Result<Option<ControlAuthority>> {
+    use nix::sys::socket::{getsockopt, sockopt::PeerPidfd};
+
+    let credentials = stream.peer_cred()?;
+    let Some(peer_pid) = credentials.pid().and_then(|pid| u32::try_from(pid).ok()) else {
+        return Ok(Some(ControlAuthority::RestrictedLocal { peer_pid: 0 }));
+    };
+    if credentials.uid() != unsafe_free_uid() {
+        return Ok(None);
+    }
+    let pidfd = match getsockopt(stream, PeerPidfd) {
+        Ok(pidfd) => pidfd,
+        Err(_) => return Ok(Some(ControlAuthority::RestrictedLocal { peer_pid })),
+    };
+    if !pidfd_is_alive(&pidfd).unwrap_or(false) {
+        return Ok(Some(ControlAuthority::RestrictedLocal { peer_pid }));
+    }
+    let peer_namespaces = namespace_identity(&peer_pid.to_string()).ok();
+    if !pidfd_is_alive(&pidfd).unwrap_or(false) {
+        return Ok(Some(ControlAuthority::RestrictedLocal { peer_pid }));
+    }
+    Ok(classify_linux_peer(
+        peer_pid,
+        credentials.uid(),
+        unsafe_free_uid(),
+        namespace_identity("self").ok(),
+        peer_namespaces,
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn connection_authority(_stream: &UnixStream) -> std::io::Result<Option<ControlAuthority>> {
+    Ok(Some(ControlAuthority::Host))
 }
 
 #[cfg(target_os = "linux")]
@@ -235,5 +356,62 @@ mod tests {
         let response: ControlResponse = serde_json::from_str(&line).unwrap();
         assert_eq!(response.result, Some(json!({"handled": true})));
         task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn restricted_local_authority_allows_passive_methods_only() {
+        let authority = ControlAuthority::RestrictedLocal { peer_pid: 42 };
+        for method in ["status", "route.inspect", "output.disposition"] {
+            assert!(authority.permits(method), "{method}");
+        }
+        for method in ["send", "route.ensure", "future.method"] {
+            assert!(!authority.permits(method), "{method}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_peer_requires_same_uid_and_kernel_namespaces() {
+        let host = NamespaceIdentity {
+            user: (1, 1),
+            mount: (1, 2),
+            pid: (1, 3),
+            ipc: (1, 4),
+        };
+        assert_eq!(
+            classify_linux_peer(42, 1000, 1000, Some(host), Some(host)),
+            Some(ControlAuthority::Host)
+        );
+        assert_eq!(
+            classify_linux_peer(42, 1001, 1000, Some(host), Some(host)),
+            None
+        );
+        assert_eq!(
+            classify_linux_peer(
+                43,
+                1000,
+                1000,
+                Some(host),
+                Some(NamespaceIdentity {
+                    mount: (2, 2),
+                    ..host
+                })
+            ),
+            Some(ControlAuthority::RestrictedLocal { peer_pid: 43 })
+        );
+        assert_eq!(
+            classify_linux_peer(44, 1000, 1000, Some(host), None),
+            Some(ControlAuthority::RestrictedLocal { peer_pid: 44 })
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn current_process_unix_peer_has_host_authority() {
+        let (_client, server) = UnixStream::pair().unwrap();
+        assert_eq!(
+            connection_authority(&server).unwrap(),
+            Some(ControlAuthority::Host)
+        );
     }
 }
