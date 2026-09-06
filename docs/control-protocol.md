@@ -180,10 +180,7 @@ disposition, and exits nonzero after its local timeout while still pending.
 }
 ```
 
-`from`, `to`, and `message` must be non-empty. Route titles resolve by exact
-case-insensitive match and fail when missing or ambiguous. `return_final` and
-`timeout_ms` default to false and zero. A nonzero timeout is rejected because
-asynchronous final callbacks do not expire.
+`from`, `to`, and `message` must be non-empty. Route titles resolve by exact case-insensitive match and fail when missing. Every live agent with the same effective title belongs to the route, including agents in separate tabs. `return_final` and `timeout_ms` default to false and zero. A nonzero timeout is rejected because asynchronous final callbacks do not expire.
 
 The normal sequence is:
 

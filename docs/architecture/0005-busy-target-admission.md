@@ -25,7 +25,7 @@ through Wakterm's active-turn steering command instead of queueing it.
 The local control admission sequence is:
 
 1. claim and persist the idempotency key
-2. resolve the workspace title to one current live tab and agent incarnation
+2. resolve the workspace title to its current live agents and select one agent incarnation
 3. establish a visible Telegram audit
 4. if the target is busy, persist `awaiting_target_idle` and return immediately
 5. after an authoritative idle observation, resolve the workspace again,
@@ -38,11 +38,7 @@ The Telegram audit uses `[queued]` while waiting and `[submitted]` only after Wa
 
 Queued work survives Panetone and Wakterm restarts. It has no automatic expiry in control v1. It remains visible through future status and cancellation operations until submitted or explicitly cancelled. The worker uses bounded backoff or lifecycle notification rather than a tight poll.
 
-Before submission, Panetone resolves the persisted workspace title again. A
-new agent incarnation may receive the work when the title still identifies one
-live tab. Panetone records both the originally observed and submitted
-incarnation in the workflow audit. Missing or ambiguous live routes are not
-guessed.
+Before submission, Panetone resolves the persisted workspace title again. A new agent incarnation may receive the work when the title still has a live agent. Panetone records both the originally observed and submitted incarnation in the workflow audit. Missing live routes are not guessed.
 
 A target with no live agent pane is not the same as a busy target. Control v1 continues to return `route_unavailable` before external side effects for a genuinely agentless route. Waiting for a route that does not exist would require a separate bounded workflow and is not part of this decision.
 

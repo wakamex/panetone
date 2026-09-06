@@ -91,15 +91,9 @@ the current effective title and live agent panes through Wakterm before each
 admission, retry, and callback. Closing and recreating a workspace therefore
 requires no Panetone repair or reconciliation command.
 
-At startup Panetone creates a durable route and Telegram topic for each unique
-live Wakterm title that contains an agent. It repeats that reconciliation when
-Wakterm reports an agent lifecycle change or visible output. An agent started
-manually in a shell therefore does not require `route ensure`. Empty tabs are
-ignored, and duplicate live titles remain ambiguous.
+At startup Panetone creates a durable route and Telegram topic for each live Wakterm title that contains an agent. Every agent with the same effective title shares that route even when the agents are in different tabs. Panetone repeats reconciliation when Wakterm reports an agent lifecycle change or visible output. An agent started manually in a shell therefore does not require `route ensure`. Empty tabs are ignored.
 
-When a tab has multiple agent panes, a quoted channel reply targets the pane
-that produced the quoted message. Otherwise the most recent pane to produce
-visible output wins, followed by the lowest live pane ID.
+When a route has multiple agent panes, a quoted channel reply targets the pane that produced the quoted message. Otherwise the most recent pane to produce visible output wins, followed by the lowest live pane ID.
 
 ## Launcher contract
 

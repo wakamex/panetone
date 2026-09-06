@@ -184,7 +184,7 @@ fi
 }
 
 #[tokio::test]
-async fn effective_route_keeps_multiple_agent_panes_and_prefers_the_requested_one() {
+async fn effective_route_merges_agents_across_tabs_and_prefers_the_requested_one() {
     let (_directory, binary) = fake_cli(
         r#"
 operation="$*"
@@ -193,7 +193,7 @@ if [[ "$operation" == *"agent capabilities"* ]]; then
 elif [[ "$operation" == *"agent catalog"* ]]; then
   printf '%s\n' '{"schema":"wakterm.agent-api.v1","as_of_event_sequence":12,"agents":[{"agent_id":"agent-first","incarnation_id":"inc-first","pane_id":4,"name":"first","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"},{"agent_id":"agent-second","incarnation_id":"inc-second","pane_id":9,"name":"second","harness":"claude","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"}]}'
 elif [[ "$operation" == *"list --format json"* ]]; then
-  printf '%s\n' '[{"pane_id":9,"tab_id":3,"window_id":1,"effective_title":"panetone"},{"pane_id":4,"tab_id":3,"window_id":1,"effective_title":"panetone"}]'
+  printf '%s\n' '[{"pane_id":9,"tab_id":8,"window_id":2,"effective_title":"PANETONE"},{"pane_id":4,"tab_id":3,"window_id":1,"effective_title":"panetone"}]'
 else
   exit 9
 fi
@@ -201,6 +201,7 @@ fi
     );
     let cli = WaktermCli::new(binary, "/tmp/non-production.sock", Duration::from_secs(2));
     let live = cli.live_routes().await.unwrap();
+    assert_eq!(live.routes().len(), 1);
     let route = live.route("PANETONE").unwrap();
     assert_eq!(route.agents.len(), 2);
     assert_eq!(route.select(None).unwrap().pane_id, Some(4));

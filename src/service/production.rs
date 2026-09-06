@@ -174,19 +174,6 @@ impl ProductionService {
                 );
                 continue;
             }
-            if live
-                .routes()
-                .iter()
-                .filter(|candidate| candidate.title.eq_ignore_ascii_case(&live_route.title))
-                .count()
-                != 1
-            {
-                tracing::warn!(
-                    title = %live_route.title,
-                    "duplicate live Wakterm title cannot be routed automatically"
-                );
-                continue;
-            }
             match exact_route(&routes, &live_route.title) {
                 Ok(_) => continue,
                 Err("not_found") => {}
@@ -658,18 +645,7 @@ impl ProductionService {
                             id,
                             "route_unavailable",
                             format!(
-                                "route {:?} cannot be created without one live Wakterm agent tab",
-                                params.title
-                            ),
-                            None,
-                        );
-                    }
-                    Err(WaktermCliError::RouteAmbiguous(_)) => {
-                        return error_response(
-                            id,
-                            "route_ambiguous",
-                            format!(
-                                "more than one live Wakterm tab matches route {:?}",
+                                "route {:?} cannot be created without a live Wakterm agent",
                                 params.title
                             ),
                             None,
@@ -768,17 +744,6 @@ impl ProductionService {
             Ok(live) => json!({"status": "available", "agents": live.agents}),
             Err(WaktermCliError::RouteNotFound(_) | WaktermCliError::RouteUnavailable(_)) => {
                 json!({"status": "unavailable", "agents": []})
-            }
-            Err(WaktermCliError::RouteAmbiguous(_)) => {
-                return error_response(
-                    id,
-                    "route_ambiguous",
-                    format!(
-                        "more than one live Wakterm tab matches route {:?}",
-                        route.title
-                    ),
-                    None,
-                );
             }
             Err(error) => {
                 return error_response(id, "route_resolution_failed", error.to_string(), None);
@@ -1145,6 +1110,99 @@ fi
         assert_eq!(service.event_once().await.unwrap(), 2);
         assert_eq!(store.status().await.unwrap().event_cursor, Some(102));
         assert_eq!(fs::read_to_string(log).unwrap(), "100\n101\n");
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn separate_tabs_share_output_and_the_latest_output_agent_receives_input() {
+        let directory = tempdir().unwrap();
+        let binary = directory.path().join("wakterm-fake");
+        let admission = directory.path().join("admission.txt");
+        fs::write(
+            &binary,
+            format!(
+                r#"#!/bin/bash
+set -euo pipefail
+operation="$*"
+if [[ "$operation" == *"agent capabilities"* ]]; then
+  echo '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
+elif [[ "$operation" == *"agent catalog"* ]]; then
+  echo '{{"schema":"wakterm.agent-api.v1","as_of_event_sequence":101,"agents":[{{"agent_id":"agent-first","incarnation_id":"inc-first","pane_id":1,"name":"first","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"}},{{"agent_id":"agent-second","incarnation_id":"inc-second","pane_id":2,"name":"second","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"}}]}}'
+elif [[ "$operation" == *"list --format json"* ]]; then
+  echo '[{{"pane_id":1,"tab_id":2,"window_id":3,"effective_title":"route"}},{{"pane_id":2,"tab_id":9,"window_id":4,"effective_title":"ROUTE"}}]'
+elif [[ "$operation" == *"agent events"*"--after 100"* ]]; then
+  echo '{{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":100,"oldest_available_sequence":1,"latest_sequence":101,"next_after_sequence":101,"events":[{{"sequence":101,"event_id":"event-101","kind":"assistant_message","agent_id":"agent-second","incarnation_id":"inc-second","text":"second tab output"}}]}}'
+elif [[ "$operation" == *"agent admit"* ]]; then
+  cat >/dev/null
+  echo "$operation" > '{}'
+  echo '{{"schema":"wakterm.agent-api.v1","request_id":"00000000-0000-0000-0000-00000000007d","status":"accepted","definitive":true,"prompt_written":true,"agent_id":"agent-second","incarnation_id":"inc-second","detail":null}}'
+else
+  echo "unexpected fake invocation: $operation" >&2
+  exit 9
+fi
+"#,
+                admission.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        let route = Route {
+            id: RouteId::new(Uuid::new_v4()),
+            title: "route".into(),
+            channels: vec![ChannelBinding::Telegram { topic_id: 10 }],
+            agent: None,
+        };
+        store.save_route(route.clone(), 1).await.unwrap();
+        store.initialize_event_cursor(100).await.unwrap();
+        let service = ProductionService::new(
+            store.clone(),
+            WaktermCli::new(
+                binary,
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            RealChannels::default(),
+            SupervisorHandle::default(),
+            vec!["event_stream.v1".into()],
+            directory.path().join("control.sock"),
+        );
+
+        assert_eq!(service.event_once().await.unwrap(), 1);
+        assert_eq!(store.status().await.unwrap().event_cursor, Some(101));
+        let output = store.pending_outbox().await.unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].destination, "10");
+        assert_eq!(output[0].body, "second tab output");
+        assert_eq!(
+            service.last_agents.read().await.get(&route.id),
+            Some(&AgentBinding {
+                agent_id: "agent-second".into(),
+                incarnation_id: "inc-second".into(),
+                harness: "codex".into(),
+                pane_id: Some(2),
+            })
+        );
+        store
+            .accept_inbox(InboxItem {
+                id: EffectId::new(Uuid::from_u128(125)),
+                channel: ChannelKind::Telegram,
+                external_id: "update-2".into(),
+                destination: "10".into(),
+                sender_id: Some("42".into()),
+                sender: Some("Mihai".into()),
+                reply_to_external_id: None,
+                body: "continue the active work".into(),
+                state: "pending".into(),
+                created_at_ms: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(service.inbox_once().await.unwrap(), 1);
+        let admission = fs::read_to_string(admission).unwrap();
+        assert!(admission.contains("agent-second --exact-agent-id --incarnation inc-second"));
         drop(service);
         store.shutdown().await.unwrap();
     }

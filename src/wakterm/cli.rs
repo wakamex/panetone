@@ -135,8 +135,6 @@ pub enum WaktermCliError {
     InvalidSteeringReceipt,
     #[error("no live Wakterm agent pane matches route title {0:?}")]
     RouteNotFound(String),
-    #[error("more than one live Wakterm tab matches route title {0:?}")]
-    RouteAmbiguous(String),
     #[error("live Wakterm route {0:?} has no agent pane")]
     RouteUnavailable(String),
     #[error("Wakterm Agent API event page violates the v1 contract: {0}")]
@@ -155,16 +153,12 @@ struct WireReceipt {
 #[derive(Deserialize)]
 struct LivePane {
     pane_id: u64,
-    tab_id: u64,
-    window_id: u64,
     effective_title: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LiveRoute {
     pub title: String,
-    pub window_id: u64,
-    pub tab_id: u64,
     pub agents: Vec<AgentBinding>,
 }
 
@@ -205,18 +199,15 @@ impl LiveRouteSnapshot {
     }
 
     pub fn route(&self, title: &str) -> Result<&LiveRoute, WaktermCliError> {
-        let matches = self
+        let route = self
             .routes
             .iter()
-            .filter(|route| route.title.eq_ignore_ascii_case(title))
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [] => Err(WaktermCliError::RouteNotFound(title.into())),
-            [route] if route.agents.is_empty() => {
-                Err(WaktermCliError::RouteUnavailable(title.into()))
-            }
-            [route] => Ok(route),
-            _ => Err(WaktermCliError::RouteAmbiguous(title.into())),
+            .find(|route| route.title.eq_ignore_ascii_case(title))
+            .ok_or_else(|| WaktermCliError::RouteNotFound(title.into()))?;
+        if route.agents.is_empty() {
+            Err(WaktermCliError::RouteUnavailable(title.into()))
+        } else {
+            Ok(route)
         }
     }
 
@@ -313,19 +304,25 @@ impl WaktermCli {
         let before = self.catalog().await?;
         let panes: Vec<LivePane> = self.run_json(&["list", "--format", "json"], None).await?;
         let after = self.catalog().await?;
-        let mut grouped = BTreeMap::<(u64, u64, String), Vec<AgentBinding>>::new();
+        let mut grouped = BTreeMap::<String, LiveRoute>::new();
         for pane in panes {
-            let agents = grouped
-                .entry((pane.window_id, pane.tab_id, pane.effective_title))
-                .or_default();
+            if pane.effective_title.trim().is_empty() {
+                continue;
+            }
+            let route = grouped
+                .entry(pane.effective_title.to_ascii_lowercase())
+                .or_insert_with(|| LiveRoute {
+                    title: pane.effective_title,
+                    agents: Vec::new(),
+                });
             match join_catalog_binding(pane.pane_id, &before, &after) {
                 Ok(binding)
-                    if !agents.iter().any(|agent| {
+                    if !route.agents.iter().any(|agent| {
                         agent.agent_id == binding.agent_id
                             && agent.incarnation_id == binding.incarnation_id
                     }) =>
                 {
-                    agents.push(binding);
+                    route.agents.push(binding);
                 }
                 Ok(_) => {}
                 Err(
@@ -337,18 +334,10 @@ impl WaktermCli {
             }
         }
         let routes = grouped
-            .into_iter()
-            .filter_map(|((window_id, tab_id, title), mut agents)| {
-                if title.trim().is_empty() {
-                    return None;
-                }
-                agents.sort_by_key(|agent| agent.pane_id);
-                Some(LiveRoute {
-                    title,
-                    window_id,
-                    tab_id,
-                    agents,
-                })
+            .into_values()
+            .map(|mut route| {
+                route.agents.sort_by_key(|agent| agent.pane_id);
+                route
             })
             .collect();
         Ok(LiveRouteSnapshot { routes })
