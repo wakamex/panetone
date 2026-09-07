@@ -53,3 +53,5 @@ command or receipt failure changes the inbox item to `indeterminate` and is not
 retried automatically. This avoids duplicate steering when it is unknown
 whether the pane write occurred. Local queued work continues to use the durable
 workflow and audit states described above.
+
+The return-terminal stream may race the admission receipt. A terminal for a workflow still in `admission_prepared` remains unread until that workflow records whether submission occurred. If the workflow then ends without a submitted target, Panetone consumes the redundant terminal without manufacturing a callback. One request-level inconsistency therefore cannot stop unrelated routes or channel workers.

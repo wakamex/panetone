@@ -324,35 +324,48 @@ impl ProductionService {
                 .await
                 .map_err(error_string)?
             {
-                let target = workflow.workflow.submitted_target.clone().ok_or_else(|| {
-                    "return terminal workflow has no submitted target".to_string()
-                })?;
-                if target.agent_id != terminal.target_agent_id {
-                    return Err("Wakterm return terminal target identity changed".into());
+                if let Some(target) = workflow.workflow.submitted_target.clone() {
+                    if target.agent_id != terminal.target_agent_id {
+                        return Err("Wakterm return terminal target identity changed".into());
+                    }
+                    let source_route = self
+                        .store
+                        .get_route(workflow.workflow.source_route_id)
+                        .await
+                        .map_err(error_string)?
+                        .ok_or_else(|| "return terminal source route is missing".to_string())?;
+                    self.workflows
+                        .persist_terminal(
+                            TerminalResult {
+                                workflow_id: request_id,
+                                source: workflow.workflow.observed_source,
+                                target,
+                                status: terminal.state,
+                                message: terminal
+                                    .final_message
+                                    .or(terminal.detail)
+                                    .unwrap_or_default(),
+                            },
+                            &source_route,
+                            now_ms(),
+                        )
+                        .await
+                        .map_err(error_string)?;
+                } else if workflow.workflow.state == WorkflowState::AdmissionPrepared {
+                    tracing::debug!(
+                        request_id = %request_id,
+                        terminal_event_sequence = terminal.terminal_event_sequence,
+                        "deferring return terminal until admission state is durable"
+                    );
+                    break;
+                } else {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        terminal_event_sequence = terminal.terminal_event_sequence,
+                        workflow_state = ?workflow.workflow.state,
+                        "ignoring return terminal for a workflow that was never submitted"
+                    );
                 }
-                let source_route = self
-                    .store
-                    .get_route(workflow.workflow.source_route_id)
-                    .await
-                    .map_err(error_string)?
-                    .ok_or_else(|| "return terminal source route is missing".to_string())?;
-                self.workflows
-                    .persist_terminal(
-                        TerminalResult {
-                            workflow_id: request_id,
-                            source: workflow.workflow.observed_source,
-                            target,
-                            status: terminal.state,
-                            message: terminal
-                                .final_message
-                                .or(terminal.detail)
-                                .unwrap_or_default(),
-                        },
-                        &source_route,
-                        now_ms(),
-                    )
-                    .await
-                    .map_err(error_string)?;
             }
             next = terminal.terminal_event_sequence;
             self.store
@@ -1035,6 +1048,7 @@ mod tests {
     use super::*;
     use crate::channels::RecordingChannels;
     use crate::domain::{ChannelBinding, EffectId, RouteId, SendCommand};
+    use crate::service::{FaultInjector, FaultPoint};
     use crate::store::InboxItem;
     use crate::wakterm::{FakeWakterm, ProfileKind, WaktermContract};
 
@@ -1237,6 +1251,140 @@ fi
 
         assert_eq!(service.terminal_once().await.unwrap(), 0);
         assert!(!log.exists());
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_worker_defers_in_flight_work_then_skips_it_after_failure() {
+        let directory = tempdir().unwrap();
+        let binary = directory.path().join("wakterm-fake");
+        let bad_id = WorkflowId::new(Uuid::from_u128(126));
+        let good_id = WorkflowId::new(Uuid::from_u128(127));
+        fs::write(
+            &binary,
+            format!(
+                r#"#!/bin/bash
+set -euo pipefail
+operation="$*"
+if [[ "$operation" == *"agent capabilities"* ]]; then
+  echo '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1"]}}'
+elif [[ "$operation" == *"agent request watch"* ]]; then
+  echo '{{"request_id":"{bad_id}","target_agent_id":"agent-target","state":"indeterminate","final_message":null,"detail":"registration was abandoned","terminal_event_sequence":69}}'
+  echo '{{"request_id":"{good_id}","target_agent_id":"agent-target","state":"completed","final_message":"finished","detail":null,"terminal_event_sequence":70}}'
+else
+  echo "unexpected fake invocation: $operation" >&2
+  exit 9
+fi
+"#,
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let source = Route {
+            id: RouteId::new(Uuid::from_u128(10)),
+            title: "source".into(),
+            channels: vec![ChannelBinding::Signal {
+                group_id: "source-group".into(),
+            }],
+            agent: Some(AgentBinding {
+                agent_id: "agent-source".into(),
+                incarnation_id: "inc-source".into(),
+                harness: "codex".into(),
+                pane_id: Some(1),
+            }),
+        };
+        let target = Route {
+            id: RouteId::new(Uuid::from_u128(11)),
+            title: "target".into(),
+            channels: vec![ChannelBinding::Telegram { topic_id: 20 }],
+            agent: Some(AgentBinding {
+                agent_id: "agent-target".into(),
+                incarnation_id: "inc-target".into(),
+                harness: "codex".into(),
+                pane_id: Some(2),
+            }),
+        };
+        let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        store.save_route(source.clone(), 1).await.unwrap();
+        store.save_route(target.clone(), 1).await.unwrap();
+        store
+            .set_metadata("wakterm_return_cursor".into(), "68".into())
+            .await
+            .unwrap();
+
+        let faults = Arc::new(FaultInjector::default());
+        faults.arm(FaultPoint::AfterAdmissionPrepared);
+        let setup = OfflineService::with_faults(
+            store.clone(),
+            FakeWakterm::new(current_contract()),
+            RecordingChannels::default(),
+            faults,
+        );
+        setup.wakterm().script_receipts([AdmissionStatus::Accepted]);
+        let command = |id| SendCommand {
+            id,
+            source: source.title.clone(),
+            target: target.title.clone(),
+            message: "do the work".into(),
+            return_final: true,
+            timeout_ms: 0,
+        };
+        assert!(matches!(
+            setup.submit(command(bad_id), &source, &target, 2).await,
+            Err(ServiceError::Injected(FaultPoint::AfterAdmissionPrepared))
+        ));
+        assert!(
+            setup
+                .submit(command(good_id), &source, &target, 3)
+                .await
+                .unwrap()
+                .submitted
+        );
+        drop(setup);
+
+        let service = ProductionService::new(
+            store.clone(),
+            WaktermCli::new(
+                binary,
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            RealChannels::default(),
+            SupervisorHandle::default(),
+            vec!["return_request_terminal_stream.v1".into()],
+            directory.path().join("control.sock"),
+        );
+
+        assert_eq!(service.terminal_once().await.unwrap(), 0);
+        assert_eq!(
+            store
+                .get_metadata("wakterm_return_cursor".into())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("68")
+        );
+        let mut failed = store.get_workflow(bad_id).await.unwrap().unwrap();
+        failed.workflow.transition(WorkflowState::Failed).unwrap();
+        failed.updated_at_ms += 1;
+        store
+            .save_workflow(failed, WorkflowState::AdmissionPrepared)
+            .await
+            .unwrap();
+
+        assert_eq!(service.terminal_once().await.unwrap(), 2);
+        assert_eq!(
+            store
+                .get_metadata("wakterm_return_cursor".into())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("70")
+        );
+        assert!(store.get_return(bad_id).await.unwrap().is_none());
+        assert!(store.get_return(good_id).await.unwrap().is_some());
         drop(service);
         store.shutdown().await.unwrap();
     }
