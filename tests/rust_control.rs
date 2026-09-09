@@ -68,6 +68,78 @@ async fn server_and_client_exchange_one_bounded_v1_frame() {
 }
 
 #[tokio::test]
+async fn client_socket_precedence_is_flag_then_environment_then_runtime_directory() {
+    let directory = private_directory();
+    let runtime = directory.path().join("runtime");
+    let socket_directory = runtime.join("panetone");
+    std::fs::create_dir_all(&socket_directory).unwrap();
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&socket_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = socket_directory.join("control.sock");
+    let server = ControlServer::bind(&socket).await.unwrap();
+    let (shutdown, receiver) = watch::channel(false);
+    let task = tokio::spawn(server.run(Arc::new(Echo), receiver));
+    let binary = env!("CARGO_BIN_EXE_panetone");
+
+    let defaulted = Command::new(binary)
+        .args(["status", "--json"])
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env_remove("PANETONE_CONTROL_SOCKET")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        defaulted.status.success(),
+        "runtime-directory default failed: {}",
+        String::from_utf8_lossy(&defaulted.stderr)
+    );
+
+    let from_environment = Command::new(binary)
+        .args(["status", "--json"])
+        .env("XDG_RUNTIME_DIR", directory.path().join("wrong-runtime"))
+        .env("PANETONE_CONTROL_SOCKET", &socket)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        from_environment.status.success(),
+        "environment override failed: {}",
+        String::from_utf8_lossy(&from_environment.stderr)
+    );
+
+    let from_flag = Command::new(binary)
+        .args(["status", "--socket", socket.to_str().unwrap(), "--json"])
+        .env("XDG_RUNTIME_DIR", directory.path().join("wrong-runtime"))
+        .env(
+            "PANETONE_CONTROL_SOCKET",
+            directory.path().join("wrong-control.sock"),
+        )
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        from_flag.status.success(),
+        "flag override failed: {}",
+        String::from_utf8_lossy(&from_flag.stderr)
+    );
+
+    let missing_runtime = Command::new(binary)
+        .args(["status", "--json"])
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("PANETONE_CONTROL_SOCKET")
+        .output()
+        .await
+        .unwrap();
+    assert!(!missing_runtime.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing_runtime.stderr).contains("XDG_RUNTIME_DIR is not set")
+    );
+
+    shutdown.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn malformed_and_oversized_frames_are_rejected_without_panicking() {
     let directory = private_directory();
     let socket = directory.path().join("control.sock");

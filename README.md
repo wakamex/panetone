@@ -102,11 +102,12 @@ context `<first name> says: <message>`. Unknown groups remain ignored.
 
 ## Commands
 
+Client commands use `$XDG_RUNTIME_DIR/panetone/control.sock` by default. `PANETONE_CONTROL_SOCKET` overrides that path, and an explicit `--socket` takes precedence over both.
+
 Inspect the running daemon:
 
 ```sh
-target/release/panetone status \
-  --socket /run/user/1000/panetone/control.sock
+target/release/panetone status
 ```
 
 Manual Wakterm agents are discovered automatically from their effective title.
@@ -114,8 +115,7 @@ Use `route ensure` when a launcher needs synchronous confirmation that the
 route exists before it sends a bootstrap prompt:
 
 ```sh
-target/release/panetone route ensure infobase \
-  --socket /run/user/1000/panetone/control.sock
+target/release/panetone route ensure infobase
 ```
 
 The result includes the exact live agent and incarnation plus an event-cursor
@@ -128,8 +128,7 @@ target/release/panetone output wait \
   --agent-id detected-pane-14 \
   --incarnation-id INCARNATION_ID \
   --after EVENT_CURSOR \
-  --expect-text READY \
-  --socket /run/user/1000/panetone/control.sock
+  --expect-text READY
 ```
 
 The wait exits successfully only for `projected`. It fails immediately for
@@ -142,7 +141,6 @@ Send a one-way message between exact, case-insensitive route titles:
 target/release/panetone send \
   --from ufopedia \
   --to wakterm \
-  --socket /run/user/1000/panetone/control.sock \
   "Investigate the observer bug"
 ```
 
@@ -155,7 +153,6 @@ Run a side-effect-free local check against the loaded Wakterm service:
 
 ```sh
 target/release/panetone doctor \
-  --socket /run/user/1000/panetone/control.sock \
   --journal ~/.local/state/panetone-rust/migration/panetone.sqlite3 \
   --wakterm-bin ~/.local/bin/wakterm \
   --wakterm-socket /run/user/1000/wakterm/sock

@@ -83,6 +83,16 @@ struct ProductionArgs {
 }
 
 #[derive(Args)]
+struct ControlSocketArgs {
+    #[arg(
+        long,
+        env = "PANETONE_CONTROL_SOCKET",
+        help = "Control socket (default: $XDG_RUNTIME_DIR/panetone/control.sock)"
+    )]
+    socket: Option<PathBuf>,
+}
+
+#[derive(Args)]
 struct SendArgs {
     #[arg(long = "from")]
     source: String,
@@ -92,15 +102,15 @@ struct SendArgs {
     id: Option<Uuid>,
     #[arg(long)]
     return_final: bool,
-    #[arg(long, env = "PANETONE_CONTROL_SOCKET")]
-    socket: PathBuf,
+    #[command(flatten)]
+    control: ControlSocketArgs,
     message: String,
 }
 
 #[derive(Args)]
 struct StatusArgs {
-    #[arg(long, env = "PANETONE_CONTROL_SOCKET")]
-    socket: PathBuf,
+    #[command(flatten)]
+    control: ControlSocketArgs,
     #[arg(long)]
     json: bool,
 }
@@ -122,8 +132,8 @@ enum RouteCommand {
 #[derive(Args)]
 struct RouteInspectArgs {
     title: String,
-    #[arg(long, env = "PANETONE_CONTROL_SOCKET")]
-    socket: PathBuf,
+    #[command(flatten)]
+    control: ControlSocketArgs,
 }
 
 #[derive(Args)]
@@ -131,8 +141,8 @@ struct RouteEnsureArgs {
     title: String,
     #[arg(long)]
     telegram_topic_id: Option<i64>,
-    #[arg(long, env = "PANETONE_CONTROL_SOCKET")]
-    socket: PathBuf,
+    #[command(flatten)]
+    control: ControlSocketArgs,
 }
 
 #[derive(Args)]
@@ -163,14 +173,14 @@ struct OutputWaitArgs {
     timeout_ms: u64,
     #[arg(long, default_value_t = 100)]
     poll_ms: u64,
-    #[arg(long, env = "PANETONE_CONTROL_SOCKET")]
-    socket: PathBuf,
+    #[command(flatten)]
+    control: ControlSocketArgs,
 }
 
 #[derive(Args)]
 struct DoctorArgs {
-    #[arg(long)]
-    socket: PathBuf,
+    #[command(flatten)]
+    control: ControlSocketArgs,
     #[arg(long, alias = "database")]
     journal: PathBuf,
     #[arg(long)]
@@ -632,6 +642,7 @@ async fn shutdown_signal() {
 }
 
 async fn run_send(args: SendArgs) -> Result<()> {
+    let socket = control_socket(args.control.socket)?;
     let params = SendParams {
         source: args.source,
         target: args.target,
@@ -640,7 +651,7 @@ async fn run_send(args: SendArgs) -> Result<()> {
         timeout_ms: 0,
     };
     let response = request(
-        &args.socket,
+        &socket,
         &ControlRequest {
             schema: CONTROL_SCHEMA.into(),
             id: args.id.unwrap_or_else(Uuid::new_v4),
@@ -658,8 +669,9 @@ async fn run_send(args: SendArgs) -> Result<()> {
 }
 
 async fn run_status(args: StatusArgs) -> Result<()> {
+    let socket = control_socket(args.control.socket)?;
     let response = request(
-        &args.socket,
+        &socket,
         &ControlRequest {
             schema: CONTROL_SCHEMA.into(),
             id: Uuid::new_v4(),
@@ -683,12 +695,12 @@ async fn run_status(args: StatusArgs) -> Result<()> {
 async fn run_route(args: RouteArgs) -> Result<()> {
     let (socket, method, params) = match args.command {
         RouteCommand::Inspect(args) => (
-            args.socket,
+            control_socket(args.control.socket)?,
             "route.inspect",
             serde_json::to_value(RouteInspectParams { title: args.title })?,
         ),
         RouteCommand::Ensure(args) => (
-            args.socket,
+            control_socket(args.control.socket)?,
             "route.ensure",
             serde_json::to_value(RouteEnsureParams {
                 title: args.title,
@@ -724,10 +736,11 @@ async fn run_output_wait(args: OutputWaitArgs) -> Result<()> {
     if args.timeout_ms == 0 || args.poll_ms == 0 {
         bail!("--timeout-ms and --poll-ms must be positive");
     }
+    let socket = control_socket(args.control.socket)?;
     let started = Instant::now();
     loop {
         let response = request(
-            &args.socket,
+            &socket,
             &ControlRequest {
                 schema: CONTROL_SCHEMA.into(),
                 id: Uuid::new_v4(),
@@ -769,8 +782,8 @@ async fn run_output_wait(args: OutputWaitArgs) -> Result<()> {
 }
 
 async fn run_doctor(args: DoctorArgs) -> Result<()> {
-    let parent = args
-        .socket
+    let socket = control_socket(args.control.socket)?;
+    let parent = socket
         .parent()
         .context("control socket requires a parent directory")?;
     let parent_check = private_directory_check(parent);
@@ -848,6 +861,20 @@ async fn run_doctor(args: DoctorArgs) -> Result<()> {
     } else {
         bail!("doctor found unsafe or incompatible local state")
     }
+}
+
+fn control_socket(socket: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(socket) = socket {
+        return Ok(socket);
+    }
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .context("XDG_RUNTIME_DIR is not set; pass --socket or set PANETONE_CONTROL_SOCKET")?;
+    let runtime = PathBuf::from(runtime);
+    if !runtime.is_absolute() {
+        bail!("XDG_RUNTIME_DIR must be an absolute path");
+    }
+    Ok(runtime.join("panetone/control.sock"))
 }
 
 fn private_directory_check(path: &Path) -> Value {

@@ -13,6 +13,8 @@ manager.
 - control socket: `/run/user/1000/panetone/control.sock`
 - Wakterm socket: `/run/user/1000/wakterm/sock`
 
+Panetone client commands default to `$XDG_RUNTIME_DIR/panetone/control.sock`. `PANETONE_CONTROL_SOCKET` overrides that path, and an explicit `--socket` takes precedence. The service keeps an explicit socket path so its loaded configuration is self-contained.
+
 The service and database are user-owned. An agent can inspect and restart them
 without root.
 
@@ -66,8 +68,7 @@ The retired `panetone.service` Python unit has been removed.
 ## Health
 
 ```sh
-target/release/panetone status \
-  --socket /run/user/1000/panetone/control.sock
+target/release/panetone status
 ```
 
 Status reports current workflows, returns, inbox and outbox state, UUID
@@ -78,7 +79,6 @@ Run the read-only doctor when the daemon is stopped:
 
 ```sh
 target/release/panetone doctor \
-  --socket /run/user/1000/panetone/control.sock \
   --journal ~/.local/state/panetone-rust/migration/panetone.sqlite3 \
   --wakterm-bin ~/.local/bin/wakterm \
   --wakterm-socket /run/user/1000/wakterm/sock
@@ -103,8 +103,7 @@ retired `~/.config/wez-tg` files.
 After Wakterm has registered the fresh agent, synchronously verify its route:
 
 ```sh
-route_json=$(target/release/panetone route ensure infobase \
-  --socket /run/user/1000/panetone/control.sock)
+route_json=$(target/release/panetone route ensure infobase)
 ```
 
 Require `result.live.status` to be `available`. Save these exact fields from
@@ -125,8 +124,7 @@ target/release/panetone output wait \
   --incarnation-id "$incarnation_id" \
   --after "$event_cursor" \
   --expect-text READY \
-  --timeout-ms 90000 \
-  --socket /run/user/1000/panetone/control.sock
+  --timeout-ms 90000
 ```
 
 Send the real startup prompt only after this command exits zero and its JSON
