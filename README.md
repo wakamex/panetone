@@ -99,6 +99,7 @@ Telegram messages are supported.
 Signal routes are owner-only except for the route titled `debate`. Every member
 of that Signal group is accepted, and the harness receives the minimal sender
 context `<first name> says: <message>`. Unknown groups remain ignored.
+On that route only, an assistant response consisting exactly of `<panetone:no-reply>` after trimming whitespace is durably recorded as suppressed and is not sent to Signal or Telegram. Normal responses and failure notices remain visible.
 
 ## Commands
 

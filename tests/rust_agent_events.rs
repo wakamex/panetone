@@ -30,6 +30,13 @@ fn route() -> Route {
     }
 }
 
+fn debate_route() -> Route {
+    Route {
+        title: "debate".into(),
+        ..route()
+    }
+}
+
 fn live_agents(route: &Route) -> Vec<RouteAgent> {
     vec![RouteAgent {
         route_id: route.id,
@@ -215,6 +222,127 @@ async fn completed_final_and_aborted_final_without_detail_are_not_projected() {
         Some(completed.sequence)
     );
     store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn only_debate_suppresses_the_exact_no_reply_disposition() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("state.sqlite3");
+    let store = StoreHandle::open(&path).unwrap();
+    let debate = debate_route();
+    store.save_route(debate.clone(), 1).await.unwrap();
+    let mut silent = fixture_events()
+        .into_iter()
+        .find(|event| event.kind == "assistant_message")
+        .unwrap();
+    silent
+        .fields
+        .insert("text".into(), "  <panetone:no-reply>\n".into());
+    store
+        .initialize_event_cursor(silent.sequence - 1)
+        .await
+        .unwrap();
+
+    let outcome = store
+        .ingest_agent_events(
+            silent.sequence - 1,
+            silent.sequence,
+            vec![silent.clone()],
+            live_agents(&debate),
+            3,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.visible_outputs, 0);
+    assert!(store.pending_outbox().await.unwrap().is_empty());
+    assert_eq!(outcome.last_agents, live_agents(&debate));
+    store.shutdown().await.unwrap();
+    let connection = Connection::open(&path).unwrap();
+    let state: String = connection
+        .query_row(
+            "SELECT state FROM agent_events WHERE event_id = ?1",
+            [&silent.event_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "suppressed");
+}
+
+#[tokio::test]
+async fn debate_forwards_normal_output_and_failures_and_other_routes_forward_the_token() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let debate = debate_route();
+    store.save_route(debate.clone(), 1).await.unwrap();
+    let mut normal = fixture_events()
+        .into_iter()
+        .find(|event| event.kind == "assistant_message")
+        .unwrap();
+    normal.fields.insert(
+        "text".into(),
+        "The token <panetone:no-reply> is not the whole response.".into(),
+    );
+    let mut failure = policy_aborted_final();
+    failure.sequence = normal.sequence + 1;
+    failure.event_id = "debate-policy-failure".into();
+    store
+        .initialize_event_cursor(normal.sequence - 1)
+        .await
+        .unwrap();
+
+    let outcome = store
+        .ingest_agent_events(
+            normal.sequence - 1,
+            failure.sequence,
+            vec![normal, failure],
+            live_agents(&debate),
+            3,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.visible_outputs, 2);
+    let bodies = store
+        .pending_outbox()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|item| item.body)
+        .collect::<Vec<_>>();
+    assert!(bodies.iter().any(|body| body.starts_with("The token ")));
+    assert!(bodies.iter().any(|body| body.starts_with("Turn failed: ")));
+    store.shutdown().await.unwrap();
+
+    let other_store = StoreHandle::open(directory.path().join("other.sqlite3")).unwrap();
+    let other = route();
+    other_store.save_route(other.clone(), 1).await.unwrap();
+    let mut token = fixture_events()
+        .into_iter()
+        .find(|event| event.kind == "assistant_message")
+        .unwrap();
+    token
+        .fields
+        .insert("text".into(), "<panetone:no-reply>".into());
+    other_store
+        .initialize_event_cursor(token.sequence - 1)
+        .await
+        .unwrap();
+    other_store
+        .ingest_agent_events(
+            token.sequence - 1,
+            token.sequence,
+            vec![token],
+            live_agents(&other),
+            3,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        other_store.pending_outbox().await.unwrap()[0].body,
+        "<panetone:no-reply>"
+    );
+    other_store.shutdown().await.unwrap();
 }
 
 #[tokio::test]

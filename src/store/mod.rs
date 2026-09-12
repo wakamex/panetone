@@ -19,6 +19,7 @@ use crate::wakterm::{AgentCatalog, EventRecord};
 
 pub const SCHEMA_VERSION: i64 = 7;
 const COMMAND_CAPACITY: usize = 128;
+const DEBATE_NO_REPLY: &str = "<panetone:no-reply>";
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -136,6 +137,20 @@ pub struct EventIngestOutcome {
     pub unrouted: u64,
     pub next_after_sequence: u64,
     pub last_agents: Vec<RouteAgent>,
+}
+
+impl EventIngestOutcome {
+    fn remember_last_agent(&mut self, candidate: &RouteAgent) {
+        if let Some(existing) = self
+            .last_agents
+            .iter_mut()
+            .find(|existing| existing.route_id == candidate.route_id)
+        {
+            *existing = candidate.clone();
+        } else {
+            self.last_agents.push(candidate.clone());
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1248,6 +1263,25 @@ fn ingest_agent_events(
                 outcome.recorded += 1;
                 continue;
             };
+            if route.title.eq_ignore_ascii_case("debate")
+                && event.kind == "assistant_message"
+                && body.trim() == DEBATE_NO_REPLY
+            {
+                state = "suppressed";
+                if let Some(candidate) = route_agent {
+                    outcome.remember_last_agent(candidate);
+                }
+                insert_agent_event(
+                    &transaction,
+                    event,
+                    Some(route.id),
+                    state,
+                    &record_json,
+                    now_ms,
+                )?;
+                outcome.recorded += 1;
+                continue;
+            }
             let Some((kind, destination)) = output_destination(
                 route,
                 preferences.get(&route.id.to_string()).map(String::as_str),
@@ -1290,20 +1324,8 @@ fn ingest_agent_events(
             }
             state = "projected";
             outcome.visible_outputs += 1;
-            if let Some(candidate) = route_agent
-                && !outcome
-                    .last_agents
-                    .iter()
-                    .any(|existing| existing.route_id == candidate.route_id)
-            {
-                outcome.last_agents.push(candidate.clone());
-            } else if let Some(candidate) = route_agent
-                && let Some(existing) = outcome
-                    .last_agents
-                    .iter_mut()
-                    .find(|existing| existing.route_id == candidate.route_id)
-            {
-                *existing = candidate.clone();
+            if let Some(candidate) = route_agent {
+                outcome.remember_last_agent(candidate);
             }
         }
         insert_agent_event(&transaction, event, route_id, state, &record_json, now_ms)?;
