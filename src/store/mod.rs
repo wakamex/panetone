@@ -1237,7 +1237,10 @@ fn ingest_agent_events(
 
         let mut state = "recorded";
         let route_id = route.map(|route| route.id);
-        if matches!(event.kind.as_str(), "assistant_message" | "plan") {
+        let visible_body = event
+            .visible_output_body()
+            .map_err(|detail| StoreError::Conflict(detail.into()))?;
+        if let Some(body) = visible_body {
             let Some(route) = route else {
                 state = "unrouted";
                 outcome.unrouted += 1;
@@ -1261,16 +1264,6 @@ fn ingest_agent_events(
                 )?;
                 outcome.recorded += 1;
                 continue;
-            };
-            let text = event
-                .fields
-                .get("text")
-                .and_then(Value::as_str)
-                .ok_or_else(|| StoreError::Conflict("visible Wakterm event has no text".into()))?;
-            let body = if event.kind == "plan" {
-                format!("Plan:\n{text}")
-            } else {
-                text.to_owned()
             };
             let namespace = Uuid::new_v5(
                 &Uuid::NAMESPACE_URL,

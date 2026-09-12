@@ -88,10 +88,8 @@ impl ProductionService {
                     latest_sequence,
                 } => {
                     let route_agents = if events.iter().any(|event| {
-                        matches!(
-                            event.kind.as_str(),
-                            "agent_lifecycle" | "assistant_message" | "plan"
-                        )
+                        event.kind == "agent_lifecycle"
+                            || event.visible_output_body().is_ok_and(|body| body.is_some())
                     }) {
                         let live = self.wakterm.live_routes().await.map_err(error_string)?;
                         self.reconcile_live_routes(&live).await?;

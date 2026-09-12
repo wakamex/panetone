@@ -45,6 +45,14 @@ fn fixture_events() -> Vec<EventRecord> {
     serde_json::from_value(fixture["event_page"]["events"].clone()).unwrap()
 }
 
+fn policy_aborted_final() -> EventRecord {
+    let fixture: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string("/code/wakterm/docs/agent-api/v1/golden-fixtures.json").unwrap(),
+    )
+    .unwrap();
+    serde_json::from_value(fixture["policy_aborted_turn_final"].clone()).unwrap()
+}
+
 #[tokio::test]
 async fn event_page_recording_output_projection_and_cursor_advance_are_atomic() {
     let directory = tempdir().unwrap();
@@ -116,6 +124,97 @@ async fn event_page_recording_output_projection_and_cursor_advance_are_atomic() 
     assert_eq!(reopened.status().await.unwrap().event_cursor, Some(107));
     assert_eq!(reopened.pending_outbox().await.unwrap().len(), 2);
     reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn aborted_final_detail_is_projected_once_as_a_failure_notice() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("state.sqlite3");
+    let store = StoreHandle::open(&path).unwrap();
+    let route = route();
+    store.save_route(route.clone(), 1).await.unwrap();
+    store
+        .set_metadata(
+            "route_output_preferences_v1".into(),
+            serde_json::json!({route.id.to_string(): "tg"}).to_string(),
+        )
+        .await
+        .unwrap();
+    let event = policy_aborted_final();
+    store
+        .initialize_event_cursor(event.sequence - 1)
+        .await
+        .unwrap();
+
+    let outcome = store
+        .ingest_agent_events(
+            event.sequence - 1,
+            event.sequence,
+            vec![event.clone()],
+            live_agents(&route),
+            3,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.visible_outputs, 1);
+    let output = store.pending_outbox().await.unwrap();
+    assert_eq!(output.len(), 1);
+    assert_eq!(
+        output[0].body,
+        "Turn failed: Codex could not complete this turn because the provider blocked the response under its content policy."
+    );
+    store.shutdown().await.unwrap();
+
+    let reopened = StoreHandle::open(&path).unwrap();
+    assert_eq!(reopened.pending_outbox().await.unwrap().len(), 1);
+    assert_eq!(
+        reopened.status().await.unwrap().event_cursor,
+        Some(event.sequence)
+    );
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn completed_final_and_aborted_final_without_detail_are_not_projected() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let route = route();
+    store.save_route(route.clone(), 1).await.unwrap();
+    let mut aborted = policy_aborted_final();
+    aborted.fields.remove("detail");
+    let mut completed = aborted.clone();
+    completed.sequence += 1;
+    completed.event_id = "completed-final".into();
+    completed
+        .fields
+        .insert("outcome".into(), "completed".into());
+    completed
+        .fields
+        .insert("text".into(), "already projected".into());
+    store
+        .initialize_event_cursor(aborted.sequence - 1)
+        .await
+        .unwrap();
+
+    let outcome = store
+        .ingest_agent_events(
+            aborted.sequence - 1,
+            completed.sequence,
+            vec![aborted, completed.clone()],
+            live_agents(&route),
+            3,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.visible_outputs, 0);
+    assert!(store.pending_outbox().await.unwrap().is_empty());
+    assert_eq!(
+        store.status().await.unwrap().event_cursor,
+        Some(completed.sequence)
+    );
+    store.shutdown().await.unwrap();
 }
 
 #[tokio::test]

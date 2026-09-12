@@ -697,13 +697,7 @@ fn validate_live_events(
                 "events are unordered or contain an invalid required field",
             ));
         }
-        if matches!(event.kind.as_str(), "plan" | "assistant_message")
-            && event
-                .fields
-                .get("text")
-                .and_then(serde_json::Value::as_str)
-                .is_none()
-        {
+        if event.visible_output_body().is_err() {
             return Err(WaktermCliError::InvalidEventPage(
                 "visible output event has no text",
             ));

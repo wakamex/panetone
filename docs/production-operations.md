@@ -95,6 +95,8 @@ At startup Panetone creates a durable route and Telegram topic for each live Wak
 
 When a route has multiple agent panes, a quoted channel reply targets the pane that produced the quoted message. Otherwise the most recent pane to produce visible output wins, followed by the lowest live pane ID.
 
+Assistant messages and plans are forwarded to the route's selected output channel. When Wakterm reports an aborted turn with a safe nonempty detail, Panetone forwards that detail as a `Turn failed:` notice. Completed `turn_final` events are not forwarded because their assistant message was already projected. Event identity provides the same durable deduplication as other visible output.
+
 ## Launcher contract
 
 An external launcher must use the control CLI rather than the database or the

@@ -47,6 +47,37 @@ pub struct EventRecord {
     pub fields: serde_json::Map<String, Value>,
 }
 
+impl EventRecord {
+    pub fn visible_output_body(&self) -> Result<Option<String>, &'static str> {
+        match self.kind.as_str() {
+            "plan" => self
+                .text()
+                .map(|text| Some(format!("Plan:\n{text}")))
+                .ok_or("visible output event has no text"),
+            "assistant_message" => self
+                .text()
+                .map(|text| Some(text.to_owned()))
+                .ok_or("visible output event has no text"),
+            "turn_final"
+                if self.fields.get("outcome").and_then(Value::as_str) == Some("aborted") =>
+            {
+                Ok(self
+                    .fields
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|detail| !detail.is_empty())
+                    .map(|detail| format!("Turn failed: {detail}")))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn text(&self) -> Option<&str> {
+        self.fields.get("text").and_then(Value::as_str)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum EventRead {
     Events {
