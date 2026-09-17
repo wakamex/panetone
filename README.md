@@ -145,10 +145,7 @@ target/release/panetone send \
   "Investigate the observer bug"
 ```
 
-Add `--return-final` when a correlated completion callback is wanted. A stable
-`--id UUID` makes a retry idempotent. Panetone permanently reserves completed
-UUIDs and never automatically retries a prompt whose admission became
-uncertain.
+Add `--return-final` when a correlated completion callback is wanted. The send command exits after target admission; Panetone mirrors the final to the source route's channel when it arrives and delivers the agent callback when the source agent is idle. A stable `--id UUID` makes a retry idempotent. Panetone permanently reserves completed UUIDs and never automatically retries a prompt whose admission became uncertain.
 
 Run a side-effect-free local check against the loaded Wakterm service:
 

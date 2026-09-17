@@ -201,7 +201,8 @@ A successful acknowledgement is:
   "accepted": true,
   "delivery_state": "submitted",
   "submitted": true,
-  "reply_pending": false
+  "reply_pending": false,
+  "reply_mode": "none"
 }
 ```
 
@@ -221,9 +222,7 @@ tombstones from the initial claim.
 
 ## Asynchronous final return
 
-`return_final: true` requests a correlated Wakterm terminal result. Panetone
-stores the exact source and target incarnations, then returns immediately after
-target admission with `reply_pending: true`.
+`return_final: true` requests a correlated Wakterm terminal result. Panetone stores the exact source and target incarnations, then returns immediately after target admission with `reply_pending: true`, `reply_mode: "asynchronous_final_callback"`, and a `reply_detail` explaining the delivery path. The control response is an admission acknowledgement, not the target's final response.
 
 When Wakterm emits the terminal result, Panetone verifies it against the exact
 submitted target and persists it before:

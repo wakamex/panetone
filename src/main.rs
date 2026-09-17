@@ -100,7 +100,10 @@ struct SendArgs {
     target: String,
     #[arg(long)]
     id: Option<Uuid>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Request an asynchronous final callback; this command exits after admission"
+    )]
     return_final: bool,
     #[command(flatten)]
     control: ControlSocketArgs,

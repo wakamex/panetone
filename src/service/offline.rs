@@ -14,12 +14,57 @@ use crate::store::{
 };
 use crate::wakterm::{ContractError, EventRead, FakeWakterm, TerminalResult, WaktermCli};
 
+const ASYNC_REPLY_DETAIL: &str = "This command does not wait for completion. Panetone mirrors the final to the source route's channel when it arrives and delivers the agent callback when the source agent is idle.";
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ServiceAck {
     pub accepted: bool,
     pub delivery_state: String,
     pub submitted: bool,
     pub reply_pending: bool,
+    #[serde(default)]
+    pub reply_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_detail: Option<String>,
+}
+
+impl ServiceAck {
+    fn queued(return_final: bool) -> Self {
+        Self::new("queued", false, false, return_final)
+    }
+
+    fn submitted(return_final: bool) -> Self {
+        Self::new("submitted", true, return_final, return_final)
+    }
+
+    fn new(delivery_state: &str, submitted: bool, reply_pending: bool, return_final: bool) -> Self {
+        Self {
+            accepted: true,
+            delivery_state: delivery_state.into(),
+            submitted,
+            reply_pending,
+            reply_mode: if return_final {
+                "asynchronous_final_callback".into()
+            } else {
+                "none".into()
+            },
+            reply_detail: return_final.then(|| ASYNC_REPLY_DETAIL.into()),
+        }
+    }
+
+    fn restore_explanation(mut self, return_final: bool) -> Self {
+        if self.reply_mode.is_empty() {
+            self.reply_mode = if return_final {
+                "asynchronous_final_callback".into()
+            } else {
+                "none".into()
+            };
+        }
+        if return_final && self.reply_detail.is_none() {
+            self.reply_detail = Some(ASYNC_REPLY_DETAIL.into());
+        }
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -295,7 +340,8 @@ impl OfflineService {
             ClaimResult::New(record) => record,
             ClaimResult::Existing(record) => {
                 if let Some(response) = record.response {
-                    return Ok(serde_json::from_value(response)?);
+                    return Ok(serde_json::from_value::<ServiceAck>(response)?
+                        .restore_explanation(record.command.return_final));
                 }
                 record
             }
@@ -316,18 +362,8 @@ impl OfflineService {
                     .await;
             }
             WorkflowState::AwaitingTargetIdle => {
-                return persist_ack(
-                    &self.store,
-                    record,
-                    ServiceAck {
-                        accepted: true,
-                        delivery_state: "queued".into(),
-                        submitted: false,
-                        reply_pending: false,
-                    },
-                    now_ms,
-                )
-                .await;
+                let ack = ServiceAck::queued(record.command.return_final);
+                return persist_ack(&self.store, record, ack, now_ms).await;
             }
             WorkflowState::Submitted => {
                 self.post_target_status(
@@ -338,12 +374,7 @@ impl OfflineService {
                     now_ms,
                 )
                 .await?;
-                let ack = ServiceAck {
-                    accepted: true,
-                    delivery_state: "submitted".into(),
-                    submitted: true,
-                    reply_pending: record.command.return_final,
-                };
+                let ack = ServiceAck::submitted(record.command.return_final);
                 record.response = Some(serde_json::to_value(&ack)?);
                 transition(&self.store, &mut record, WorkflowState::Completed, now_ms).await?;
                 return Ok(ack);
@@ -494,18 +525,8 @@ impl OfflineService {
                     )
                     .await?;
                 }
-                persist_ack(
-                    &self.store,
-                    record,
-                    ServiceAck {
-                        accepted: true,
-                        delivery_state: "queued".into(),
-                        submitted: false,
-                        reply_pending: false,
-                    },
-                    now_ms,
-                )
-                .await
+                let ack = ServiceAck::queued(record.command.return_final);
+                persist_ack(&self.store, record, ack, now_ms).await
             }
             WorkflowState::Submitted => {
                 self.post_target_status(
@@ -517,12 +538,7 @@ impl OfflineService {
                 )
                 .await?;
                 record.workflow.submitted_target = Some(target);
-                let ack = ServiceAck {
-                    accepted: true,
-                    delivery_state: "submitted".into(),
-                    submitted: true,
-                    reply_pending: record.command.return_final,
-                };
+                let ack = ServiceAck::submitted(record.command.return_final);
                 record.response = Some(serde_json::to_value(&ack)?);
                 transition(&self.store, &mut record, WorkflowState::Completed, now_ms).await?;
                 Ok(ack)

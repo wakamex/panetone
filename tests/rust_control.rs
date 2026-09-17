@@ -17,6 +17,19 @@ use uuid::Uuid;
 
 struct Echo;
 
+#[tokio::test]
+async fn send_help_identifies_return_final_as_asynchronous() {
+    let output = Command::new(env!("CARGO_BIN_EXE_panetone"))
+        .args(["send", "--help"])
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Request an asynchronous final callback"));
+    assert!(stdout.contains("this command exits after admission"));
+}
+
 impl ControlHandler for Echo {
     fn handle(
         &self,

@@ -105,6 +105,28 @@ async fn audit_is_visible_before_exact_target_admission() {
 }
 
 #[tokio::test]
+async fn return_final_acknowledgement_explains_asynchronous_delivery() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let service = OfflineService::new(
+        store.clone(),
+        FakeWakterm::new(contract()),
+        RecordingChannels::default(),
+    );
+    let (source, target) = routes();
+    let ack = service
+        .submit(command(11, true), &source, &target, 100)
+        .await
+        .unwrap();
+
+    assert!(ack.reply_pending);
+    assert_eq!(ack.reply_mode, "asynchronous_final_callback");
+    assert!(ack.reply_detail.unwrap().contains("does not wait"));
+    drop(service);
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn long_audit_is_fully_delivered_in_durable_chunks_before_admission() {
     let directory = tempdir().unwrap();
     let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
@@ -204,13 +226,16 @@ async fn busy_target_queues_durably_and_re_resolves_the_same_route_before_retry(
     wakterm.script_receipts([AdmissionStatus::Busy]);
     let service = OfflineService::new(store.clone(), wakterm, RecordingChannels::default());
     let (source, mut target) = routes();
-    let request = command(12, false);
+    let request = command(12, true);
     let queued = service
         .submit(request.clone(), &source, &target, 100)
         .await
         .unwrap();
     assert_eq!(queued.delivery_state, "queued");
     assert!(!queued.submitted);
+    assert!(!queued.reply_pending);
+    assert_eq!(queued.reply_mode, "asynchronous_final_callback");
+    assert!(queued.reply_detail.unwrap().contains("does not wait"));
     assert!(service.wakterm().calls().is_empty());
     drop(service);
     store.shutdown().await.unwrap();
