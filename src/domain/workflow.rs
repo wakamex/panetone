@@ -120,6 +120,8 @@ pub struct Workflow {
     pub observed_source: AgentBinding,
     pub observed_target: AgentBinding,
     pub submitted_target: Option<AgentBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_admission_receipt: Option<Box<AdmissionReceipt>>,
     pub state: WorkflowState,
 }
 
@@ -176,7 +178,7 @@ impl Workflow {
         receipt: &AdmissionReceipt,
         binding: &AgentBinding,
     ) -> Result<WorkflowState, WorkflowError> {
-        receipt.validate(self.target_effect_id, binding)?;
+        self.record_target_receipt(receipt, binding)?;
         let next = match receipt.status {
             AdmissionStatus::Accepted => {
                 self.submitted_target = Some(binding.clone());
@@ -188,6 +190,16 @@ impl Workflow {
         };
         self.transition(next)?;
         Ok(next)
+    }
+
+    pub fn record_target_receipt(
+        &mut self,
+        receipt: &AdmissionReceipt,
+        binding: &AgentBinding,
+    ) -> Result<(), WorkflowError> {
+        receipt.validate(self.target_effect_id, binding)?;
+        self.target_admission_receipt = Some(Box::new(receipt.clone()));
+        Ok(())
     }
 }
 
@@ -283,6 +295,7 @@ mod tests {
             observed_source: binding(),
             observed_target: binding(),
             submitted_target: None,
+            target_admission_receipt: None,
             state: WorkflowState::AdmissionPrepared,
         }
     }
@@ -328,6 +341,17 @@ mod tests {
             semantic_request_hash(&omitted),
             semantic_request_hash(&steering)
         );
+    }
+
+    #[test]
+    fn historical_workflow_without_admission_receipt_still_loads() {
+        let mut value = serde_json::to_value(workflow()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("target_admission_receipt");
+        let restored: Workflow = serde_json::from_value(value).unwrap();
+        assert!(restored.target_admission_receipt.is_none());
     }
 
     #[test]

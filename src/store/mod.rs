@@ -193,7 +193,7 @@ enum Command {
         reply: oneshot::Sender<StoreResult<Option<StoredWorkflow>>>,
     },
     SaveWorkflow {
-        record: StoredWorkflow,
+        record: Box<StoredWorkflow>,
         expected: WorkflowState,
         reply: oneshot::Sender<StoreResult<()>>,
     },
@@ -385,7 +385,7 @@ impl StoreHandle {
         expected: WorkflowState,
     ) -> StoreResult<()> {
         self.request(|reply| Command::SaveWorkflow {
-            record,
+            record: Box::new(record),
             expected,
             reply,
         })
@@ -958,6 +958,7 @@ fn claim(
         observed_source: source,
         observed_target: target,
         submitted_target: None,
+        target_admission_receipt: None,
         state: WorkflowState::Claimed,
     };
     let record = StoredWorkflow {

@@ -207,13 +207,28 @@ async fn definitive_target_failure_adds_a_linked_visible_failure_annotation() {
     let (source, target) = routes();
     let request = command(111, false);
     assert!(matches!(
-        service.submit(request, &source, &target, 100).await,
-        Err(ServiceError::AdmissionFailed(WorkflowState::Failed))
+        service.submit(request.clone(), &source, &target, 100).await,
+        Err(ServiceError::AdmissionRejected {
+            state: WorkflowState::Failed,
+            status: AdmissionStatus::Unavailable,
+            ref detail,
+        }) if detail == "fake Unavailable"
     ));
+    let stored = store.get_workflow(request.id).await.unwrap().unwrap();
+    let receipt = stored
+        .workflow
+        .target_admission_receipt
+        .expect("failure receipt is durable");
+    assert_eq!(receipt.status, AdmissionStatus::Unavailable);
+    assert_eq!(receipt.detail.as_deref(), Some("fake Unavailable"));
     let calls = service.channels().calls();
     assert_eq!(calls.len(), 2);
     assert!(calls[0].body.starts_with("[pending]"));
-    assert!(calls[1].body.contains("DELIVERY FAILED"));
+    assert!(
+        calls[1]
+            .body
+            .contains("DELIVERY FAILED: Unavailable: fake Unavailable")
+    );
     drop(service);
     store.shutdown().await.unwrap();
 }

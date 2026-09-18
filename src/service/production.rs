@@ -277,7 +277,11 @@ impl ProductionService {
                 | Err(ServiceError::RouteUnavailable(_))
                 | Err(ServiceError::AdmissionFailed(
                     WorkflowState::Failed | WorkflowState::Indeterminate,
-                )) => {}
+                ))
+                | Err(ServiceError::AdmissionRejected {
+                    state: WorkflowState::Failed | WorkflowState::Indeterminate,
+                    ..
+                }) => {}
                 Err(error) => return Err(error.to_string()),
             }
         }

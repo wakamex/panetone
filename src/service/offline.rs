@@ -145,6 +145,12 @@ pub enum ServiceError {
     AuditFailed(String),
     #[error("target admission failed in state {0:?}")]
     AdmissionFailed(WorkflowState),
+    #[error("target admission failed in state {state:?}: {status:?}: {detail}")]
+    AdmissionRejected {
+        state: WorkflowState,
+        status: AdmissionStatus,
+        detail: String,
+    },
     #[error("adapter operation became uncertain: {0}")]
     Adapter(String),
     #[error("terminal result does not match the persisted workflow identity")]
@@ -539,7 +545,7 @@ impl OfflineService {
         };
         self.faults.hit(FaultPoint::AfterPromptEffect)?;
         if receipt.status == AdmissionStatus::Busy && record.command.steer {
-            receipt.validate(record.workflow.target_effect_id, &target)?;
+            record.workflow.record_target_receipt(&receipt, &target)?;
             let acknowledged = match self.wakterm.steer(&target, prompt).await {
                 Ok(acknowledged) => acknowledged,
                 Err(error) => {
@@ -597,15 +603,23 @@ impl OfflineService {
                     .await
             }
             WorkflowState::Indeterminate | WorkflowState::Failed => {
+                let detail = receipt
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| "no admission detail was provided".into());
                 self.post_target_status(
                     &record,
                     target_channel,
                     "delivery-failed",
-                    "DELIVERY FAILED; see durable request state",
+                    &format!("DELIVERY FAILED: {:?}: {detail}", receipt.status),
                     now_ms,
                 )
                 .await?;
-                Err(ServiceError::AdmissionFailed(state))
+                Err(ServiceError::AdmissionRejected {
+                    state,
+                    status: receipt.status,
+                    detail,
+                })
             }
             _ => Err(ServiceError::AdmissionFailed(state)),
         }

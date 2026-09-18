@@ -364,7 +364,7 @@ elif [[ "$operation" == *"agent admit"* ]]; then
   printf '{{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"busy","definitive":true,"prompt_written":false,"agent_id":"agent-target","incarnation_id":"%s","detail":"target is busy"}}\n' "$request_id" "$incarnation"
 elif [[ "$operation" == *"agent send agent-target"* ]]; then
   cat > '{}'
-  echo '{{"agent_id":"agent-target","agent_name":"target","pane_id":2,"transport":"managed_app_server","submitted":true,"acknowledgement":{{"kind":"app_server","acknowledged":true,"latency_ms":1,"session_path":null,"detail":null}}}}'
+  echo '{{"agent_id":"agent-target","agent_name":"target","pane_id":2,"transport":"CodexAppServerTui","submitted":true,"acknowledgement":{{"kind":"app_server","acknowledged":true,"latency_ms":1,"session_path":null,"detail":"[app-server-tui running] Codex commandExecution"}}}}'
 else
   echo "unexpected fake invocation: $operation" >&2
   exit 92

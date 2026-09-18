@@ -218,6 +218,8 @@ If Wakterm may have accepted a prompt but Panetone did not receive or persist a
 definitive receipt, the workflow becomes indeterminate and is never retried
 automatically.
 
+A definitive Wakterm rejection stores the complete target admission receipt in `workflow.target_admission_receipt`. The control error and linked channel failure annotation include its status and detail, so an observer, identity, availability, or contract failure is distinguishable without reading Wakterm's private store.
+
 Reusing a UUID with the same semantic request returns its stored
 acknowledgement without repeating effects. Reusing it with different content
 returns `idempotency_conflict`. Request UUIDs are reserved in durable
