@@ -6,8 +6,8 @@ use thiserror::Error;
 
 use crate::channels::{RealChannels, RecordingChannels};
 use crate::domain::{
-    AgentBinding, CallbackDelivery, ChannelBinding, ChannelKind, DeliveryState, EffectId,
-    OutboxItem, OutboxState, Route, SendCommand, WorkflowId, WorkflowState,
+    AdmissionStatus, AgentBinding, CallbackDelivery, ChannelBinding, ChannelKind, DeliveryState,
+    EffectId, OutboxItem, OutboxState, Route, SendCommand, WorkflowId, WorkflowState,
 };
 use crate::store::{
     ClaimResult, DestinationDelivery, ReturnDelivery, StoreError, StoreHandle, StoredWorkflow,
@@ -26,6 +26,8 @@ pub struct ServiceAck {
     pub reply_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steering_acknowledged: Option<bool>,
 }
 
 impl ServiceAck {
@@ -49,6 +51,19 @@ impl ServiceAck {
                 "none".into()
             },
             reply_detail: return_final.then(|| ASYNC_REPLY_DETAIL.into()),
+            steering_acknowledged: None,
+        }
+    }
+
+    fn steered(acknowledged: bool) -> Self {
+        Self {
+            accepted: true,
+            delivery_state: "steered".into(),
+            submitted: true,
+            reply_pending: false,
+            reply_mode: "none".into(),
+            reply_detail: None,
+            steering_acknowledged: Some(acknowledged),
         }
     }
 
@@ -74,6 +89,7 @@ pub enum FaultPoint {
     AfterAuditCheckpoint,
     AfterAdmissionPrepared,
     AfterPromptEffect,
+    AfterSteeringEffect,
     AfterReceiptCheckpoint,
     AfterReturnPersist,
     AfterMirrorEffect,
@@ -123,6 +139,8 @@ pub enum ServiceError {
     IdempotencyConflict,
     #[error("the request id payload has expired and remains reserved in state {0}")]
     Expired(String),
+    #[error("active-turn steering cannot request a correlated final callback")]
+    SteeringReturnFinal,
     #[error("audit delivery failed before prompt submission: {0}")]
     AuditFailed(String),
     #[error("target admission failed in state {0:?}")]
@@ -176,6 +194,17 @@ impl WaktermBackend {
             Self::Real(wakterm) => wakterm
                 .admit(request_id, binding, &prompt, return_final, timeout_ms)
                 .await
+                .map_err(|error| ServiceError::Adapter(error.to_string())),
+        }
+    }
+
+    async fn steer(&self, binding: &AgentBinding, prompt: String) -> Result<bool, ServiceError> {
+        match self {
+            Self::Fake(wakterm) => Ok(wakterm.steer(binding, prompt)),
+            Self::Real(wakterm) => wakterm
+                .steer(binding, &prompt)
+                .await
+                .map(|receipt| receipt.acknowledged())
                 .map_err(|error| ServiceError::Adapter(error.to_string())),
         }
     }
@@ -323,6 +352,9 @@ impl OfflineService {
         target: &Route,
         now_ms: i64,
     ) -> Result<ServiceAck, ServiceError> {
+        if command.steer && command.return_final {
+            return Err(ServiceError::SteeringReturnFinal);
+        }
         let source_binding = available_agent(source)?;
         let target_binding = available_agent(target)?;
         let claim = self
@@ -339,8 +371,10 @@ impl OfflineService {
         let mut record = match claim {
             ClaimResult::New(record) => record,
             ClaimResult::Existing(record) => {
-                if let Some(response) = record.response {
-                    return Ok(serde_json::from_value::<ServiceAck>(response)?
+                if record.workflow.state != WorkflowState::Submitted
+                    && let Some(response) = record.response.as_ref()
+                {
+                    return Ok(serde_json::from_value::<ServiceAck>(response.clone())?
                         .restore_explanation(record.command.return_final));
                 }
                 record
@@ -366,18 +400,14 @@ impl OfflineService {
                 return persist_ack(&self.store, record, ack, now_ms).await;
             }
             WorkflowState::Submitted => {
-                self.post_target_status(
-                    &record,
-                    channel_destination(target)?,
-                    "submitted",
-                    "prompt accepted by Wakterm",
-                    now_ms,
-                )
-                .await?;
-                let ack = ServiceAck::submitted(record.command.return_final);
-                record.response = Some(serde_json::to_value(&ack)?);
-                transition(&self.store, &mut record, WorkflowState::Completed, now_ms).await?;
-                return Ok(ack);
+                let ack = match record.response.as_ref() {
+                    Some(response) => serde_json::from_value::<ServiceAck>(response.clone())?
+                        .restore_explanation(record.command.return_final),
+                    None => ServiceAck::submitted(record.command.return_final),
+                };
+                return self
+                    .complete_submission(record, channel_destination(target)?, ack, now_ms)
+                    .await;
             }
             WorkflowState::Indeterminate | WorkflowState::Failed => {
                 return Err(ServiceError::AdmissionFailed(record.workflow.state));
@@ -481,7 +511,7 @@ impl OfflineService {
             .admit(
                 record.workflow.target_effect_id,
                 &target,
-                prompt,
+                prompt.clone(),
                 record.command.return_final,
                 record.command.timeout_ms,
             )
@@ -508,6 +538,39 @@ impl OfflineService {
             }
         };
         self.faults.hit(FaultPoint::AfterPromptEffect)?;
+        if receipt.status == AdmissionStatus::Busy && record.command.steer {
+            receipt.validate(record.workflow.target_effect_id, &target)?;
+            let acknowledged = match self.wakterm.steer(&target, prompt).await {
+                Ok(acknowledged) => acknowledged,
+                Err(error) => {
+                    transition(
+                        &self.store,
+                        &mut record,
+                        WorkflowState::Indeterminate,
+                        now_ms,
+                    )
+                    .await?;
+                    self.post_target_status(
+                        &record,
+                        target_channel,
+                        "delivery-failed",
+                        "STEERING INDETERMINATE; see durable request state",
+                        now_ms,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
+            self.faults.hit(FaultPoint::AfterSteeringEffect)?;
+            record.workflow.submitted_target = Some(target);
+            let ack = ServiceAck::steered(acknowledged);
+            record.response = Some(serde_json::to_value(&ack)?);
+            transition(&self.store, &mut record, WorkflowState::Submitted, now_ms).await?;
+            self.faults.hit(FaultPoint::AfterReceiptCheckpoint)?;
+            return self
+                .complete_submission(record, target_channel, ack, now_ms)
+                .await;
+        }
         let expected = record.workflow.state;
         let state = record.workflow.apply_target_receipt(&receipt, &target)?;
         record.updated_at_ms = now_ms;
@@ -529,19 +592,9 @@ impl OfflineService {
                 persist_ack(&self.store, record, ack, now_ms).await
             }
             WorkflowState::Submitted => {
-                self.post_target_status(
-                    &record,
-                    target_channel,
-                    "submitted",
-                    "prompt accepted by Wakterm",
-                    now_ms,
-                )
-                .await?;
-                record.workflow.submitted_target = Some(target);
                 let ack = ServiceAck::submitted(record.command.return_final);
-                record.response = Some(serde_json::to_value(&ack)?);
-                transition(&self.store, &mut record, WorkflowState::Completed, now_ms).await?;
-                Ok(ack)
+                self.complete_submission(record, target_channel, ack, now_ms)
+                    .await
             }
             WorkflowState::Indeterminate | WorkflowState::Failed => {
                 self.post_target_status(
@@ -556,6 +609,32 @@ impl OfflineService {
             }
             _ => Err(ServiceError::AdmissionFailed(state)),
         }
+    }
+
+    async fn complete_submission(
+        &self,
+        mut record: StoredWorkflow,
+        target_channel: (ChannelKind, String),
+        ack: ServiceAck,
+        now_ms: i64,
+    ) -> Result<ServiceAck, ServiceError> {
+        let (purpose, detail) = if ack.delivery_state == "steered" {
+            (
+                "steered",
+                if ack.steering_acknowledged == Some(true) {
+                    "active-turn steering submitted and observer acknowledged"
+                } else {
+                    "active-turn steering submitted without observer acknowledgement"
+                },
+            )
+        } else {
+            ("submitted", "prompt accepted by Wakterm")
+        };
+        self.post_target_status(&record, target_channel, purpose, detail, now_ms)
+            .await?;
+        record.response = Some(serde_json::to_value(&ack)?);
+        transition(&self.store, &mut record, WorkflowState::Completed, now_ms).await?;
+        Ok(ack)
     }
 
     async fn post_target_status(

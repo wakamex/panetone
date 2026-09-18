@@ -45,6 +45,7 @@ fn command(value: u128, return_final: bool) -> SendCommand {
         target: "target".into(),
         message: "do the work".into(),
         return_final,
+        steer: false,
         timeout_ms: 0,
     }
 }
@@ -270,6 +271,178 @@ async fn busy_target_queues_durably_and_re_resolves_the_same_route_before_retry(
     );
     drop(service);
     reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn explicit_steering_redirects_a_busy_target_once_and_returns_its_acknowledgement() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let wakterm = FakeWakterm::new(contract());
+    wakterm.script_receipts([AdmissionStatus::Busy]);
+    let service = OfflineService::new(store.clone(), wakterm, RecordingChannels::default());
+    let (source, target) = routes();
+    let mut request = command(120, false);
+    request.steer = true;
+
+    let ack = service
+        .submit(request.clone(), &source, &target, 100)
+        .await
+        .unwrap();
+    assert_eq!(ack.delivery_state, "steered");
+    assert!(ack.submitted);
+    assert_eq!(ack.steering_acknowledged, Some(true));
+    assert_eq!(service.wakterm().steering_calls().len(), 1);
+    assert!(
+        service.wakterm().steering_calls()[0]
+            .prompt
+            .contains("From: source (codex)")
+    );
+    assert!(service.channels().calls()[1].body.starts_with("[steered]"));
+
+    let duplicate = service
+        .submit(request.clone(), &source, &target, 200)
+        .await
+        .unwrap();
+    assert_eq!(duplicate, ack);
+    assert_eq!(service.wakterm().steering_calls().len(), 1);
+    assert_eq!(service.channels().calls().len(), 2);
+    let mut queued_mode = request;
+    queued_mode.steer = false;
+    assert!(matches!(
+        service.submit(queued_mode, &source, &target, 300).await,
+        Err(ServiceError::IdempotencyConflict)
+    ));
+    drop(service);
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn explicit_steering_starts_a_normal_turn_when_the_target_is_idle() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let service = OfflineService::new(
+        store.clone(),
+        FakeWakterm::new(contract()),
+        RecordingChannels::default(),
+    );
+    let (source, target) = routes();
+    let mut request = command(121, false);
+    request.steer = true;
+
+    let ack = service
+        .submit(request, &source, &target, 100)
+        .await
+        .unwrap();
+    assert_eq!(ack.delivery_state, "submitted");
+    assert!(ack.submitted);
+    assert_eq!(ack.steering_acknowledged, None);
+    assert_eq!(service.wakterm().calls().len(), 1);
+    assert!(service.wakterm().steering_calls().is_empty());
+    drop(service);
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn crash_after_steering_recovers_indeterminate_without_a_second_write() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("state.sqlite3");
+    let store = StoreHandle::open(&path).unwrap();
+    let wakterm = FakeWakterm::new(contract());
+    wakterm.script_receipts([AdmissionStatus::Busy]);
+    let faults = Arc::new(FaultInjector::default());
+    faults.arm(FaultPoint::AfterSteeringEffect);
+    let service =
+        OfflineService::with_faults(store.clone(), wakterm, RecordingChannels::default(), faults);
+    let (source, target) = routes();
+    let mut request = command(123, false);
+    request.steer = true;
+
+    assert!(matches!(
+        service.submit(request.clone(), &source, &target, 100).await,
+        Err(ServiceError::Injected(FaultPoint::AfterSteeringEffect))
+    ));
+    assert_eq!(service.wakterm().steering_calls().len(), 1);
+    drop(service);
+    store.shutdown().await.unwrap();
+
+    let reopened = StoreHandle::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .get_workflow(request.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .workflow
+            .state,
+        WorkflowState::Indeterminate
+    );
+    let replacement = OfflineService::new(
+        reopened.clone(),
+        FakeWakterm::new(contract()),
+        RecordingChannels::default(),
+    );
+    assert!(matches!(
+        replacement.submit(request, &source, &target, 200).await,
+        Err(ServiceError::AdmissionFailed(WorkflowState::Indeterminate))
+    ));
+    assert!(replacement.wakterm().steering_calls().is_empty());
+    drop(replacement);
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn crash_after_durable_steering_receipt_finishes_with_the_same_acknowledgement() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let wakterm = FakeWakterm::new(contract());
+    wakterm.script_receipts([AdmissionStatus::Busy]);
+    let faults = Arc::new(FaultInjector::default());
+    faults.arm(FaultPoint::AfterReceiptCheckpoint);
+    let service =
+        OfflineService::with_faults(store.clone(), wakterm, RecordingChannels::default(), faults);
+    let (source, target) = routes();
+    let mut request = command(124, false);
+    request.steer = true;
+
+    assert!(matches!(
+        service.submit(request.clone(), &source, &target, 100).await,
+        Err(ServiceError::Injected(FaultPoint::AfterReceiptCheckpoint))
+    ));
+    assert_eq!(service.wakterm().steering_calls().len(), 1);
+    let ack = service
+        .submit(request, &source, &target, 200)
+        .await
+        .unwrap();
+    assert_eq!(ack.delivery_state, "steered");
+    assert_eq!(ack.steering_acknowledged, Some(true));
+    assert_eq!(service.wakterm().steering_calls().len(), 1);
+    assert!(service.channels().calls()[1].body.starts_with("[steered]"));
+    drop(service);
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn explicit_steering_rejects_return_final_before_claiming_the_request() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let service = OfflineService::new(
+        store.clone(),
+        FakeWakterm::new(contract()),
+        RecordingChannels::default(),
+    );
+    let (source, target) = routes();
+    let mut request = command(122, true);
+    request.steer = true;
+
+    assert!(matches!(
+        service.submit(request.clone(), &source, &target, 100).await,
+        Err(ServiceError::SteeringReturnFinal)
+    ));
+    assert!(store.get_workflow(request.id).await.unwrap().is_none());
+    assert!(service.channels().calls().is_empty());
+    assert!(service.wakterm().calls().is_empty());
+    drop(service);
+    store.shutdown().await.unwrap();
 }
 
 #[tokio::test]

@@ -105,6 +105,12 @@ struct SendArgs {
         help = "Request an asynchronous final callback; this command exits after admission"
     )]
     return_final: bool,
+    #[arg(
+        long,
+        conflicts_with = "return_final",
+        help = "Steer an active turn immediately; starts a normal turn when the target is idle"
+    )]
+    steer: bool,
     #[command(flatten)]
     control: ControlSocketArgs,
     message: String,
@@ -651,6 +657,7 @@ async fn run_send(args: SendArgs) -> Result<()> {
         target: args.target,
         message: args.message,
         return_final: args.return_final,
+        steer: args.steer,
         timeout_ms: 0,
     };
     let response = request(

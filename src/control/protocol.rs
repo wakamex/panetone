@@ -25,6 +25,8 @@ pub struct SendParams {
     #[serde(default)]
     pub return_final: bool,
     #[serde(default)]
+    pub steer: bool,
+    #[serde(default)]
     pub timeout_ms: u64,
 }
 
@@ -57,6 +59,7 @@ impl SendParams {
             target: self.target,
             message: self.message,
             return_final: self.return_final,
+            steer: self.steer,
             timeout_ms: self.timeout_ms,
         }
     }

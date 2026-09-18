@@ -141,6 +141,7 @@ fn fake_wakterm_uses_exact_identity_stable_ids_and_labeled_envelopes() {
             target: "wakterm".into(),
             message: "review this".into(),
             return_final: true,
+            steer: false,
             timeout_ms: 0,
         },
         "codex",

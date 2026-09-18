@@ -13,6 +13,8 @@ pub struct SendCommand {
     #[serde(default)]
     pub return_final: bool,
     #[serde(default)]
+    pub steer: bool,
+    #[serde(default)]
     pub timeout_ms: u64,
 }
 
@@ -34,6 +36,12 @@ pub fn semantic_request_hash(command: &SendCommand) -> String {
         digest.update([0]);
     }
     digest.update(command.timeout_ms.to_string().as_bytes());
+    // Preserve the semantic hash of existing/default queued sends. Steering is
+    // an additive mode and must conflict with a queued send using the same ID.
+    if command.steer {
+        digest.update([0]);
+        digest.update(b"steer");
+    }
     format!("{:x}", digest.finalize())
 }
 
@@ -306,12 +314,19 @@ mod tests {
             target: "target".into(),
             message: "hello".into(),
             return_final: false,
+            steer: false,
             timeout_ms: 0,
         };
         let explicit = omitted.clone();
         assert_eq!(
             semantic_request_hash(&omitted),
             semantic_request_hash(&explicit)
+        );
+        let mut steering = omitted.clone();
+        steering.steer = true;
+        assert_ne!(
+            semantic_request_hash(&omitted),
+            semantic_request_hash(&steering)
         );
     }
 

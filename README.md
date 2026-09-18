@@ -86,10 +86,7 @@ After authorization and routing, Panetone sends the message body unchanged
 except for Debate's sender label and attachment paths. An idle agent receives a
 normal admitted prompt. A busy agent receives immediate active-turn steering
 after Wakterm definitively confirms that admission did not write the prompt.
-Channel, topic, update, and reply metadata remain internal and do not alter what
-the harness sees. Local `panetone send` retains its separate queue-until-idle
-behavior. Signal attachments are downloaded by signal-cli; Panetone appends
-their absolute local paths to the message so the harness can inspect them.
+Channel, topic, update, and reply metadata remain internal and do not alter what the harness sees. Local `panetone send` queues a busy target by default; callers can opt into the same immediate behavior with `--steer`. Signal attachments are downloaded by signal-cli; Panetone appends their absolute local paths to the message so the harness can inspect them.
 Telegram documents up to 20 MB are downloaded into an `attachments/telegram`
 directory beside the database before the update cursor advances. Telegram
 photos use the largest available image size and the same durable download path.
@@ -145,7 +142,16 @@ target/release/panetone send \
   "Investigate the observer bug"
 ```
 
-Add `--return-final` when a correlated completion callback is wanted. The send command exits after target admission; Panetone mirrors the final to the source route's channel when it arrives and delivers the agent callback when the source agent is idle. A stable `--id UUID` makes a retry idempotent. Panetone permanently reserves completed UUIDs and never automatically retries a prompt whose admission became uncertain.
+Steer an active turn immediately, while retaining normal new-turn delivery if the target has become idle:
+
+```sh
+target/release/panetone send --steer \
+  --from wow-astra \
+  --to wow-sol \
+  "Use the corrected requirement for the current turn"
+```
+
+Add `--steer` when the message should redirect an active target turn immediately instead of waiting in the durable busy queue. If the target is idle, it starts a normal new turn. Add `--return-final` when a correlated completion callback is wanted. The two modes are mutually exclusive because active-turn steering cannot create separate final-response correlation. The send command exits after target admission; Panetone mirrors a requested final to the source route's channel when it arrives and delivers the agent callback when the source agent is idle. A stable `--id UUID` makes a retry idempotent. Panetone permanently reserves completed UUIDs and never automatically retries a prompt whose admission became uncertain.
 
 Run a side-effect-free local check against the loaded Wakterm service:
 

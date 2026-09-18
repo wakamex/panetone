@@ -37,6 +37,7 @@ fn command(request_id: WorkflowId, message: &str) -> SendCommand {
         target: "target".into(),
         message: message.into(),
         return_final: false,
+        steer: false,
         timeout_ms: 30_000,
     }
 }

@@ -329,6 +329,56 @@ fi
     (path, admissions)
 }
 
+fn write_busy_steering_wakterm_fake(directory: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let path = directory.join("wakterm-steering-fake");
+    let admitted_prompt = directory.join("admitted-prompt.txt");
+    let steered_prompt = directory.join("steered-prompt.txt");
+    fs::write(
+        &path,
+        format!(
+            r#"#!/bin/bash
+set -euo pipefail
+operation="$*"
+if [[ "$operation" == *"--version"* ]]; then
+  echo 'wakterm steering-test'
+elif [[ "$operation" == *"agent capabilities"* ]]; then
+  echo '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
+elif [[ "$operation" == *"agent catalog"* ]]; then
+  echo '{{"schema":"wakterm.agent-api.v1","as_of_event_sequence":500,"agents":[{{"agent_id":"agent-source","incarnation_id":"inc-source","pane_id":1,"name":"source","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-09-18T00:00:00Z"}},{{"agent_id":"agent-target","incarnation_id":"inc-target","pane_id":2,"name":"target","harness":"codex","status":"busy","turn_state":"waiting_on_agent","alive":true,"observed_at":"2026-09-18T00:00:00Z"}}]}}'
+elif [[ "$operation" == *"list --format json"* ]]; then
+  echo '[{{"pane_id":1,"tab_id":1,"window_id":1,"effective_title":"source"}},{{"pane_id":2,"tab_id":2,"window_id":1,"effective_title":"target"}}]'
+elif [[ "$operation" == *"agent events"* ]]; then
+  echo '{{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":500,"oldest_available_sequence":1,"latest_sequence":500,"next_after_sequence":500,"events":[]}}'
+elif [[ "$operation" == *"agent request watch"* ]]; then
+  exit 0
+elif [[ "$operation" == *"agent admit"* ]]; then
+  request_id=""
+  incarnation=""
+  previous=""
+  for argument in "$@"; do
+    if [[ "$previous" == "--request-id" ]]; then request_id="$argument"; fi
+    if [[ "$previous" == "--incarnation" ]]; then incarnation="$argument"; fi
+    previous="$argument"
+  done
+  cat > '{}'
+  printf '{{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"busy","definitive":true,"prompt_written":false,"agent_id":"agent-target","incarnation_id":"%s","detail":"target is busy"}}\n' "$request_id" "$incarnation"
+elif [[ "$operation" == *"agent send agent-target"* ]]; then
+  cat > '{}'
+  echo '{{"agent_id":"agent-target","agent_name":"target","pane_id":2,"transport":"managed_app_server","submitted":true,"acknowledgement":{{"kind":"app_server","acknowledged":true,"latency_ms":1,"session_path":null,"detail":null}}}}'
+else
+  echo "unexpected fake invocation: $operation" >&2
+  exit 92
+fi
+"#,
+            admitted_prompt.display(),
+            steered_prompt.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    (path, admitted_prompt, steered_prompt)
+}
+
 #[tokio::test]
 async fn production_workflow_resolves_live_routes_and_survives_restart() {
     let directory = tempdir().unwrap();
@@ -451,6 +501,66 @@ async fn production_workflow_resolves_live_routes_and_survives_restart() {
     assert_eq!(fs::read_to_string(&admissions).unwrap().lines().count(), 2);
     assert_eq!(telegram.sent_messages().len(), 4);
     restarted.stop();
+}
+
+#[tokio::test]
+async fn cli_steer_uses_the_busy_turn_path_and_deduplicates_retries() {
+    let directory = tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let database = directory.path().join("state.sqlite3");
+    let store = StoreHandle::open(&database).unwrap();
+    store
+        .save_route(unavailable_route(31, "source", 301), 1)
+        .await
+        .unwrap();
+    store
+        .save_route(unavailable_route(32, "target", 302), 1)
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+    let telegram = HttpCapture::start();
+    let (wakterm, admitted_prompt, steered_prompt) =
+        write_busy_steering_wakterm_fake(directory.path());
+    let daemon = Daemon::start(directory.path(), &database, &wakterm, &telegram.base);
+    let request_id = "33333333-3333-4333-8333-333333333333";
+    let args = [
+        "send",
+        "--from",
+        "source",
+        "--to",
+        "target",
+        "--id",
+        request_id,
+        "--steer",
+        "correct the active turn",
+    ];
+
+    let first = cli(&daemon.socket, &args);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let ack: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(ack["result"]["delivery_state"], "steered");
+    assert_eq!(ack["result"]["submitted"], true);
+    assert_eq!(ack["result"]["steering_acknowledged"], true);
+    assert_eq!(
+        fs::read_to_string(&admitted_prompt).unwrap(),
+        fs::read_to_string(&steered_prompt).unwrap()
+    );
+    assert!(
+        fs::read_to_string(&steered_prompt)
+            .unwrap()
+            .contains("correct the active turn")
+    );
+
+    let duplicate = cli(&daemon.socket, &args);
+    assert!(duplicate.status.success());
+    let duplicate_ack: Value = serde_json::from_slice(&duplicate.stdout).unwrap();
+    assert_eq!(duplicate_ack["result"], ack["result"]);
+    assert_eq!(telegram.sent_messages().len(), 2);
+    daemon.stop();
 }
 
 #[tokio::test]

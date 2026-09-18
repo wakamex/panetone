@@ -17,6 +17,12 @@ pub struct AdmissionCall {
     pub return_final: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SteeringCall {
+    pub binding: AgentBinding,
+    pub prompt: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TerminalResult {
     pub workflow_id: WorkflowId,
@@ -30,6 +36,7 @@ pub struct FakeWakterm {
     contract: WaktermContract,
     receipts: Mutex<VecDeque<AdmissionStatus>>,
     calls: Mutex<Vec<AdmissionCall>>,
+    steering_calls: Mutex<Vec<SteeringCall>>,
 }
 
 impl FakeWakterm {
@@ -38,6 +45,7 @@ impl FakeWakterm {
             contract,
             receipts: Mutex::new(VecDeque::new()),
             calls: Mutex::new(Vec::new()),
+            steering_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -103,6 +111,24 @@ impl FakeWakterm {
         self.calls
             .lock()
             .expect("fake call lock is healthy")
+            .clone()
+    }
+
+    pub fn steer(&self, binding: &AgentBinding, prompt: String) -> bool {
+        self.steering_calls
+            .lock()
+            .expect("fake steering lock is healthy")
+            .push(SteeringCall {
+                binding: binding.clone(),
+                prompt,
+            });
+        true
+    }
+
+    pub fn steering_calls(&self) -> Vec<SteeringCall> {
+        self.steering_calls
+            .lock()
+            .expect("fake steering lock is healthy")
             .clone()
     }
 

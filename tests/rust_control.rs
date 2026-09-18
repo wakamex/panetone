@@ -18,7 +18,7 @@ use uuid::Uuid;
 struct Echo;
 
 #[tokio::test]
-async fn send_help_identifies_return_final_as_asynchronous() {
+async fn send_help_explains_queue_steer_and_asynchronous_return_modes() {
     let output = Command::new(env!("CARGO_BIN_EXE_panetone"))
         .args(["send", "--help"])
         .output()
@@ -28,6 +28,29 @@ async fn send_help_identifies_return_final_as_asynchronous() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Request an asynchronous final callback"));
     assert!(stdout.contains("this command exits after admission"));
+    assert!(stdout.contains("Steer an active turn immediately"));
+    assert!(stdout.contains("starts a normal turn when the target is idle"));
+
+    let incompatible = Command::new(env!("CARGO_BIN_EXE_panetone"))
+        .args([
+            "send",
+            "--from",
+            "source",
+            "--to",
+            "target",
+            "--steer",
+            "--return-final",
+            "message",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(!incompatible.status.success());
+    assert!(
+        String::from_utf8(incompatible.stderr)
+            .unwrap()
+            .contains("cannot be used with")
+    );
 }
 
 impl ControlHandler for Echo {

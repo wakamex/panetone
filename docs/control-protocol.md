@@ -177,12 +177,13 @@ disposition, and exits nonzero after its local timeout while still pending.
     "to": "wakterm",
     "message": "Investigate the observer bug",
     "return_final": false,
+    "steer": false,
     "timeout_ms": 0
   }
 }
 ```
 
-`from`, `to`, and `message` must be non-empty. Route titles resolve by exact case-insensitive match and fail when missing. Every live agent with the same effective title belongs to the route, including agents in separate tabs. `return_final` and `timeout_ms` default to false and zero. A nonzero timeout is rejected because asynchronous final callbacks do not expire.
+`from`, `to`, and `message` must be non-empty. Route titles resolve by exact case-insensitive match and fail when missing. Every live agent with the same effective title belongs to the route, including agents in separate tabs. `return_final` and `steer` default to false, and `timeout_ms` defaults to zero. A nonzero timeout is rejected because asynchronous final callbacks do not expire.
 
 The normal sequence is:
 
@@ -210,6 +211,8 @@ A definitively busy target returns a successful durable registration with
 `delivery_state: "queued"`, `submitted: false`, and `reply_pending: false`.
 The busy worker resolves the workspace route again before admission. It does
 not steer an active turn.
+
+Set `steer: true` to allow immediate active-turn steering instead of queueing. Panetone still attempts exact atomic admission first. An idle target accepts the message as a normal new turn and returns `delivery_state: "submitted"`. A definitively busy target receives the same complete cross-agent message through Wakterm's steering path and returns `delivery_state: "steered"`, `submitted: true`, and `steering_acknowledged: true` or `false`. The acknowledgement field distinguishes observer confirmation from submission. `steer: true` cannot be combined with `return_final: true` because steering does not create a new provider turn with separate final-response correlation.
 
 If Wakterm may have accepted a prompt but Panetone did not receive or persist a
 definitive receipt, the workflow becomes indeterminate and is never retried
