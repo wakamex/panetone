@@ -67,23 +67,27 @@ impl InboundIngestor {
         let routes = self.store.list_routes().await?;
         let matching = routes
             .iter()
-            .filter(|route| {
-                route.channels.iter().any(|binding| match binding {
-                    ChannelBinding::Signal { group_id } => {
-                        group_id.trim_end_matches('=') == message.destination.trim_end_matches('=')
+            .filter_map(|route| {
+                route.channels.iter().find_map(|binding| match binding {
+                    ChannelBinding::Signal {
+                        group_id,
+                        allow_members,
+                    } if group_id.trim_end_matches('=')
+                        == message.destination.trim_end_matches('=') =>
+                    {
+                        Some((route, *allow_members))
                     }
-                    ChannelBinding::Telegram { .. } => false,
+                    _ => None,
                 })
             })
             .collect::<Vec<_>>();
-        let [route] = matching.as_slice() else {
+        let [(_route, allow_members)] = matching.as_slice() else {
             return Ok(false);
         };
-        let is_debate = route.title.eq_ignore_ascii_case("debate");
-        if message.sender_id.as_deref() != Some(owner) && !is_debate {
+        if message.sender_id.as_deref() != Some(owner) && !allow_members {
             return Ok(false);
         }
-        if is_debate {
+        if *allow_members {
             let sender = message
                 .sender
                 .as_deref()

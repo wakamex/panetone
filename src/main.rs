@@ -134,7 +134,7 @@ struct RouteArgs {
 enum RouteCommand {
     /// Inspect one exact case-insensitive route title.
     Inspect(RouteInspectArgs),
-    /// Ensure a live title has a durable Telegram route.
+    /// Ensure a live title has durable channel bindings.
     Ensure(RouteEnsureArgs),
 }
 
@@ -150,6 +150,10 @@ struct RouteEnsureArgs {
     title: String,
     #[arg(long)]
     telegram_topic_id: Option<i64>,
+    #[arg(long)]
+    signal_group_id: Option<String>,
+    #[arg(long, requires = "signal_group_id")]
+    signal_allow_members: bool,
     #[command(flatten)]
     control: ControlSocketArgs,
 }
@@ -715,6 +719,8 @@ async fn run_route(args: RouteArgs) -> Result<()> {
             serde_json::to_value(RouteEnsureParams {
                 title: args.title,
                 telegram_topic_id: args.telegram_topic_id,
+                signal_group_id: args.signal_group_id,
+                signal_allow_members: args.signal_allow_members,
             })?,
         ),
     };

@@ -82,10 +82,7 @@ WAK_SIG_OWNER=+15551111111
 
 Signal subscription timeouts and transport disconnects reconnect inside the inbound worker, so a signal-cli restart does not take down Panetone's control, Telegram, or outbound workers.
 
-After authorization and routing, Panetone sends the message body unchanged
-except for Debate's sender label and attachment paths. An idle agent receives a
-normal admitted prompt. A busy agent receives immediate active-turn steering
-after Wakterm definitively confirms that admission did not write the prompt.
+After authorization and routing, Panetone sends the message body unchanged except for sender labels on member-enabled Signal groups and attachment paths. An idle agent receives a normal admitted prompt. A busy agent receives immediate active-turn steering after Wakterm definitively confirms that admission did not write the prompt.
 Channel, topic, update, and reply metadata remain internal and do not alter what the harness sees. Local `panetone send` queues a busy target by default; callers can opt into the same immediate behavior with `--steer`. Signal attachments are downloaded by signal-cli; Panetone appends their absolute local paths to the message so the harness can inspect them.
 Telegram documents up to 20 MB are downloaded into an `attachments/telegram`
 directory beside the database before the update cursor advances. Telegram
@@ -93,10 +90,8 @@ photos use the largest available image size and the same durable download path.
 Their absolute paths are appended to the message. Attachment-only Signal and
 Telegram messages are supported.
 
-Signal routes are owner-only except for the route titled `debate`. Every member
-of that Signal group is accepted, and the harness receives the minimal sender
-context `<first name> says: <message>`. Unknown groups remain ignored.
-On that route only, an assistant response consisting exactly of `<panetone:no-reply>` after trimming whitespace is durably recorded as suppressed and is not sent to Signal or Telegram. Normal responses and failure notices remain visible.
+Signal routes are owner-only by default. A route bound with `panetone route ensure TITLE --signal-group-id ID --signal-allow-members` accepts every member of that exact Signal group and gives the harness the minimal sender context `<first name> says: <message>`. Unknown groups remain ignored.
+On the `debate` route only, an assistant response consisting exactly of `<panetone:no-reply>` after trimming whitespace is durably recorded as suppressed and is not sent to Signal or Telegram. Normal responses and failure notices remain visible.
 
 ## Commands
 

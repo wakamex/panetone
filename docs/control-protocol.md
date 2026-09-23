@@ -78,23 +78,22 @@ Wakterm resolution:
 }
 ```
 
-`route.ensure` returns an existing Telegram-bound route unchanged or creates a
-Telegram forum topic and persists a new route:
+`route.ensure` establishes the requested durable channel bindings, creating a Telegram forum topic and route when needed:
 
 ```json
 {
   "schema": "panetone.control.v1",
   "id": "fe57dc90-994e-4e73-b09c-fac483d9f05b",
   "method": "route.ensure",
-  "params": {"title": "infobase"}
+  "params": {
+    "title": "infobase",
+    "signal_group_id": "base64-signal-group-id",
+    "signal_allow_members": true
+  }
 }
 ```
 
-The title must contain 1 to 128 characters without surrounding whitespace. A
-new route requires exactly one live Wakterm tab with that effective title. The
-configured primary Telegram bot creates its topic. A caller may instead pass
-`telegram_topic_id` to bind a known positive topic ID. An existing conflicting
-binding returns `route_binding_conflict` and is not changed.
+The title must contain 1 to 128 characters without surrounding whitespace. A new route requires a live Wakterm agent with that effective title. The configured primary Telegram bot creates its topic. A caller may instead pass `telegram_topic_id` to bind a known positive topic ID. `signal_group_id` adds one exact Signal group binding. Signal input remains owner-only unless `signal_allow_members` is true, in which case authenticated group members are accepted with a minimal first-name label. An existing conflicting binding returns `route_binding_conflict` and is not changed. Repeating a member-enabled binding does not downgrade it.
 
 The result is:
 
@@ -120,12 +119,7 @@ The result is:
 }
 ```
 
-`created` reports creation of the route. `binding_created` reports addition of
-its Telegram binding. Repeating `route.ensure` returns both as false and does
-not create another topic. `event_cursor` is Panetone's durable baseline for an
-output sent after this response. A launcher that knows its new pane ID selects
-the matching entry from `live.agents`; a tab may legitimately contain more than
-one agent pane.
+`created` reports creation of the route. `binding_created` reports addition or policy upgrade of a channel binding. Repeating `route.ensure` returns both as false and does not create another topic. `event_cursor` is Panetone's durable baseline for an output sent after this response. A launcher that knows its new pane ID selects the matching entry from `live.agents`; a tab may legitimately contain more than one agent pane.
 
 ## Durable output disposition
 

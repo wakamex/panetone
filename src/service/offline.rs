@@ -970,7 +970,7 @@ fn channel_destination(route: &Route) -> Result<(ChannelKind, String), ServiceEr
         .first()
         .map(|binding| match binding {
             ChannelBinding::Telegram { topic_id } => (ChannelKind::Telegram, topic_id.to_string()),
-            ChannelBinding::Signal { group_id } => (ChannelKind::Signal, group_id.clone()),
+            ChannelBinding::Signal { group_id, .. } => (ChannelKind::Signal, group_id.clone()),
         })
         .ok_or_else(|| ServiceError::MissingChannel(route.title.clone()))
 }

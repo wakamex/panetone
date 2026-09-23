@@ -40,6 +40,10 @@ pub struct RouteEnsureParams {
     pub title: String,
     #[serde(default)]
     pub telegram_topic_id: Option<i64>,
+    #[serde(default)]
+    pub signal_group_id: Option<String>,
+    #[serde(default)]
+    pub signal_allow_members: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

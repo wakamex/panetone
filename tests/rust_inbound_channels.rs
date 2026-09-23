@@ -443,6 +443,7 @@ async fn signal_notifications_are_normalized_and_deduplicated_durably() {
                 title: "private".into(),
                 channels: vec![ChannelBinding::Signal {
                     group_id: "group-one".into(),
+                    allow_members: false,
                 }],
                 agent: None,
             },
@@ -470,16 +471,17 @@ async fn signal_notifications_are_normalized_and_deduplicated_durably() {
 }
 
 #[tokio::test]
-async fn signal_debate_accepts_group_members_and_adds_first_name_only() {
+async fn configured_signal_group_accepts_members_and_adds_first_name_only() {
     let directory = tempdir().unwrap();
     let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
     store
         .save_route(
             Route {
                 id: RouteId::new(Uuid::new_v4()),
-                title: "debate".into(),
+                title: "inquisition".into(),
                 channels: vec![ChannelBinding::Signal {
-                    group_id: "debate-group==".into(),
+                    group_id: "inquisition-group==".into(),
+                    allow_members: true,
                 }],
                 agent: None,
             },
@@ -494,6 +496,7 @@ async fn signal_debate_accepts_group_members_and_adds_first_name_only() {
                 title: "private".into(),
                 channels: vec![ChannelBinding::Signal {
                     group_id: "private-group".into(),
+                    allow_members: false,
                 }],
                 agent: None,
             },
@@ -516,7 +519,12 @@ async fn signal_debate_accepts_group_members_and_adds_first_name_only() {
     assert!(
         ingestor
             .persist_signal(
-                message("friend-debate", "debate-group", "friend", "Andrew RM"),
+                message(
+                    "friend-inquisition",
+                    "inquisition-group",
+                    "friend",
+                    "Melissa Young",
+                ),
                 "owner",
                 10,
             )
@@ -556,7 +564,7 @@ async fn signal_debate_accepts_group_members_and_adds_first_name_only() {
 
     let pending = store.pending_inbox().await.unwrap();
     assert_eq!(pending.len(), 2);
-    assert_eq!(pending[0].body, "Andrew says: hello");
+    assert_eq!(pending[0].body, "Melissa says: hello");
     assert_eq!(pending[1].body, "hello");
     store.shutdown().await.unwrap();
 }

@@ -58,6 +58,7 @@ fn routes() -> (Route, Route) {
             binding("source", "source-incarnation-1", 1),
             ChannelBinding::Signal {
                 group_id: "source-group".into(),
+                allow_members: false,
             },
         ),
         route(

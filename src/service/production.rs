@@ -632,11 +632,16 @@ impl ProductionService {
             || params
                 .telegram_topic_id
                 .is_some_and(|topic_id| topic_id <= 0)
+            || params
+                .signal_group_id
+                .as_deref()
+                .is_some_and(|group_id| group_id.trim().is_empty())
+            || (params.signal_allow_members && params.signal_group_id.is_none())
         {
             return error_response(
                 id,
                 "invalid_params",
-                "route title must be 1 to 128 characters without surrounding whitespace, and a Telegram topic ID must be positive",
+                "route title must be 1 to 128 characters without surrounding whitespace, a Telegram topic ID must be positive, and Signal member access requires a non-empty group ID",
                 None,
             );
         }
@@ -697,7 +702,13 @@ impl ProductionService {
                         }
                     },
                 };
-                let route = telegram_route(params.title, topic_id);
+                let mut route = telegram_route(params.title, topic_id);
+                ensure_signal_binding(
+                    &mut route,
+                    params.signal_group_id.as_deref(),
+                    params.signal_allow_members,
+                )
+                .expect("a new route has no conflicting Signal binding");
                 if let Err(error) = self.store.save_route(route.clone(), now_ms()).await {
                     return internal(id, error);
                 }
@@ -737,10 +748,29 @@ impl ProductionService {
                 },
             };
             route.channels.push(ChannelBinding::Telegram { topic_id });
-            if let Err(error) = self.store.save_route(route.clone(), now_ms()).await {
-                return internal(id, error);
-            }
             binding_created = true;
+        }
+        match ensure_signal_binding(
+            &mut route,
+            params.signal_group_id.as_deref(),
+            params.signal_allow_members,
+        ) {
+            Ok(changed) => binding_created |= changed,
+            Err(existing) => {
+                return error_response(
+                    id,
+                    "route_binding_conflict",
+                    format!(
+                        "route {:?} is already bound to a different Signal group",
+                        route.title
+                    ),
+                    Some(json!({"signal_group_id": existing})),
+                );
+            }
+        }
+        if binding_created && let Err(error) = self.store.save_route(route.clone(), now_ms()).await
+        {
+            return internal(id, error);
         }
         self.route_response(id, &route, false, binding_created, None)
             .await
@@ -927,6 +957,39 @@ fn exact_route<'a>(routes: &'a [Route], name: &str) -> Result<&'a Route, &'stati
     }
 }
 
+fn ensure_signal_binding(
+    route: &mut Route,
+    requested_group_id: Option<&str>,
+    allow_members: bool,
+) -> Result<bool, String> {
+    let Some(requested_group_id) = requested_group_id else {
+        return Ok(false);
+    };
+    if let Some((group_id, existing_allow_members)) =
+        route.channels.iter_mut().find_map(|binding| match binding {
+            ChannelBinding::Signal {
+                group_id,
+                allow_members,
+            } => Some((group_id, allow_members)),
+            ChannelBinding::Telegram { .. } => None,
+        })
+    {
+        if group_id.trim_end_matches('=') != requested_group_id.trim_end_matches('=') {
+            return Err(group_id.clone());
+        }
+        if allow_members && !*existing_allow_members {
+            *existing_allow_members = true;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    route.channels.push(ChannelBinding::Signal {
+        group_id: requested_group_id.to_owned(),
+        allow_members,
+    });
+    Ok(true)
+}
+
 fn valid_route_title(title: &str) -> bool {
     !title.is_empty() && title.trim() == title && title.chars().count() <= 128
 }
@@ -993,7 +1056,7 @@ fn route_matches_inbox(route: &Route, item: &InboxItem) -> bool {
             (ChannelBinding::Telegram { topic_id }, ChannelKind::Telegram) => {
                 topic_id.to_string() == item.destination
             }
-            (ChannelBinding::Signal { group_id }, ChannelKind::Signal) => {
+            (ChannelBinding::Signal { group_id, .. }, ChannelKind::Signal) => {
                 group_id.trim_end_matches('=') == item.destination.trim_end_matches('=')
             }
             _ => false,
@@ -1068,6 +1131,30 @@ mod tests {
             ProfileKind::Current,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn signal_binding_member_policy_is_explicit_and_monotonic() {
+        let mut route = telegram_route("inquisition".into(), 42);
+        assert_eq!(
+            ensure_signal_binding(&mut route, Some("group-id=="), true),
+            Ok(true)
+        );
+        assert!(matches!(
+            route.channels.last(),
+            Some(ChannelBinding::Signal {
+                group_id,
+                allow_members: true,
+            }) if group_id == "group-id=="
+        ));
+        assert_eq!(
+            ensure_signal_binding(&mut route, Some("group-id"), false),
+            Ok(false)
+        );
+        assert_eq!(
+            ensure_signal_binding(&mut route, Some("other-group"), true),
+            Err("group-id==".into())
+        );
     }
 
     #[tokio::test]
@@ -1297,6 +1384,7 @@ fi
             title: "source".into(),
             channels: vec![ChannelBinding::Signal {
                 group_id: "source-group".into(),
+                allow_members: false,
             }],
             agent: Some(AgentBinding {
                 agent_id: "agent-source".into(),
@@ -1429,6 +1517,7 @@ fi
             title: "source".into(),
             channels: vec![ChannelBinding::Signal {
                 group_id: "source-group".into(),
+                allow_members: false,
             }],
             agent: Some(AgentBinding {
                 agent_id: "agent-source".into(),

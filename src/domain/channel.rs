@@ -15,8 +15,14 @@ pub enum ChannelKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChannelBinding {
-    Telegram { topic_id: i64 },
-    Signal { group_id: String },
+    Telegram {
+        topic_id: i64,
+    },
+    Signal {
+        group_id: String,
+        #[serde(default)]
+        allow_members: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

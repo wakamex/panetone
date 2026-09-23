@@ -19,6 +19,7 @@ fn route() -> Route {
             ChannelBinding::Telegram { topic_id: 101 },
             ChannelBinding::Signal {
                 group_id: "signal-zola".into(),
+                allow_members: false,
             },
         ],
         agent: Some(AgentBinding {

@@ -1445,7 +1445,7 @@ fn output_destination(route: &Route, preference: Option<&str>) -> Option<(Channe
         _ => None,
     });
     let signal_group = route.channels.iter().find_map(|binding| match binding {
-        crate::domain::ChannelBinding::Signal { group_id } => Some(group_id.as_str()),
+        crate::domain::ChannelBinding::Signal { group_id, .. } => Some(group_id.as_str()),
         _ => None,
     });
     match selected {
