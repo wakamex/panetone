@@ -329,6 +329,125 @@ fi
     (path, admissions)
 }
 
+fn write_source_pane_wakterm_fake(directory: &Path, request_id: &str) -> (PathBuf, PathBuf) {
+    let path = directory.join("wakterm-source-pane-fake");
+    let admissions = directory.join("source-pane-admissions.log");
+    fs::write(
+        &path,
+        format!(
+            r#"#!/bin/bash
+set -euo pipefail
+operation="$*"
+if [[ "$operation" == *"--version"* ]]; then
+  echo 'wakterm source-pane-test'
+elif [[ "$operation" == *"agent capabilities"* ]]; then
+  echo '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
+elif [[ "$operation" == *"agent catalog"* ]]; then
+  echo '{{"schema":"wakterm.agent-api.v1","as_of_event_sequence":500,"agents":[{{"agent_id":"agent-main","incarnation_id":"inc-main","pane_id":1,"name":"main","harness":"claude","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-09-24T00:00:00Z"}},{{"agent_id":"agent-caller","incarnation_id":"inc-caller","pane_id":85,"name":"inq2","harness":"claude","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-09-24T00:00:00Z"}},{{"agent_id":"agent-target","incarnation_id":"inc-target","pane_id":2,"name":"target","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-09-24T00:00:00Z"}}]}}'
+elif [[ "$operation" == *"list --format json"* ]]; then
+  echo '[{{"pane_id":1,"tab_id":1,"window_id":1,"effective_title":"inquisition"}},{{"pane_id":85,"tab_id":2,"window_id":1,"effective_title":"inq2"}},{{"pane_id":2,"tab_id":3,"window_id":1,"effective_title":"target"}}]'
+elif [[ "$operation" == *"agent events"* ]]; then
+  echo '{{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":500,"oldest_available_sequence":1,"latest_sequence":500,"next_after_sequence":500,"events":[]}}'
+elif [[ "$operation" == *"agent request watch"* ]]; then
+  echo '{{"request_id":"{request_id}","target_agent_id":"agent-target","state":"completed","final_message":"finished","detail":null,"terminal_event_sequence":1}}'
+elif [[ "$operation" == *"agent admit"* ]]; then
+  target=""
+  request_id=""
+  incarnation=""
+  previous=""
+  for argument in "$@"; do
+    if [[ "$previous" == "admit" ]]; then target="$argument"; fi
+    if [[ "$previous" == "--request-id" ]]; then request_id="$argument"; fi
+    if [[ "$previous" == "--incarnation" ]]; then incarnation="$argument"; fi
+    previous="$argument"
+  done
+  cat >/dev/null
+  printf '%s %s\n' "$request_id" "$target" >> '{}'
+  printf '{{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"accepted","definitive":true,"prompt_written":true,"agent_id":"%s","incarnation_id":"%s","detail":null}}\n' "$request_id" "$target" "$incarnation"
+else
+  echo "unexpected fake invocation: $operation" >&2
+  exit 92
+fi
+"#,
+            admissions.display(),
+            request_id = request_id
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    (path, admissions)
+}
+
+#[tokio::test]
+async fn wakterm_source_pane_derives_the_route_without_from() {
+    let directory = tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let database = directory.path().join("state.sqlite3");
+    let store = StoreHandle::open(&database).unwrap();
+    store
+        .save_route(unavailable_route(41, "inquisition", 401), 1)
+        .await
+        .unwrap();
+    store
+        .save_route(unavailable_route(42, "inq2", 402), 1)
+        .await
+        .unwrap();
+    store
+        .save_route(unavailable_route(43, "target", 403), 1)
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+    let request_id = "44444444-4444-4444-8444-444444444444";
+    let telegram = HttpCapture::start();
+    let (wakterm, admissions) = write_source_pane_wakterm_fake(directory.path(), request_id);
+    let daemon = Daemon::start(directory.path(), &database, &wakterm, &telegram.base);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_panetone"))
+        .args([
+            "send",
+            "--socket",
+            daemon.socket.to_str().unwrap(),
+            "--to",
+            "target",
+            "--id",
+            request_id,
+            "--return-final",
+            "do the work",
+        ])
+        .env("WAKTERM_PANE", "85")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let log = fs::read_to_string(&admissions).unwrap_or_default();
+        if log.contains("agent-target") && log.contains("agent-caller") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "callback was not returned to agent-caller: {log}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    daemon.stop();
+
+    let store = StoreHandle::open(&database).unwrap();
+    let workflow_id = panetone::domain::WorkflowId::new(Uuid::parse_str(request_id).unwrap());
+    let workflow = store.get_workflow(workflow_id).await.unwrap().unwrap();
+    assert_eq!(workflow.command.source, "inq2");
+    assert_eq!(workflow.workflow.observed_source.agent_id, "agent-caller");
+    assert_eq!(workflow.workflow.observed_source.pane_id, Some(85));
+    let returned = store.get_return(workflow_id).await.unwrap().unwrap();
+    assert_eq!(returned.agent.source.agent_id, "agent-caller");
+    assert_eq!(returned.agent.source.pane_id, Some(85));
+    store.shutdown().await.unwrap();
+}
+
 fn write_busy_steering_wakterm_fake(directory: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let path = directory.join("wakterm-steering-fake");
     let admitted_prompt = directory.join("admitted-prompt.txt");

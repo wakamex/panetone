@@ -7,7 +7,7 @@ use panetone::control::{
     CONTROL_SCHEMA, ControlHandler, ControlRequest, ControlResponse, ControlServer,
     ControlServerError, error_response, request, success_response,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::tempdir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -170,6 +170,41 @@ async fn client_socket_precedence_is_flag_then_environment_then_runtime_director
     assert!(
         String::from_utf8_lossy(&missing_runtime.stderr).contains("XDG_RUNTIME_DIR is not set")
     );
+
+    shutdown.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn send_inherits_the_exact_wakterm_source_pane_without_from() {
+    let directory = private_directory();
+    let socket = directory.path().join("control.sock");
+    let server = ControlServer::bind(&socket).await.unwrap();
+    let (shutdown, receiver) = watch::channel(false);
+    let task = tokio::spawn(server.run(Arc::new(Echo), receiver));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_panetone"))
+        .args([
+            "send",
+            "--socket",
+            socket.to_str().unwrap(),
+            "--to",
+            "target",
+            "do the work",
+        ])
+        .env("WAKTERM_PANE", "85")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: ControlResponse = serde_json::from_slice(&output.stdout).unwrap();
+    let params = response.result.unwrap();
+    assert_eq!(params["source_pane_id"], 85);
+    assert_eq!(params["from"], Value::Null);
 
     shutdown.send(true).unwrap();
     task.await.unwrap().unwrap();

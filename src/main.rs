@@ -95,11 +95,17 @@ struct ControlSocketArgs {
 #[derive(Args)]
 struct SendArgs {
     #[arg(long = "from")]
-    source: String,
+    source: Option<String>,
     #[arg(long = "to")]
     target: String,
     #[arg(long)]
     id: Option<Uuid>,
+    #[arg(
+        long,
+        env = "WAKTERM_PANE",
+        help = "Exact calling pane (default: $WAKTERM_PANE inside Wakterm)"
+    )]
+    source_pane_id: Option<u64>,
     #[arg(
         long,
         help = "Request an asynchronous final callback; this command exits after admission"
@@ -660,6 +666,7 @@ async fn run_send(args: SendArgs) -> Result<()> {
         source: args.source,
         target: args.target,
         message: args.message,
+        source_pane_id: args.source_pane_id,
         return_final: args.return_final,
         steer: args.steer,
         timeout_ms: 0,

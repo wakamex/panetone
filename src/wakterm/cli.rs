@@ -198,6 +198,29 @@ impl LiveRouteSnapshot {
         &self.routes
     }
 
+    pub fn source_in_pane(&self, pane_id: u64) -> Option<(&LiveRoute, AgentBinding)> {
+        self.routes.iter().find_map(|route| {
+            route
+                .agents
+                .iter()
+                .find(|agent| agent.pane_id == Some(pane_id))
+                .cloned()
+                .map(|agent| (route, agent))
+        })
+    }
+
+    pub fn current_agent(&self, previous: &AgentBinding) -> Option<AgentBinding> {
+        let mut agents = self.routes.iter().flat_map(|route| &route.agents);
+        agents
+            .clone()
+            .find(|agent| {
+                agent.agent_id == previous.agent_id
+                    && agent.incarnation_id == previous.incarnation_id
+            })
+            .or_else(|| agents.find(|agent| agent.agent_id == previous.agent_id))
+            .cloned()
+    }
+
     pub fn route(&self, title: &str) -> Result<&LiveRoute, WaktermCliError> {
         let route = self
             .routes

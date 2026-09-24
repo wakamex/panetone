@@ -399,10 +399,14 @@ impl ProductionService {
                 .await
                 .map_err(error_string)?
                 .ok_or_else(|| "pending return source route is missing".to_string())?;
-            let preferred = self.last_agents.read().await.get(&route.id).cloned();
-            let live_route = match resolve_live(&live, &route, preferred.as_ref())? {
-                Some(binding) => route.with_agent(binding),
-                None => route,
+            let live_route = if let Some(binding) = live.current_agent(&returned.agent.source) {
+                route.with_agent(binding)
+            } else {
+                let preferred = self.last_agents.read().await.get(&route.id).cloned();
+                match resolve_live(&live, &route, preferred.as_ref())? {
+                    Some(binding) => route.with_agent(binding),
+                    None => route,
+                }
             };
             attempted += 1;
             match self
@@ -522,21 +526,24 @@ impl ProductionService {
                 None,
             );
         }
-        if params.source.is_empty() || params.target.is_empty() || params.message.is_empty() {
+        if params
+            .source
+            .as_ref()
+            .is_some_and(|source| source.is_empty())
+            || params.target.is_empty()
+            || params.message.is_empty()
+            || (params.source.is_none() && params.source_pane_id.is_none())
+        {
             return error_response(
                 id,
                 "invalid_request",
-                "send requires non-empty from, to, and message fields",
+                "send requires non-empty to and message fields plus either from or a Wakterm source pane",
                 None,
             );
         }
         let routes = match self.store.list_routes().await {
             Ok(routes) => routes,
             Err(error) => return internal(id, error),
-        };
-        let source = match exact_route(&routes, &params.source) {
-            Ok(route) => route,
-            Err(response) => return route_error(id, "source", response),
         };
         let target = match exact_route(&routes, &params.target) {
             Ok(route) => route,
@@ -549,10 +556,47 @@ impl ProductionService {
             }
         };
         let last_agents = self.last_agents.read().await;
-        let source_binding = match resolve_live(&live, source, last_agents.get(&source.id)) {
-            Ok(Some(binding)) => binding,
-            Ok(None) => return route_unavailable(id, "source", source),
-            Err(error) => return error_response(id, "route_resolution_failed", error, None),
+        let source_pane = params
+            .source_pane_id
+            .and_then(|pane_id| live.source_in_pane(pane_id));
+        if let Some(pane_id) = params.source_pane_id
+            && source_pane.is_none()
+            && params.source.is_none()
+        {
+            return error_response(
+                id,
+                "source_pane_unavailable",
+                format!("source pane {pane_id} has no live Wakterm agent"),
+                Some(json!({"pane_id": pane_id})),
+            );
+        }
+        let (source, source_binding) = match source_pane {
+            Some((pane_route, binding)) => {
+                let source_title = params.source.as_deref().unwrap_or(&pane_route.title);
+                let source = match exact_route(&routes, source_title) {
+                    Ok(route) => route,
+                    Err(response) => return route_error(id, "source", response),
+                };
+                (source, binding)
+            }
+            None => {
+                let source_title = params
+                    .source
+                    .as_deref()
+                    .expect("a source route is required without a source pane");
+                let source = match exact_route(&routes, source_title) {
+                    Ok(route) => route,
+                    Err(response) => return route_error(id, "source", response),
+                };
+                let binding = match resolve_live(&live, source, last_agents.get(&source.id)) {
+                    Ok(Some(binding)) => binding,
+                    Ok(None) => return route_unavailable(id, "source", source),
+                    Err(error) => {
+                        return error_response(id, "route_resolution_failed", error, None);
+                    }
+                };
+                (source, binding)
+            }
         };
         let target_binding = match resolve_live(&live, target, last_agents.get(&target.id)) {
             Ok(Some(binding)) => binding,
@@ -560,11 +604,17 @@ impl ProductionService {
             Err(error) => return error_response(id, "route_resolution_failed", error, None),
         };
         drop(last_agents);
+        let command_source = source.title.clone();
         let source = source.with_agent(source_binding);
         let target = target.with_agent(target_binding);
         match self
             .workflows
-            .submit(params.into_command(id), &source, &target, now_ms())
+            .submit(
+                params.into_command(id, command_source),
+                &source,
+                &target,
+                now_ms(),
+            )
             .await
         {
             Ok(ack) => success_response(id, serde_json::to_value(ack).expect("ack serializes")),

@@ -128,11 +128,10 @@ The wait exits successfully only for `projected`. It fails immediately for
 `unrouted` or `misrouted` output. This reads Panetone's existing durable event
 disposition and does not use the SQLite file or retired Python state.
 
-Send a one-way message between exact, case-insensitive route titles:
+Send a one-way message from a Wakterm agent. The CLI derives its source agent and route from `WAKTERM_PANE`:
 
 ```sh
 target/release/panetone send \
-  --from ufopedia \
   --to wakterm \
   "Investigate the observer bug"
 ```
@@ -141,12 +140,13 @@ Steer an active turn immediately, while retaining normal new-turn delivery if th
 
 ```sh
 target/release/panetone send --steer \
-  --from wow-astra \
   --to wow-sol \
   "Use the corrected requirement for the current turn"
 ```
 
 Add `--steer` when the message should redirect an active target turn immediately instead of waiting in the durable busy queue. If the target is idle, it starts a normal new turn. Add `--return-final` when a correlated completion callback is wanted. The two modes are mutually exclusive because active-turn steering cannot create separate final-response correlation. The send command exits after target admission; Panetone mirrors a requested final to the source route's channel when it arrives and delivers the agent callback when the source agent is idle. A stable `--id UUID` makes a retry idempotent. Panetone permanently reserves completed UUIDs and never automatically retries a prompt whose admission became uncertain.
+
+Use `--from ROUTE` only outside Wakterm or to override the calling pane's route for the shared channel mirror and audit identity. A final callback still returns to the exact calling agent while it remains live. If that agent has exited, Panetone falls back to the selected source route's current agent.
 
 Run a side-effect-free local check against the loaded Wakterm service:
 

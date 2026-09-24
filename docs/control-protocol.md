@@ -167,9 +167,9 @@ disposition, and exits nonzero after its local timeout while still pending.
   "id": "fe57dc90-994e-4e73-b09c-fac483d9f05b",
   "method": "send",
   "params": {
-    "from": "ufopedia",
     "to": "wakterm",
     "message": "Investigate the observer bug",
+    "source_pane_id": 42,
     "return_final": false,
     "steer": false,
     "timeout_ms": 0
@@ -177,12 +177,11 @@ disposition, and exits nonzero after its local timeout while still pending.
 }
 ```
 
-`from`, `to`, and `message` must be non-empty. Route titles resolve by exact case-insensitive match and fail when missing. Every live agent with the same effective title belongs to the route, including agents in separate tabs. `return_final` and `steer` default to false, and `timeout_ms` defaults to zero. A nonzero timeout is rejected because asynchronous final callbacks do not expire.
+`to` and `message` must be non-empty. A caller must provide either `source_pane_id` or `from`. The CLI automatically supplies `source_pane_id` from `WAKTERM_PANE`, so normal calls from a Wakterm agent omit `--from`. Panetone validates that the pane contains a live agent and derives the source route from its current effective title. `from` remains an optional route override for the shared channel mirror and audit identity, and is required for callers outside Wakterm. Route titles resolve by exact case-insensitive match and fail when missing. Every live agent with the same effective title belongs to the route, including agents in separate tabs. `return_final` and `steer` default to false, and `timeout_ms` defaults to zero. A nonzero timeout is rejected because asynchronous final callbacks do not expire.
 
 The normal sequence is:
 
-1. resolve source and target workspace titles to the current live Wakterm
-   agent and incarnation
+1. resolve the exact calling pane or explicit source route, then resolve the target route to its current live Wakterm agent and incarnation
 2. claim the request UUID and semantic hash
 3. durably enqueue and deliver the visible target-channel audit
 4. persist the admission boundary
@@ -227,8 +226,7 @@ When Wakterm emits the terminal result, Panetone verifies it against the exact
 submitted target and persists it before:
 
 - mirroring it to the source route's channel
-- resolving the source workspace again and admitting a structured callback to
-  its current agent
+- admitting a structured callback to the exact calling agent when it remains live, otherwise resolving the explicit or derived source route's current agent
 
 Each destination has independent durable state. A possibly accepted callback
 becomes indeterminate and is not retried. A definitive busy callback remains

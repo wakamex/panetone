@@ -17,11 +17,13 @@ pub struct ControlRequest {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SendParams {
-    #[serde(rename = "from")]
-    pub source: String,
+    #[serde(rename = "from", skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(rename = "to")]
     pub target: String,
     pub message: String,
+    #[serde(default)]
+    pub source_pane_id: Option<u64>,
     #[serde(default)]
     pub return_final: bool,
     #[serde(default)]
@@ -56,10 +58,10 @@ pub struct OutputDispositionParams {
 }
 
 impl SendParams {
-    pub fn into_command(self, id: Uuid) -> SendCommand {
+    pub fn into_command(self, id: Uuid, source: String) -> SendCommand {
         SendCommand {
             id: WorkflowId::new(id),
-            source: self.source,
+            source,
             target: self.target,
             message: self.message,
             return_final: self.return_final,
