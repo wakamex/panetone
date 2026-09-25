@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -1092,6 +1092,7 @@ fn project_live_routes(
             projected.push(RouteAgent {
                 route_id: route.id,
                 agent: agent.clone(),
+                working_directory: live_route.working_directory(agent).map(Path::to_path_buf),
             });
         }
     }

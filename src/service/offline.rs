@@ -438,6 +438,7 @@ impl OfflineService {
                 record.command.id,
                 record.command.message
             ),
+            attachments: Vec::new(),
             state: OutboxState::Pending,
             attempts: 0,
             last_error: None,
@@ -674,6 +675,7 @@ impl OfflineService {
                 "[{purpose}] {} -> {}\nRequest ID: {}\n{detail}",
                 record.command.source, record.command.target, record.command.id
             ),
+            attachments: Vec::new(),
             state: OutboxState::Pending,
             attempts: 0,
             last_error: None,
@@ -826,6 +828,7 @@ impl OfflineService {
                 kind,
                 destination,
                 body: callback_envelope_from_value(&workflow, &returned),
+                attachments: Vec::new(),
                 state: OutboxState::Pending,
                 attempts: returned.mirror.attempts,
                 last_error: returned.mirror.last_error.clone(),

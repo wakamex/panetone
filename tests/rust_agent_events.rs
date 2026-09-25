@@ -1,5 +1,7 @@
 use std::fs;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use panetone::domain::{AgentBinding, ChannelBinding, ChannelKind, Route, RouteId};
 use panetone::store::{EventCursorGap, RouteAgent, StoreError, StoreHandle};
 use panetone::wakterm::EventRecord;
@@ -42,6 +44,7 @@ fn live_agents(route: &Route) -> Vec<RouteAgent> {
     vec![RouteAgent {
         route_id: route.id,
         agent: route.agent.clone().unwrap(),
+        working_directory: None,
     }]
 }
 
@@ -405,6 +408,98 @@ async fn event_output_defaults_to_an_available_signal_binding() {
     assert_eq!(output.len(), 1);
     assert_eq!(output[0].kind, ChannelKind::Signal);
     assert_eq!(output[0].destination, "signal-zola");
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn standalone_attachment_tags_are_captured_in_order_and_use_the_route_channel() {
+    let directory = tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let image = workspace.join("scene image.png");
+    fs::write(&image, b"png bytes").unwrap();
+    let second_image = workspace.join("detail.jpg");
+    fs::write(&second_image, b"jpeg bytes").unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let route = route();
+    store.save_route(route.clone(), 1).await.unwrap();
+    let mut event = fixture_events()
+        .into_iter()
+        .find(|event| event.kind == "assistant_message")
+        .unwrap();
+    let expected = event.sequence - 1;
+    event.fields.insert(
+        "text".into(),
+        format!(
+            "Here is the scene.\n\n```text\n[panetone:attach /example/not-a-request.png]\n```\n\n[panetone:attach {}]\n[panetone:attach {}]",
+            image.display(),
+            second_image.display()
+        )
+        .into(),
+    );
+    let mut agents = live_agents(&route);
+    agents[0].working_directory = Some(workspace);
+    store.initialize_event_cursor(expected).await.unwrap();
+
+    store
+        .ingest_agent_events(expected, event.sequence, vec![event], agents, 3)
+        .await
+        .unwrap();
+
+    let output = store.pending_outbox().await.unwrap();
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].kind, ChannelKind::Signal);
+    assert_eq!(
+        output[0].body,
+        "Here is the scene.\n\n```text\n[panetone:attach /example/not-a-request.png]\n```"
+    );
+    assert_eq!(output[0].attachments.len(), 2);
+    let first = &output[0].attachments[0];
+    assert_eq!(first.file_name, "scene_image.png");
+    assert_eq!(first.media_type, "image/png");
+    assert_eq!(BASE64.decode(&first.data_base64).unwrap(), b"png bytes");
+    let second = &output[0].attachments[1];
+    assert_eq!(second.file_name, "detail.jpg");
+    assert_eq!(second.media_type, "image/jpeg");
+    assert_eq!(BASE64.decode(&second.data_base64).unwrap(), b"jpeg bytes");
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn attachment_tag_cannot_read_outside_the_harness_working_directory() {
+    let directory = tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let outside = directory.path().join("private.png");
+    fs::write(&outside, b"private").unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let route = route();
+    store.save_route(route.clone(), 1).await.unwrap();
+    let mut event = fixture_events()
+        .into_iter()
+        .find(|event| event.kind == "assistant_message")
+        .unwrap();
+    let expected = event.sequence - 1;
+    event.fields.insert(
+        "text".into(),
+        format!("[panetone:attach {}]", outside.display()).into(),
+    );
+    let mut agents = live_agents(&route);
+    agents[0].working_directory = Some(workspace);
+    store.initialize_event_cursor(expected).await.unwrap();
+
+    store
+        .ingest_agent_events(expected, event.sequence, vec![event], agents, 3)
+        .await
+        .unwrap();
+
+    let output = store.pending_outbox().await.unwrap();
+    assert_eq!(output.len(), 1);
+    assert!(output[0].attachments.is_empty());
+    assert_eq!(
+        output[0].body,
+        "Attachment unavailable: the tagged file is outside the harness working directory"
+    );
     store.shutdown().await.unwrap();
 }
 

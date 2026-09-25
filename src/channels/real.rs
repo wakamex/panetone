@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::StatusCode;
+use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -97,19 +98,31 @@ impl TelegramClient {
             .parse::<i64>()
             .map_err(|_| ChannelDeliveryError::InvalidDestination(item.kind))?;
         let mut next_send = self.wait_for_send().await;
-        let result = telegram_send(
-            &self.http,
-            &self.api_base,
-            &self.token,
-            json!({
-                "chat_id": self.chat_id,
-                "message_thread_id": topic_id,
-                "text": item.body,
-                "link_preview_options": {"is_disabled": true}
-            }),
-            item,
-        )
-        .await;
+        let result = if !item.attachments.is_empty() {
+            telegram_send_attachments(
+                &self.http,
+                &self.api_base,
+                &self.token,
+                self.chat_id,
+                topic_id,
+                item,
+            )
+            .await
+        } else {
+            telegram_send(
+                &self.http,
+                &self.api_base,
+                &self.token,
+                json!({
+                    "chat_id": self.chat_id,
+                    "message_thread_id": topic_id,
+                    "text": item.body,
+                    "link_preview_options": {"is_disabled": true}
+                }),
+                item,
+            )
+            .await
+        };
         *next_send = Instant::now() + self.delay_after(result.as_ref().err());
         result
     }
@@ -182,15 +195,29 @@ impl SignalClient {
             .await
             .map_err(|_| ChannelDeliveryError::Transport(ChannelKind::Signal))?;
         let request_id = item.id.to_string();
+        let mut params = json!({
+            "groupId": item.destination,
+            "message": item.body,
+            "account": self.account,
+        });
+        if !item.attachments.is_empty() {
+            params["attachments"] = Value::Array(
+                item.attachments
+                    .iter()
+                    .map(|attachment| {
+                        Value::String(format!(
+                            "data:{};filename={};base64,{}",
+                            attachment.media_type, attachment.file_name, attachment.data_base64
+                        ))
+                    })
+                    .collect(),
+            );
+        }
         let request = json!({
             "jsonrpc": "2.0",
             "id": request_id,
             "method": "send",
-            "params": {
-                "groupId": item.destination,
-                "message": item.body,
-                "account": self.account
-            }
+            "params": params,
         });
         let mut encoded = serde_json::to_vec(&request)
             .map_err(|_| ChannelDeliveryError::Malformed(ChannelKind::Signal))?;
@@ -288,15 +315,10 @@ impl RealChannels {
 #[derive(Deserialize)]
 struct TelegramResponse {
     ok: bool,
-    result: Option<TelegramMessage>,
+    result: Option<Value>,
     description: Option<String>,
     error_code: Option<u16>,
     parameters: Option<TelegramParameters>,
-}
-
-#[derive(Deserialize)]
-struct TelegramMessage {
-    message_id: i64,
 }
 
 #[derive(Deserialize)]
@@ -339,21 +361,132 @@ async fn telegram_send(
         .send()
         .await
         .map_err(|error| map_http_error(item.kind, &error))?;
+    telegram_response(response, item.kind).await
+}
+
+async fn telegram_send_attachments(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    chat_id: i64,
+    topic_id: i64,
+    item: &OutboxItem,
+) -> Result<DeliveryReceipt, ChannelDeliveryError> {
+    if item.attachments.len() > 1 {
+        return telegram_send_media_group(client, base, token, chat_id, topic_id, item).await;
+    }
+    let attachment = &item.attachments[0];
+    let bytes = attachment
+        .bytes()
+        .map_err(|_| ChannelDeliveryError::Malformed(item.kind))?;
+    let photo = telegram_photo(attachment);
+    let field = if photo { "photo" } else { "document" };
+    let method = if photo { "sendPhoto" } else { "sendDocument" };
+    let part = Part::bytes(bytes)
+        .file_name(attachment.file_name.clone())
+        .mime_str(&attachment.media_type)
+        .map_err(|_| ChannelDeliveryError::Malformed(item.kind))?;
+    let mut form = Form::new()
+        .text("chat_id", chat_id.to_string())
+        .text("message_thread_id", topic_id.to_string())
+        .part(field, part);
+    if !item.body.is_empty() {
+        form = form.text("caption", item.body.clone());
+    }
+    let response = client
+        .post(format!("{base}/bot{token}/{method}"))
+        .header("x-panetone-delivery-id", item.id.to_string())
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|error| map_http_error(item.kind, &error))?;
+    telegram_response(response, item.kind).await
+}
+
+async fn telegram_send_media_group(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    chat_id: i64,
+    topic_id: i64,
+    item: &OutboxItem,
+) -> Result<DeliveryReceipt, ChannelDeliveryError> {
+    let photos = item.attachments.iter().all(telegram_photo);
+    if !photos && item.attachments.iter().any(telegram_photo) {
+        return Err(ChannelDeliveryError::Rejected {
+            kind: item.kind,
+            detail: "Telegram cannot combine photos and documents in one media group".into(),
+        });
+    }
+    let media_kind = if photos { "photo" } else { "document" };
+    let media = item
+        .attachments
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let mut entry = json!({
+                "type": media_kind,
+                "media": format!("attach://attachment_{index}"),
+            });
+            if index == 0 && !item.body.is_empty() {
+                entry["caption"] = Value::String(item.body.clone());
+            }
+            entry
+        })
+        .collect::<Vec<_>>();
+    let mut form = Form::new()
+        .text("chat_id", chat_id.to_string())
+        .text("message_thread_id", topic_id.to_string())
+        .text(
+            "media",
+            serde_json::to_string(&media)
+                .map_err(|_| ChannelDeliveryError::Malformed(item.kind))?,
+        );
+    for (index, attachment) in item.attachments.iter().enumerate() {
+        let bytes = attachment
+            .bytes()
+            .map_err(|_| ChannelDeliveryError::Malformed(item.kind))?;
+        let part = Part::bytes(bytes)
+            .file_name(attachment.file_name.clone())
+            .mime_str(&attachment.media_type)
+            .map_err(|_| ChannelDeliveryError::Malformed(item.kind))?;
+        form = form.part(format!("attachment_{index}"), part);
+    }
+    let response = client
+        .post(format!("{base}/bot{token}/sendMediaGroup"))
+        .header("x-panetone-delivery-id", item.id.to_string())
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|error| map_http_error(item.kind, &error))?;
+    telegram_response(response, item.kind).await
+}
+
+fn telegram_photo(attachment: &crate::domain::ChannelAttachment) -> bool {
+    matches!(
+        attachment.media_type.as_str(),
+        "image/jpeg" | "image/png" | "image/webp"
+    )
+}
+
+async fn telegram_response(
+    response: reqwest::Response,
+    kind: ChannelKind,
+) -> Result<DeliveryReceipt, ChannelDeliveryError> {
     let status = response.status();
-    let body = response_body(response, item.kind).await?;
+    let body = response_body(response, kind).await?;
     let parsed: TelegramResponse =
-        serde_json::from_slice(&body).map_err(|_| ChannelDeliveryError::Malformed(item.kind))?;
+        serde_json::from_slice(&body).map_err(|_| ChannelDeliveryError::Malformed(kind))?;
     if status.is_success() && parsed.ok {
         return parsed
             .result
-            .map(|message| DeliveryReceipt {
-                external_id: message.message_id.to_string(),
-            })
-            .ok_or(ChannelDeliveryError::Malformed(item.kind));
+            .and_then(|result| telegram_message_id(&result))
+            .map(|external_id| DeliveryReceipt { external_id })
+            .ok_or(ChannelDeliveryError::Malformed(kind));
     }
     if status == StatusCode::TOO_MANY_REQUESTS || parsed.error_code == Some(429) {
         return Err(ChannelDeliveryError::RateLimited {
-            kind: item.kind,
+            kind,
             retry_after_secs: parsed
                 .parameters
                 .and_then(|parameters| parameters.retry_after)
@@ -371,16 +504,24 @@ async fn telegram_send(
         || lowered.contains("chat not found")
         || lowered.contains("topic_closed")
     {
-        Err(ChannelDeliveryError::DestinationUnavailable {
-            kind: item.kind,
-            detail,
-        })
+        Err(ChannelDeliveryError::DestinationUnavailable { kind, detail })
     } else {
-        Err(ChannelDeliveryError::Rejected {
-            kind: item.kind,
-            detail,
-        })
+        Err(ChannelDeliveryError::Rejected { kind, detail })
     }
+}
+
+fn telegram_message_id(result: &Value) -> Option<String> {
+    result
+        .get("message_id")
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            result
+                .as_array()
+                .and_then(|messages| messages.first())
+                .and_then(|message| message.get("message_id"))
+                .and_then(Value::as_i64)
+        })
+        .map(|message_id| message_id.to_string())
 }
 
 async fn telegram_create_forum_topic(

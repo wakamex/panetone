@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use panetone::channels::{ChannelDeliveryError, RealChannels, SignalClient, TelegramClient};
-use panetone::domain::{ChannelKind, EffectId, OutboxItem, OutboxState};
+use panetone::domain::{ChannelAttachment, ChannelKind, EffectId, OutboxItem, OutboxState};
 use serde_json::Value;
 use tempfile::tempdir;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -14,6 +14,13 @@ struct CapturedHttp {
     request_line: String,
     headers: String,
     body: Value,
+}
+
+#[derive(Debug)]
+struct CapturedRawHttp {
+    request_line: String,
+    headers: String,
+    body: Vec<u8>,
 }
 
 async fn http_server(
@@ -65,6 +72,46 @@ async fn http_server(
     (format!("http://{address}"), task)
 }
 
+async fn raw_http_server(response: &'static [u8]) -> (String, JoinHandle<CapturedRawHttp>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut received = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0);
+            received.extend_from_slice(&chunk[..read]);
+            if let Some(position) = received.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let headers = String::from_utf8(received[..header_end].to_vec()).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap();
+        while received.len() - header_end < content_length {
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0);
+            received.extend_from_slice(&chunk[..read]);
+        }
+        stream.write_all(response).await.unwrap();
+        CapturedRawHttp {
+            request_line: headers.lines().next().unwrap().to_owned(),
+            headers,
+            body: received[header_end..header_end + content_length].to_vec(),
+        }
+    });
+    (format!("http://{address}"), task)
+}
+
 fn item(kind: ChannelKind, destination: &str) -> OutboxItem {
     OutboxItem {
         id: EffectId::new(Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap()),
@@ -74,6 +121,7 @@ fn item(kind: ChannelKind, destination: &str) -> OutboxItem {
         kind,
         destination: destination.into(),
         body: "message café ✓".into(),
+        attachments: Vec::new(),
         state: OutboxState::Delivering,
         attempts: 1,
         last_error: None,
@@ -100,6 +148,79 @@ async fn telegram_sends_the_expected_stable_request() {
     assert_eq!(request.body["message_thread_id"], 77);
     assert_eq!(request.body["text"], "message café ✓");
     assert!(request.headers.contains("x-panetone-delivery-id: 11111111"));
+}
+
+#[tokio::test]
+async fn telegram_sends_an_image_attachment_as_multipart_photo() {
+    let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 39\r\n\r\n{\"ok\":true,\"result\":{\"message_id\":403}}";
+    let (base, request) = raw_http_server(response).await;
+    let telegram = TelegramClient::new(&base, "fake-token", -1001, Duration::from_secs(2)).unwrap();
+    let mut message = item(ChannelKind::Telegram, "77");
+    message.body = "scene caption".into();
+    message.attachments.push(ChannelAttachment {
+        file_name: "scene.png".into(),
+        media_type: "image/png".into(),
+        size: 9,
+        sha256: "unused-by-adapter".into(),
+        data_base64: "cG5nIGJ5dGVz".into(),
+    });
+
+    let receipt = telegram.send(&message).await.unwrap();
+    assert_eq!(receipt.external_id, "403");
+    let request = request.await.unwrap();
+    assert_eq!(
+        request.request_line,
+        "POST /botfake-token/sendPhoto HTTP/1.1"
+    );
+    assert!(request.headers.contains("multipart/form-data"));
+    let body = String::from_utf8(request.body).unwrap();
+    assert!(body.contains("name=\"photo\"; filename=\"scene.png\""));
+    assert!(body.contains("Content-Type: image/png"));
+    assert!(body.contains("png bytes"));
+    assert!(body.contains("scene caption"));
+    assert!(body.contains("-1001"));
+    assert!(body.contains("77"));
+}
+
+#[tokio::test]
+async fn telegram_sends_multiple_images_as_one_media_group() {
+    let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"ok\":true,\"result\":[{\"message_id\":404},{\"message_id\":405}]}";
+    let (base, request) = raw_http_server(response).await;
+    let telegram = TelegramClient::new(&base, "fake-token", -1001, Duration::from_secs(2)).unwrap();
+    let mut message = item(ChannelKind::Telegram, "77");
+    message.body = "two scenes".into();
+    message.attachments = vec![
+        ChannelAttachment {
+            file_name: "first.png".into(),
+            media_type: "image/png".into(),
+            size: 5,
+            sha256: "unused".into(),
+            data_base64: "Zmlyc3Q=".into(),
+        },
+        ChannelAttachment {
+            file_name: "second.jpg".into(),
+            media_type: "image/jpeg".into(),
+            size: 6,
+            sha256: "unused".into(),
+            data_base64: "c2Vjb25k".into(),
+        },
+    ];
+
+    let receipt = telegram.send(&message).await.unwrap();
+    assert_eq!(receipt.external_id, "404");
+    let request = request.await.unwrap();
+    assert_eq!(
+        request.request_line,
+        "POST /botfake-token/sendMediaGroup HTTP/1.1"
+    );
+    let body = String::from_utf8(request.body).unwrap();
+    assert!(body.contains("attach://attachment_0"));
+    assert!(body.contains("attach://attachment_1"));
+    assert!(body.contains("filename=\"first.png\""));
+    assert!(body.contains("filename=\"second.jpg\""));
+    assert!(body.contains("two scenes"));
+    assert!(body.contains("first"));
+    assert!(body.contains("second"));
 }
 
 #[tokio::test]
@@ -279,6 +400,54 @@ async fn signal_uses_stable_json_rpc_identity_and_handles_protocol_failures() {
         ChannelDeliveryError::Timeout(ChannelKind::Signal)
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn signal_sends_the_same_attachment_model_as_a_data_uri() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("signal-attachment.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut request = String::new();
+        reader.read_line(&mut request).await.unwrap();
+        let request: Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["params"]["message"], "scene caption");
+        assert_eq!(
+            request["params"]["attachments"][0],
+            "data:image/png;filename=scene.png;base64,cG5nIGJ5dGVz"
+        );
+        assert_eq!(
+            request["params"]["attachments"][1],
+            "data:image/jpeg;filename=detail.jpg;base64,anBlZyBieXRlcw=="
+        );
+        reader
+            .get_mut()
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"11111111-1111-4111-8111-111111111111\",\"result\":{\"timestamp\":12346}}\n")
+            .await
+            .unwrap();
+    });
+    let signal = SignalClient::new(&socket, "+15550000", Duration::from_secs(2));
+    let mut message = item(ChannelKind::Signal, "group-one");
+    message.body = "scene caption".into();
+    message.attachments.push(ChannelAttachment {
+        file_name: "scene.png".into(),
+        media_type: "image/png".into(),
+        size: 9,
+        sha256: "unused-by-adapter".into(),
+        data_base64: "cG5nIGJ5dGVz".into(),
+    });
+    message.attachments.push(ChannelAttachment {
+        file_name: "detail.jpg".into(),
+        media_type: "image/jpeg".into(),
+        size: 10,
+        sha256: "unused-by-adapter".into(),
+        data_base64: "anBlZyBieXRlcw==".into(),
+    });
+
+    assert_eq!(signal.send(&message).await.unwrap().external_id, "12346");
+    server.await.unwrap();
 }
 
 #[tokio::test]

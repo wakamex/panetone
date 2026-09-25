@@ -14,6 +14,7 @@ than a rollback target.
 
 - Observe agent lifecycle and output through Wakterm Agent API v1.
 - Deliver output to Telegram and Signal.
+- Attach workspace files to normal agent output through the same selected Telegram or Signal route.
 - Create a durable route and Telegram topic when a live Wakterm agent title is
   first discovered, including agents started manually in a shell.
 - Establish or inspect routes synchronously through the supported control API.
@@ -89,6 +90,15 @@ directory beside the database before the update cursor advances. Telegram
 photos use the largest available image size and the same durable download path.
 Their absolute paths are appended to the message. Attachment-only Signal and
 Telegram messages are supported.
+
+To attach files to an outbound response, the harness places one standalone line per file anywhere in its normal assistant message:
+
+```text
+[panetone:attach /absolute/path/to/image.png]
+[panetone:attach /absolute/path/to/another-image.jpg]
+```
+
+Panetone removes attachment directives outside fenced or indented code blocks, captures the files into the durable outbox, and sends them through the route's already selected Signal or Telegram binding. The harness does not name or inspect the transport. Up to 10 attachment directives are accepted per assistant message. Every file must resolve inside the harness's Wakterm-reported working directory, each file may be at most 10 MiB, and the combined payload may be at most 50 MiB. Multiple JPEG, PNG, and WebP files become one Telegram media group; a single image uses Telegram's photo presentation; non-image files use its document presentation. Signal receives the files as native attachments on one message. A missing, unreadable, oversized, or out-of-workspace file makes the whole attachment set a visible `Attachment unavailable:` notice and does not stall later output.
 
 Signal routes are owner-only by default. A route bound with `panetone route ensure TITLE --signal-group-id ID --signal-allow-members` accepts every member of that exact Signal group and gives the harness the minimal sender context `<first name> says: <message>`. Unknown groups remain ignored.
 On the `debate` route only, an assistant response consisting exactly of `<panetone:no-reply>` after trimming whitespace is durably recorded as suppressed and is not sent to Signal or Telegram. Normal responses and failure notices remain visible.

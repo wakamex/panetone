@@ -192,6 +192,8 @@ if [[ "$operation" == *"agent capabilities"* ]]; then
   printf '%s\n' '{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1"]}'
 elif [[ "$operation" == *"agent catalog"* ]]; then
   printf '%s\n' '{"schema":"wakterm.agent-api.v1","as_of_event_sequence":12,"agents":[{"agent_id":"agent-first","incarnation_id":"inc-first","pane_id":4,"name":"first","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"},{"agent_id":"agent-second","incarnation_id":"inc-second","pane_id":9,"name":"second","harness":"claude","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"}]}'
+elif [[ "$operation" == *"agent list --format json"* ]]; then
+  printf '%s\n' '[{"pane_id":9,"metadata":{"declared_cwd":"/code/panetone-second"}},{"pane_id":4,"metadata":{"declared_cwd":"/code/panetone-first"}}]'
 elif [[ "$operation" == *"list --format json"* ]]; then
   printf '%s\n' '[{"pane_id":9,"tab_id":8,"window_id":2,"effective_title":"PANETONE"},{"pane_id":4,"tab_id":3,"window_id":1,"effective_title":"panetone"}]'
 else
@@ -205,6 +207,10 @@ fi
     let route = live.route("PANETONE").unwrap();
     assert_eq!(route.agents.len(), 2);
     assert_eq!(route.select(None).unwrap().pane_id, Some(4));
+    assert_eq!(
+        route.working_directory(&route.agents[0]),
+        Some(std::path::Path::new("/code/panetone-first"))
+    );
 
     let preferred = AgentBinding {
         agent_id: "agent-second".into(),

@@ -1,19 +1,26 @@
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
+use std::io::Read;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::domain::{
-    AgentBinding, CallbackDelivery, ChannelKind, DeliveryState, EffectId, OutboxItem, OutboxState,
-    Route, RouteId, SEMANTIC_HASH_KIND, SendCommand, Workflow, WorkflowId, WorkflowState,
-    semantic_request_hash,
+    AgentBinding, CallbackDelivery, ChannelAttachment, ChannelKind, DeliveryState, EffectId,
+    MAX_CHANNEL_ATTACHMENT_BYTES, MAX_CHANNEL_ATTACHMENT_TOTAL_BYTES, MAX_CHANNEL_ATTACHMENTS,
+    OutboxItem, OutboxState, Route, RouteId, SEMANTIC_HASH_KIND, SendCommand, Workflow, WorkflowId,
+    WorkflowState, semantic_request_hash,
 };
 use crate::wakterm::{AgentCatalog, EventRecord};
 
@@ -157,6 +164,8 @@ impl EventIngestOutcome {
 pub struct RouteAgent {
     pub route_id: RouteId,
     pub agent: AgentBinding,
+    #[serde(default)]
+    pub working_directory: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1300,6 +1309,10 @@ fn ingest_agent_events(
                 outcome.recorded += 1;
                 continue;
             };
+            let (body, attachments) = visible_attachments(
+                body,
+                route_agent.and_then(|candidate| candidate.working_directory.as_deref()),
+            );
             let namespace = Uuid::new_v5(
                 &Uuid::NAMESPACE_URL,
                 b"https://panetone.dev/wakterm/events/v1",
@@ -1315,6 +1328,7 @@ fn ingest_agent_events(
                 kind,
                 destination,
                 body,
+                attachments,
                 state: OutboxState::Pending,
                 attempts: 0,
                 last_error: None,
@@ -1454,6 +1468,184 @@ fn output_destination(route: &Route, preference: Option<&str>) -> Option<(Channe
     }
 }
 
+fn visible_attachments(
+    body: String,
+    working_directory: Option<&Path>,
+) -> (String, Vec<ChannelAttachment>) {
+    let mut retained = Vec::new();
+    let mut requested = Vec::new();
+    let mut fence = None;
+    for line in body.split('\n') {
+        if let Some((marker, length)) = fence {
+            retained.push(line);
+            if closes_markdown_fence(line, marker, length) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(opened) = opens_markdown_fence(line) {
+            fence = Some(opened);
+            retained.push(line);
+            continue;
+        }
+        let trimmed = line.trim();
+        if !line.starts_with("    ")
+            && !line.starts_with('\t')
+            && let Some(path) = trimmed
+                .strip_prefix("[panetone:attach ")
+                .and_then(|value| value.strip_suffix(']'))
+        {
+            requested.push(path.to_owned());
+        } else {
+            retained.push(line);
+        }
+    }
+    if requested.is_empty() {
+        return (body, Vec::new());
+    }
+    let clean_body = retained.join("\n").trim_end().to_owned();
+    let result = if requested.len() <= MAX_CHANNEL_ATTACHMENTS {
+        capture_attachments(&requested, working_directory)
+    } else {
+        Err(format!(
+            "at most {MAX_CHANNEL_ATTACHMENTS} attachment tags are supported per assistant message"
+        ))
+    };
+    match result {
+        Ok(attachments) => (clean_body, attachments),
+        Err(detail) => {
+            let notice = format!("Attachment unavailable: {detail}");
+            if clean_body.is_empty() {
+                (notice, Vec::new())
+            } else {
+                (format!("{clean_body}\n\n{notice}"), Vec::new())
+            }
+        }
+    }
+}
+
+fn opens_markdown_fence(line: &str) -> Option<(u8, usize)> {
+    let trimmed = line.trim_start_matches(' ');
+    if line.len() - trimmed.len() > 3 {
+        return None;
+    }
+    let line = trimmed;
+    let marker = *line.as_bytes().first()?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
+    }
+    let length = line.bytes().take_while(|byte| *byte == marker).count();
+    (length >= 3).then_some((marker, length))
+}
+
+fn closes_markdown_fence(line: &str, marker: u8, minimum_length: usize) -> bool {
+    let trimmed = line.trim_start_matches(' ');
+    if line.len() - trimmed.len() > 3 {
+        return false;
+    }
+    let line = trimmed;
+    let length = line.bytes().take_while(|byte| *byte == marker).count();
+    length >= minimum_length && line[length..].trim().is_empty()
+}
+
+fn capture_attachments(
+    requested: &[String],
+    working_directory: Option<&Path>,
+) -> Result<Vec<ChannelAttachment>, String> {
+    let mut attachments = Vec::with_capacity(requested.len());
+    let mut total = 0_u64;
+    for path in requested {
+        let attachment = capture_attachment(path, working_directory)?;
+        total = total.saturating_add(attachment.size);
+        if total > MAX_CHANNEL_ATTACHMENT_TOTAL_BYTES {
+            return Err(format!(
+                "tagged files may total at most {MAX_CHANNEL_ATTACHMENT_TOTAL_BYTES} bytes"
+            ));
+        }
+        attachments.push(attachment);
+    }
+    Ok(attachments)
+}
+
+fn capture_attachment(
+    requested: &str,
+    working_directory: Option<&Path>,
+) -> Result<ChannelAttachment, String> {
+    let requested = Path::new(requested);
+    if !requested.is_absolute() {
+        return Err("the tagged path must be absolute".into());
+    }
+    let root = working_directory
+        .ok_or_else(|| "Wakterm did not report the harness working directory".to_string())?;
+    let root = fs::canonicalize(root)
+        .map_err(|_| "the harness working directory is unavailable".to_string())?;
+    let mut file =
+        File::open(requested).map_err(|_| "the tagged file does not exist".to_string())?;
+    let path = opened_file_path(&file, requested)
+        .map_err(|_| "the tagged file cannot be inspected".to_string())?;
+    if !path.starts_with(&root) {
+        return Err("the tagged file is outside the harness working directory".into());
+    }
+    let metadata = file
+        .metadata()
+        .map_err(|_| "the tagged file cannot be inspected".to_string())?;
+    if !metadata.is_file() {
+        return Err("the tagged path is not a regular file".into());
+    }
+    if metadata.len() == 0 || metadata.len() > MAX_CHANNEL_ATTACHMENT_BYTES {
+        return Err(format!(
+            "the tagged file must be between 1 byte and {MAX_CHANNEL_ATTACHMENT_BYTES} bytes"
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    (&mut file)
+        .take(MAX_CHANNEL_ATTACHMENT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "the tagged file cannot be read".to_string())?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_CHANNEL_ATTACHMENT_BYTES {
+        return Err("the tagged file changed size while being captured".into());
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "the tagged file name is not valid UTF-8".to_string())?;
+    let file_name = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(128)
+        .collect::<String>();
+    if file_name.is_empty() {
+        return Err("the tagged file has no usable name".into());
+    }
+    let media_type = mime_guess::from_path(&path)
+        .first_or_octet_stream()
+        .essence_str()
+        .to_owned();
+    Ok(ChannelAttachment {
+        file_name,
+        media_type,
+        size: bytes.len() as u64,
+        sha256: format!("{:x}", Sha256::digest(&bytes)),
+        data_base64: BASE64.encode(bytes),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn opened_file_path(file: &File, _requested: &Path) -> std::io::Result<PathBuf> {
+    fs::canonicalize(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn opened_file_path(_file: &File, requested: &Path) -> std::io::Result<PathBuf> {
+    fs::canonicalize(requested)
+}
+
 fn register_return(connection: &Connection, record: &ReturnDelivery) -> StoreResult<()> {
     let changed = connection.execute(
         "INSERT OR IGNORE INTO return_deliveries(
@@ -1587,6 +1779,7 @@ fn enqueue_outbox(
             || existing.kind != item.kind
             || existing.destination != item.destination
             || existing.body != item.body
+            || existing.attachments != item.attachments
         {
             return Err(StoreError::Conflict(format!(
                 "outbox effect {} already differs",

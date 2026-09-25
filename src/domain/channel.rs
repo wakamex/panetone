@@ -1,9 +1,15 @@
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
 use super::{EffectId, RouteId};
 
 const TELEGRAM_TEXT_UNITS: usize = 3900;
 const SIGNAL_TEXT_CHARS: usize = 4000;
+const ATTACHMENT_CAPTION_CHARS: usize = 1024;
+pub const MAX_CHANNEL_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
+pub const MAX_CHANNEL_ATTACHMENTS: usize = 10;
+pub const MAX_CHANNEL_ATTACHMENT_TOTAL_BYTES: u64 = 50 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +42,21 @@ pub enum OutboxState {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChannelAttachment {
+    pub file_name: String,
+    pub media_type: String,
+    pub size: u64,
+    pub sha256: String,
+    pub data_base64: String,
+}
+
+impl ChannelAttachment {
+    pub fn bytes(&self) -> Result<Vec<u8>, base64::DecodeError> {
+        BASE64.decode(&self.data_base64)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OutboxItem {
     pub id: EffectId,
     #[serde(default)]
@@ -47,6 +68,8 @@ pub struct OutboxItem {
     pub kind: ChannelKind,
     pub destination: String,
     pub body: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<ChannelAttachment>,
     pub state: OutboxState,
     pub attempts: u32,
     pub last_error: Option<String>,
@@ -54,6 +77,25 @@ pub struct OutboxItem {
 }
 
 pub fn chunk_outbox(mut item: OutboxItem) -> Vec<OutboxItem> {
+    if !item.attachments.is_empty() {
+        let chunks = split_by_chars(&item.body, ATTACHMENT_CAPTION_CHARS);
+        if chunks.len() == 1 {
+            return vec![item];
+        }
+        let parent = item.id;
+        return chunks
+            .into_iter()
+            .enumerate()
+            .map(|(index, body)| {
+                item.id = EffectId::chunk(parent, index);
+                item.body = body;
+                if index > 0 {
+                    item.attachments.clear();
+                }
+                item.clone()
+            })
+            .collect();
+    }
     let chunks = split_text(item.kind, &item.body);
     if chunks.len() == 1 {
         return vec![item];
@@ -68,6 +110,24 @@ pub fn chunk_outbox(mut item: OutboxItem) -> Vec<OutboxItem> {
             item.clone()
         })
         .collect()
+}
+
+fn split_by_chars(text: &str, limit: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut chunk = String::new();
+    let mut count = 0;
+    for character in text.chars() {
+        if !chunk.is_empty() && count == limit {
+            chunks.push(std::mem::take(&mut chunk));
+            count = 0;
+        }
+        chunk.push(character);
+        count += 1;
+    }
+    if !chunk.is_empty() || chunks.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
 }
 
 fn split_text(kind: ChannelKind, text: &str) -> Vec<String> {
@@ -111,6 +171,7 @@ mod tests {
             kind,
             destination: "destination".into(),
             body,
+            attachments: Vec::new(),
             state: OutboxState::Pending,
             attempts: 0,
             last_error: None,
@@ -138,5 +199,23 @@ mod tests {
     fn short_output_keeps_its_original_effect_id() {
         let original = item(ChannelKind::Signal, "hello".into());
         assert_eq!(chunk_outbox(original.clone()), vec![original]);
+    }
+
+    #[test]
+    fn long_attachment_caption_sends_the_file_once() {
+        let mut original = item(ChannelKind::Signal, "x".repeat(1025));
+        original.attachments.push(ChannelAttachment {
+            file_name: "scene.png".into(),
+            media_type: "image/png".into(),
+            size: 1,
+            sha256: "hash".into(),
+            data_base64: "eA==".into(),
+        });
+        let chunks = chunk_outbox(original);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].body.chars().count(), 1024);
+        assert_eq!(chunks[0].attachments.len(), 1);
+        assert_eq!(chunks[1].body, "x");
+        assert!(chunks[1].attachments.is_empty());
     }
 }
