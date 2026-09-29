@@ -50,6 +50,12 @@ pub struct ChannelAttachment {
     pub data_base64: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OutboxAction {
+    pub id: String,
+    pub label: String,
+}
+
 impl ChannelAttachment {
     pub fn bytes(&self) -> Result<Vec<u8>, base64::DecodeError> {
         BASE64.decode(&self.data_base64)
@@ -70,6 +76,8 @@ pub struct OutboxItem {
     pub body: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<ChannelAttachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<OutboxAction>,
     pub state: OutboxState,
     pub attempts: u32,
     pub last_error: Option<String>,
@@ -91,6 +99,25 @@ pub fn chunk_outbox(mut item: OutboxItem) -> Vec<OutboxItem> {
                 item.body = body;
                 if index > 0 {
                     item.attachments.clear();
+                }
+                item.clone()
+            })
+            .collect();
+    }
+    if !item.actions.is_empty() {
+        let chunks = split_text(item.kind, &item.body);
+        if chunks.len() == 1 {
+            return vec![item];
+        }
+        let parent = item.id;
+        return chunks
+            .into_iter()
+            .enumerate()
+            .map(|(index, body)| {
+                item.id = EffectId::chunk(parent, index);
+                item.body = body;
+                if index > 0 {
+                    item.actions.clear();
                 }
                 item.clone()
             })
@@ -172,6 +199,7 @@ mod tests {
             destination: "destination".into(),
             body,
             attachments: Vec::new(),
+            actions: Vec::new(),
             state: OutboxState::Pending,
             attempts: 0,
             last_error: None,

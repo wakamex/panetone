@@ -44,7 +44,17 @@ impl InboundMessage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InboundBatch {
     pub messages: Vec<InboundMessage>,
+    pub approvals: Vec<TelegramApprovalResponse>,
     pub next_offset: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TelegramApprovalResponse {
+    pub query_id: String,
+    pub destination: String,
+    pub sender_id: String,
+    pub request_id: String,
+    pub choice_id: String,
 }
 
 #[derive(Clone)]
@@ -105,7 +115,7 @@ impl TelegramPoller {
                 "offset": offset,
                 "limit": 100,
                 "timeout": poll_seconds,
-                "allowed_updates": ["message"]
+                "allowed_updates": ["message", "callback_query"]
             }))
             .send()
             .await
@@ -145,8 +155,23 @@ impl TelegramPoller {
         }
         let mut next_offset = offset;
         let mut messages = Vec::new();
+        let mut approvals = Vec::new();
         for update in response.result {
             next_offset = next_offset.max(update.update_id.saturating_add(1));
+            if let Some(callback) = update.callback_query
+                && let Some(message) = callback.message
+                && message.chat.id == self.chat_id
+                && let Some(topic) = message.message_thread_id
+                && let Some((request_id, choice_id)) = parse_approval_callback(&callback.data)
+            {
+                approvals.push(TelegramApprovalResponse {
+                    query_id: callback.id,
+                    destination: topic.to_string(),
+                    sender_id: callback.from.id.to_string(),
+                    request_id,
+                    choice_id,
+                });
+            }
             let Some(message) = update.message else {
                 continue;
             };
@@ -210,8 +235,49 @@ impl TelegramPoller {
         }
         Ok(InboundBatch {
             messages,
+            approvals,
             next_offset,
         })
+    }
+
+    pub async fn answer_callback(
+        &self,
+        query_id: &str,
+        text: &str,
+    ) -> Result<(), ChannelDeliveryError> {
+        let response = self
+            .http
+            .post(format!(
+                "{}/bot{}/answerCallbackQuery",
+                self.api_base, self.token
+            ))
+            .json(&json!({"callback_query_id": query_id, "text": text}))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    ChannelDeliveryError::Timeout(self.kind)
+                } else {
+                    ChannelDeliveryError::Transport(self.kind)
+                }
+            })?;
+        let status = response.status();
+        let body = response_body(response, self.kind).await?;
+        let response: TelegramCallbackAnswer = serde_json::from_slice(&body)
+            .map_err(|_| ChannelDeliveryError::Malformed(self.kind))?;
+        if status.is_success() && response.ok {
+            Ok(())
+        } else {
+            Err(ChannelDeliveryError::Rejected {
+                kind: self.kind,
+                detail: safe_detail(
+                    response
+                        .description
+                        .as_deref()
+                        .unwrap_or("callback answer rejected"),
+                ),
+            })
+        }
     }
 
     async fn attachment_line(
@@ -514,6 +580,12 @@ struct TelegramUpdates {
 }
 
 #[derive(Deserialize)]
+struct TelegramCallbackAnswer {
+    ok: bool,
+    description: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct TelegramUpdateParameters {
     retry_after: Option<u64>,
 }
@@ -522,6 +594,15 @@ struct TelegramUpdateParameters {
 struct TelegramUpdate {
     update_id: i64,
     message: Option<TelegramMessage>,
+    callback_query: Option<TelegramCallbackQuery>,
+}
+
+#[derive(Deserialize)]
+struct TelegramCallbackQuery {
+    id: String,
+    from: TelegramUser,
+    message: Option<TelegramMessage>,
+    data: String,
 }
 
 #[derive(Deserialize)]
@@ -609,6 +690,25 @@ impl TelegramUser {
     }
 }
 
+fn parse_approval_callback(data: &str) -> Option<(String, String)> {
+    let mut parts = data.split(':');
+    if parts.next()? != "wakap" {
+        return None;
+    }
+    let request_id = parts.next()?;
+    let choice_id = parts.next()?;
+    if parts.next().is_some()
+        || request_id.len() != 24
+        || !request_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !choice_id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+    {
+        return None;
+    }
+    Some((request_id.to_string(), choice_id.to_string()))
+}
+
 fn scalar_id(value: &Value) -> Option<String> {
     value
         .as_str()
@@ -683,4 +783,20 @@ fn safe_detail(detail: &str) -> String {
         .filter(|character| !character.is_control())
         .take(240)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_approval_callback;
+
+    #[test]
+    fn approval_callback_is_strict_and_compact() {
+        assert_eq!(
+            parse_approval_callback("wakap:0123456789abcdef01234567:allow_once"),
+            Some(("0123456789abcdef01234567".into(), "allow_once".into()))
+        );
+        assert!(parse_approval_callback("wakap:short:allow_once").is_none());
+        assert!(parse_approval_callback("wakap:0123456789abcdef01234567:Allow").is_none());
+        assert!(parse_approval_callback("other:0123456789abcdef01234567:allow_once").is_none());
+    }
 }

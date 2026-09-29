@@ -72,6 +72,16 @@ pub struct SteeringReceipt {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct ApprovalResolution {
+    pub schema: String,
+    pub request_id: String,
+    pub agent_id: String,
+    pub incarnation_id: String,
+    pub choice_id: String,
+    pub resolved: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 struct SteeringAcknowledgement {
     acknowledged: bool,
 }
@@ -470,6 +480,48 @@ impl WaktermCli {
             .await?;
         receipt.validate(binding)?;
         Ok(receipt)
+    }
+
+    pub async fn resolve_approval(
+        &self,
+        request_id: &str,
+        agent_id: &str,
+        incarnation_id: &str,
+        choice_id: &str,
+    ) -> Result<ApprovalResolution, WaktermCliError> {
+        let capabilities = self.capabilities().await?;
+        if !capabilities.capabilities.contains("approval_control.v1") {
+            return Err(WaktermCliError::MissingCapability("approval_control.v1"));
+        }
+        let resolution: ApprovalResolution = self
+            .run_json(
+                &[
+                    "agent",
+                    "approval",
+                    "--request-id",
+                    request_id,
+                    "--agent-id",
+                    agent_id,
+                    "--incarnation",
+                    incarnation_id,
+                    "--choice",
+                    choice_id,
+                ],
+                None,
+            )
+            .await?;
+        if resolution.schema != "wakterm.agent-approval.v1"
+            || resolution.request_id != request_id
+            || resolution.agent_id != agent_id
+            || resolution.incarnation_id != incarnation_id
+            || resolution.choice_id != choice_id
+            || !resolution.resolved
+        {
+            return Err(WaktermCliError::Rejected(
+                "Wakterm returned an invalid approval resolution receipt".into(),
+            ));
+        }
+        Ok(resolution)
     }
 
     pub async fn terminal_events(

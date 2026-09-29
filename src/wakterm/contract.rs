@@ -47,7 +47,59 @@ pub struct EventRecord {
     pub fields: serde_json::Map<String, Value>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ApprovalChoice {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ApprovalRequest {
+    pub schema: String,
+    #[serde(default = "command_approval_kind")]
+    pub kind: String,
+    pub request_id: String,
+    pub agent_id: String,
+    pub incarnation_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub observed_at: String,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    pub reason: Option<String>,
+    pub command: Option<String>,
+    pub cwd: Option<String>,
+    pub choices: Vec<ApprovalChoice>,
+}
+
+fn command_approval_kind() -> String {
+    "command_approval".to_string()
+}
+
 impl EventRecord {
+    pub fn approval(&self) -> Result<Option<ApprovalRequest>, &'static str> {
+        if self.kind != "approval_requested" {
+            return Ok(None);
+        }
+        let value = self
+            .fields
+            .get("approval")
+            .cloned()
+            .ok_or("approval event has no request")?;
+        let approval: ApprovalRequest =
+            serde_json::from_value(value).map_err(|_| "approval event has an invalid request")?;
+        if approval.schema != "wakterm.agent-approval.v1"
+            || approval.agent_id != self.agent_id
+            || approval.incarnation_id != self.incarnation_id
+            || approval.choices.is_empty()
+        {
+            return Err("approval event identity or choices are invalid");
+        }
+        Ok(Some(approval))
+    }
+
     pub fn visible_output_body(&self) -> Result<Option<String>, &'static str> {
         match self.kind.as_str() {
             "plan" => self

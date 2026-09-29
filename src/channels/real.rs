@@ -109,19 +109,21 @@ impl TelegramClient {
             )
             .await
         } else {
-            telegram_send(
-                &self.http,
-                &self.api_base,
-                &self.token,
-                json!({
-                    "chat_id": self.chat_id,
-                    "message_thread_id": topic_id,
-                    "text": item.body,
-                    "link_preview_options": {"is_disabled": true}
-                }),
-                item,
-            )
-            .await
+            let mut payload = json!({
+                "chat_id": self.chat_id,
+                "message_thread_id": topic_id,
+                "text": item.body,
+                "link_preview_options": {"is_disabled": true}
+            });
+            if !item.actions.is_empty() {
+                payload["reply_markup"] = json!({
+                    "inline_keyboard": item.actions.iter().map(|action| vec![json!({
+                        "text": action.label,
+                        "callback_data": action.id,
+                    })]).collect::<Vec<_>>()
+                });
+            }
+            telegram_send(&self.http, &self.api_base, &self.token, payload, item).await
         };
         *next_send = Instant::now() + self.delay_after(result.as_ref().err());
         result

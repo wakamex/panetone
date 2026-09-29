@@ -65,6 +65,67 @@ fn policy_aborted_final() -> EventRecord {
 }
 
 #[tokio::test]
+async fn question_event_routes_buttons_and_preserves_exact_identity() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let route = route();
+    store.save_route(route.clone(), 1).await.unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+    let event: EventRecord = serde_json::from_value(serde_json::json!({
+        "sequence": 101,
+        "event_id": "approval-event-101",
+        "kind": "approval_requested",
+        "agent_id": "agent-zola",
+        "incarnation_id": "incarnation-zola-7",
+        "turn_id": "turn-1",
+        "approval": {
+            "schema": "wakterm.agent-approval.v1",
+            "kind": "user_question",
+            "request_id": "0123456789abcdef01234567",
+            "agent_id": "agent-zola",
+            "incarnation_id": "incarnation-zola-7",
+            "turn_id": "turn-1",
+            "item_id": "item-1",
+            "observed_at": "2026-09-29T12:00:00Z",
+            "prompt": "How should I promote the build?",
+            "reason": "Promotion scope",
+            "choices": [
+                {"id": "option_1", "label": "Build and activate", "description": "Replace the shared runtime."},
+                {"id": "option_2", "label": "Hold off", "description": "Keep the current runtime."}
+            ]
+        }
+    }))
+    .unwrap();
+    store
+        .ingest_agent_events(100, 101, vec![event], live_agents(&route), 3)
+        .await
+        .unwrap();
+    let pending = store.pending_outbox().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].kind, ChannelKind::Telegram);
+    assert_eq!(pending[0].destination, "101");
+    assert!(pending[0].body.contains("How should I promote the build?"));
+    assert!(
+        pending[0]
+            .body
+            .contains("1. Build and activate: Replace the shared runtime.")
+    );
+    assert_eq!(
+        pending[0].actions[0].id,
+        "wakap:0123456789abcdef01234567:option_1"
+    );
+    let stored = store
+        .get_approval("0123456789abcdef01234567".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.route_id, route.id);
+    assert_eq!(stored.request.agent_id, "agent-zola");
+    assert_eq!(stored.request.incarnation_id, "incarnation-zola-7");
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn event_page_recording_output_projection_and_cursor_advance_are_atomic() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("state.sqlite3");

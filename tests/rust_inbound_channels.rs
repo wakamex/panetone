@@ -180,6 +180,46 @@ async fn telegram_polling_classifies_rate_limits_and_server_errors_as_retryable(
 }
 
 #[tokio::test]
+async fn telegram_polling_returns_structured_approval_callbacks() {
+    let response = serde_json::json!({
+        "ok": true,
+        "result": [{
+            "update_id": 45,
+            "callback_query": {
+                "id": "callback-1",
+                "from": {"id": 1234},
+                "message": {"chat": {"id": -1001}, "message_thread_id": 77},
+                "data": "wakap:0123456789abcdef01234567:allow_once"
+            }
+        }]
+    })
+    .to_string();
+    let (base, request) = telegram_server(&response).await;
+    let directory = tempdir().unwrap();
+    let poller = TelegramPoller::telegram(
+        &base,
+        "fake-token",
+        -1001,
+        directory.path(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let batch = poller.poll(40, 0).await.unwrap();
+    assert_eq!(batch.next_offset, 46);
+    assert!(batch.messages.is_empty());
+    assert_eq!(batch.approvals.len(), 1);
+    assert_eq!(batch.approvals[0].sender_id, "1234");
+    assert_eq!(batch.approvals[0].destination, "77");
+    assert_eq!(batch.approvals[0].request_id, "0123456789abcdef01234567");
+    assert_eq!(batch.approvals[0].choice_id, "allow_once");
+    let payload = request.await.unwrap();
+    assert_eq!(
+        payload["allowed_updates"],
+        serde_json::json!(["message", "callback_query"])
+    );
+}
+
+#[tokio::test]
 async fn telegram_updates_are_durable_before_the_confirmation_cursor_advances() {
     let response = serde_json::json!({
         "ok": true,

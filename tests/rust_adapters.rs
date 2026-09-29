@@ -163,6 +163,7 @@ fn item(index: u128, kind: ChannelKind) -> OutboxItem {
         destination: format!("destination-{index}"),
         body: format!("message-{index}"),
         attachments: Vec::new(),
+        actions: Vec::new(),
         state: OutboxState::Pending,
         attempts: 0,
         last_error: None,

@@ -99,6 +99,8 @@ Local `panetone send` calls inherit `WAKTERM_PANE`, so `--from` is unnecessary i
 
 Assistant messages and plans are forwarded to the route's selected output channel. Each standalone `[panetone:attach /absolute/path]` line outside fenced or indented code adds a file from inside the emitting harness's Wakterm-reported working directory. Panetone removes up to 10 directives, captures files of at most 10 MiB each and 50 MiB combined into the same durable outbox record, and lets the existing route preference choose Signal or Telegram. Invalid attachment requests become visible failure notices without blocking the event cursor. When Wakterm reports an aborted turn with a safe nonempty detail, Panetone forwards that detail as a `Turn failed:` notice. Completed `turn_final` events are not forwarded because their assistant message was already projected. Event identity provides the same durable deduplication as other visible output.
 
+Wakterm `approval_requested` events are projected to the route's Telegram topic through the durable outbox. These cover managed Codex command approvals and single-choice questions, plus observer-backed Claude single-choice questions. The primary Telegram bot sends all interactive messages because it owns the inbound update cursor. A callback is accepted only from `WAK_TG_OWNER`, in the topic bound to the stored route, for the exact stored request, agent, incarnation, and advertised choice. Wakterm performs the final live-state check. It answers Codex through its app-server protocol and submits Claude selections only while the exact question remains pending in the exact session. A failure is shown as stale or unavailable.
+
 ## Launcher contract
 
 An external launcher must use the control CLI rather than the database or the

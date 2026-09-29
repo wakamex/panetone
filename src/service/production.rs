@@ -6,7 +6,7 @@ use std::time::Instant;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::channels::RealChannels;
+use crate::channels::{RealChannels, TelegramApprovalResponse};
 use crate::control::{
     CONTROL_SCHEMA, ControlHandler, ControlRequest, ControlResponse, OutputDispositionParams,
     RouteEnsureParams, RouteInspectParams, SendParams, error_response, success_response,
@@ -35,6 +35,46 @@ pub struct ProductionService {
 }
 
 impl ProductionService {
+    pub async fn resolve_telegram_approval(
+        &self,
+        response: &TelegramApprovalResponse,
+    ) -> Result<String, String> {
+        let stored = self
+            .store
+            .get_approval(response.request_id.clone())
+            .await
+            .map_err(error_string)?
+            .ok_or_else(|| "approval request is unknown or expired".to_string())?;
+        let route = self
+            .store
+            .get_route(stored.route_id)
+            .await
+            .map_err(error_string)?
+            .ok_or_else(|| "approval route no longer exists".to_string())?;
+        let correct_topic = route.channels.iter().any(|binding| {
+            matches!(binding, ChannelBinding::Telegram { topic_id } if topic_id.to_string() == response.destination)
+        });
+        if !correct_topic {
+            return Err("approval button does not belong to this topic".into());
+        }
+        let choice = stored
+            .request
+            .choices
+            .iter()
+            .find(|choice| choice.id == response.choice_id)
+            .ok_or_else(|| "approval choice is no longer available".to_string())?;
+        self.wakterm
+            .resolve_approval(
+                &stored.request.request_id,
+                &stored.request.agent_id,
+                &stored.request.incarnation_id,
+                &choice.id,
+            )
+            .await
+            .map_err(error_string)?;
+        Ok(choice.label.clone())
+    }
+
     pub fn new(
         store: StoreHandle,
         wakterm: WaktermCli,
@@ -89,6 +129,7 @@ impl ProductionService {
                 } => {
                     let route_agents = if events.iter().any(|event| {
                         event.kind == "agent_lifecycle"
+                            || event.kind == "approval_requested"
                             || event.visible_output_body().is_ok_and(|body| body.is_some())
                     }) {
                         let live = self.wakterm.live_routes().await.map_err(error_string)?;

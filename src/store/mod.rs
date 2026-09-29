@@ -22,7 +22,7 @@ use crate::domain::{
     OutboxItem, OutboxState, Route, RouteId, SEMANTIC_HASH_KIND, SendCommand, Workflow, WorkflowId,
     WorkflowState, semantic_request_hash,
 };
-use crate::wakterm::{AgentCatalog, EventRecord};
+use crate::wakterm::{AgentCatalog, ApprovalRequest, EventRecord};
 
 pub const SCHEMA_VERSION: i64 = 7;
 const COMMAND_CAPACITY: usize = 128;
@@ -181,6 +181,12 @@ pub struct OutputDispositionSnapshot {
     pub output: Option<StoredAgentOutput>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredApproval {
+    pub request: ApprovalRequest,
+    pub route_id: RouteId,
+}
+
 #[derive(Clone)]
 pub struct StoreHandle {
     sender: mpsc::Sender<Command>,
@@ -308,6 +314,10 @@ enum Command {
         after_sequence: u64,
         expected_text: String,
         reply: oneshot::Sender<StoreResult<OutputDispositionSnapshot>>,
+    },
+    GetApproval {
+        request_id: String,
+        reply: oneshot::Sender<StoreResult<Option<StoredApproval>>>,
     },
     Status {
         reply: oneshot::Sender<StoreResult<StoreStatus>>,
@@ -584,6 +594,11 @@ impl StoreHandle {
         .await
     }
 
+    pub async fn get_approval(&self, request_id: String) -> StoreResult<Option<StoredApproval>> {
+        self.request(|reply| Command::GetApproval { request_id, reply })
+            .await
+    }
+
     pub async fn status(&self) -> StoreResult<StoreStatus> {
         self.request(|reply| Command::Status { reply }).await
     }
@@ -740,6 +755,9 @@ fn handle_command(connection: &mut Connection, command: Command) {
                 &expected_text,
             ),
         ),
+        Command::GetApproval { request_id, reply } => {
+            send_reply(reply, get_approval(connection, &request_id))
+        }
         Command::Status { reply } => send_reply(reply, status(connection)),
         Command::Shutdown { reply } => send_reply(reply, Ok(())),
     }
@@ -1170,6 +1188,34 @@ fn output_disposition(
     })
 }
 
+fn get_approval(connection: &Connection, request_id: &str) -> StoreResult<Option<StoredApproval>> {
+    let row = connection
+        .query_row(
+            "SELECT route_id, record_json
+             FROM agent_events
+             WHERE json_extract(record_json, '$.approval.request_id') = ?1
+               AND route_id IS NOT NULL
+             ORDER BY sequence DESC
+             LIMIT 1",
+            params![request_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    row.map(|(route_id, record_json)| {
+        let event: EventRecord = serde_json::from_str(&record_json)?;
+        let request = event
+            .approval()
+            .map_err(|detail| StoreError::Conflict(detail.into()))?
+            .ok_or_else(|| StoreError::Conflict("stored event is not an approval".into()))?;
+        let route_id = route_id
+            .parse::<Uuid>()
+            .map(RouteId::new)
+            .map_err(|_| StoreError::Conflict("stored approval route id is invalid".into()))?;
+        Ok(StoredApproval { request, route_id })
+    })
+    .transpose()
+}
+
 fn ingest_agent_events(
     connection: &mut Connection,
     expected: u64,
@@ -1262,10 +1308,13 @@ fn ingest_agent_events(
 
         let mut state = "recorded";
         let route_id = route.map(|route| route.id);
+        let approval = event
+            .approval()
+            .map_err(|detail| StoreError::Conflict(detail.into()))?;
         let visible_body = event
             .visible_output_body()
             .map_err(|detail| StoreError::Conflict(detail.into()))?;
-        if let Some(body) = visible_body {
+        if approval.is_some() || visible_body.is_some() {
             let Some(route) = route else {
                 state = "unrouted";
                 outcome.unrouted += 1;
@@ -1275,7 +1324,9 @@ fn ingest_agent_events(
             };
             if route.title.eq_ignore_ascii_case("debate")
                 && event.kind == "assistant_message"
-                && body.trim() == DEBATE_NO_REPLY
+                && visible_body
+                    .as_deref()
+                    .is_some_and(|body| body.trim() == DEBATE_NO_REPLY)
             {
                 state = "suppressed";
                 if let Some(candidate) = route_agent {
@@ -1292,10 +1343,20 @@ fn ingest_agent_events(
                 outcome.recorded += 1;
                 continue;
             }
-            let Some((kind, destination)) = output_destination(
-                route,
-                preferences.get(&route.id.to_string()).map(String::as_str),
-            ) else {
+            let destination = if approval.is_some() {
+                route.channels.iter().find_map(|binding| match binding {
+                    crate::domain::ChannelBinding::Telegram { topic_id } => {
+                        Some((ChannelKind::Telegram, topic_id.to_string()))
+                    }
+                    crate::domain::ChannelBinding::Signal { .. } => None,
+                })
+            } else {
+                output_destination(
+                    route,
+                    preferences.get(&route.id.to_string()).map(String::as_str),
+                )
+            };
+            let Some((kind, destination)) = destination else {
                 state = "unrouted";
                 outcome.unrouted += 1;
                 insert_agent_event(
@@ -1309,10 +1370,55 @@ fn ingest_agent_events(
                 outcome.recorded += 1;
                 continue;
             };
-            let (body, attachments) = visible_attachments(
-                body,
-                route_agent.and_then(|candidate| candidate.working_directory.as_deref()),
-            );
+            let (body, attachments, actions) = match approval {
+                Some(approval) => {
+                    let mut body = if approval.kind == "user_question" {
+                        "Input needed".to_string()
+                    } else {
+                        "Approval needed".to_string()
+                    };
+                    if let Some(prompt) = approval.prompt.as_deref() {
+                        body.push_str("\n\n");
+                        body.push_str(prompt);
+                    }
+                    if let Some(command) = approval.command.as_deref() {
+                        body.push_str("\n\nCommand:\n");
+                        body.push_str(command);
+                    }
+                    if let Some(reason) = approval.reason.as_deref() {
+                        body.push_str("\n\nReason: ");
+                        body.push_str(reason);
+                    }
+                    if approval.kind == "user_question" {
+                        for (index, choice) in approval.choices.iter().enumerate() {
+                            if let Some(description) = choice.description.as_deref() {
+                                body.push_str(&format!(
+                                    "\n\n{}. {}: {}",
+                                    index + 1,
+                                    choice.label,
+                                    description
+                                ));
+                            }
+                        }
+                    }
+                    let actions = approval
+                        .choices
+                        .into_iter()
+                        .map(|choice| crate::domain::OutboxAction {
+                            id: format!("wakap:{}:{}", approval.request_id, choice.id),
+                            label: choice.label,
+                        })
+                        .collect();
+                    (body, Vec::new(), actions)
+                }
+                None => {
+                    let (body, attachments) = visible_attachments(
+                        visible_body.expect("visible output was checked"),
+                        route_agent.and_then(|candidate| candidate.working_directory.as_deref()),
+                    );
+                    (body, attachments, Vec::new())
+                }
+            };
             let namespace = Uuid::new_v5(
                 &Uuid::NAMESPACE_URL,
                 b"https://panetone.dev/wakterm/events/v1",
@@ -1323,12 +1429,20 @@ fn ingest_agent_events(
                     format!("{}\0{}", event.incarnation_id, event.event_id).as_bytes(),
                 )),
                 route_id: Some(route.id),
-                sender_harness: route_agent.map(|candidate| candidate.agent.harness.clone()),
+                // Interactive callbacks must use the one Telegram bot that owns
+                // the inbound update cursor. Harness-specific bots remain
+                // appropriate for ordinary one-way output.
+                sender_harness: if actions.is_empty() {
+                    route_agent.map(|candidate| candidate.agent.harness.clone())
+                } else {
+                    None
+                },
                 source_agent: route_agent.map(|candidate| candidate.agent.clone()),
                 kind,
                 destination,
                 body,
                 attachments,
+                actions,
                 state: OutboxState::Pending,
                 attempts: 0,
                 last_error: None,

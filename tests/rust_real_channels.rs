@@ -1,7 +1,9 @@
 use std::time::Duration;
 
 use panetone::channels::{ChannelDeliveryError, RealChannels, SignalClient, TelegramClient};
-use panetone::domain::{ChannelAttachment, ChannelKind, EffectId, OutboxItem, OutboxState};
+use panetone::domain::{
+    ChannelAttachment, ChannelKind, EffectId, OutboxAction, OutboxItem, OutboxState,
+};
 use serde_json::Value;
 use tempfile::tempdir;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -122,6 +124,7 @@ fn item(kind: ChannelKind, destination: &str) -> OutboxItem {
         destination: destination.into(),
         body: "message café ✓".into(),
         attachments: Vec::new(),
+        actions: Vec::new(),
         state: OutboxState::Delivering,
         attempts: 1,
         last_error: None,
@@ -148,6 +151,34 @@ async fn telegram_sends_the_expected_stable_request() {
     assert_eq!(request.body["message_thread_id"], 77);
     assert_eq!(request.body["text"], "message café ✓");
     assert!(request.headers.contains("x-panetone-delivery-id: 11111111"));
+}
+
+#[tokio::test]
+async fn telegram_sends_approval_choices_as_inline_buttons() {
+    let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 39\r\n\r\n{\"ok\":true,\"result\":{\"message_id\":402}}";
+    let (base, request) = http_server(response, Duration::ZERO).await;
+    let telegram = TelegramClient::new(&base, "fake-token", -1001, Duration::from_secs(2)).unwrap();
+    let mut message = item(ChannelKind::Telegram, "77");
+    message.actions = vec![
+        OutboxAction {
+            id: "wakap:0123456789abcdef01234567:allow_once".into(),
+            label: "Allow once".into(),
+        },
+        OutboxAction {
+            id: "wakap:0123456789abcdef01234567:reject".into(),
+            label: "Reject".into(),
+        },
+    ];
+    telegram.send(&message).await.unwrap();
+    let request = request.await.unwrap();
+    assert_eq!(
+        request.body["reply_markup"]["inline_keyboard"][0][0]["text"],
+        "Allow once"
+    );
+    assert_eq!(
+        request.body["reply_markup"]["inline_keyboard"][1][0]["callback_data"],
+        "wakap:0123456789abcdef01234567:reject"
+    );
 }
 
 #[tokio::test]

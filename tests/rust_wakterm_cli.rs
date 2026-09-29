@@ -102,7 +102,7 @@ async fn real_cli_boundary_negotiates_joins_admits_and_resumes_terminals() {
         r#"
 operation="$*"
 if [[ "$operation" == *"agent capabilities"* ]]; then
-  printf '%s\n' '{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1","codex_output_shadow.experimental.v1"]}'
+  printf '%s\n' '{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1","approval_control.v1","codex_output_shadow.experimental.v1"]}'
 elif [[ "$operation" == *"agent catalog"* ]]; then
   printf '%s\n' '{"schema":"wakterm.agent-api.v1","agents":[{"agent_id":"agent-zola","incarnation_id":"incarnation-zola-7","pane_id":9,"name":"renamed display","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"}]}'
 elif [[ "$operation" == *"list --format json"* ]]; then
@@ -126,6 +126,12 @@ elif [[ "$operation" == *"agent admit"* ]]; then
 elif [[ "$operation" == *"agent send agent-zola"* ]]; then
   [[ "$(cat)" == "steer this turn" ]]
   printf '%s\n' '{"agent_id":"agent-zola","agent_name":"renamed display","pane_id":9,"transport":"observed_pty","submitted":true,"acknowledgement":{"kind":"session_observer","acknowledged":true,"latency_ms":10,"session_path":"/tmp/session","detail":null}}'
+elif [[ "$operation" == *"agent approval"* ]]; then
+  [[ "$operation" == *"--request-id 0123456789abcdef01234567"* ]]
+  [[ "$operation" == *"--agent-id agent-zola"* ]]
+  [[ "$operation" == *"--incarnation incarnation-zola-7"* ]]
+  [[ "$operation" == *"--choice allow_once"* ]]
+  printf '%s\n' '{"schema":"wakterm.agent-approval.v1","request_id":"0123456789abcdef01234567","agent_id":"agent-zola","incarnation_id":"incarnation-zola-7","choice_id":"allow_once","resolved":true}'
 elif [[ "$operation" == *"agent request watch"* ]]; then
   [[ "$operation" == *"--after 40 --once"* ]]
   printf '%s\n' '{"request_id":"11111111-1111-4111-8111-111111111111","target_agent_id":"agent-zola","state":"completed","final_message":"done","detail":null,"terminal_event_sequence":41}'
@@ -176,6 +182,17 @@ fi
 
     let steering = cli.steer(&resolved, "steer this turn").await.unwrap();
     assert!(steering.acknowledged());
+
+    let approval = cli
+        .resolve_approval(
+            "0123456789abcdef01234567",
+            "agent-zola",
+            "incarnation-zola-7",
+            "allow_once",
+        )
+        .await
+        .unwrap();
+    assert!(approval.resolved);
 
     let events = cli.terminal_events(40).await.unwrap();
     assert_eq!(events.len(), 1);

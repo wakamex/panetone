@@ -336,9 +336,18 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
     if let Some((poller, owner)) = telegram {
         let ingestor = InboundIngestor::new(store.clone());
         let channel_store = store.clone();
+        let channel_service = handler.clone();
         let shutdown = supervisor.shutdown_receiver();
         supervisor.spawn("telegram-inbound", TaskPolicy::Critical, async move {
-            telegram_loop(poller, owner, ingestor, channel_store, shutdown).await
+            telegram_loop(
+                poller,
+                owner,
+                ingestor,
+                channel_store,
+                channel_service,
+                shutdown,
+            )
+            .await
         });
     }
     if let Some((socket, account, owner)) = signal {
@@ -467,6 +476,7 @@ async fn telegram_loop(
     owner: String,
     ingestor: InboundIngestor,
     store: StoreHandle,
+    service: Arc<ProductionService>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
     let mut consecutive_failures = 0_u32;
@@ -518,6 +528,29 @@ async fn telegram_loop(
                 continue;
             }
         };
+        let approvals = std::mem::take(&mut batch.approvals);
+        for approval in approvals {
+            let result = if approval.sender_id == owner {
+                service.resolve_telegram_approval(&approval).await
+            } else {
+                Err("Only the configured owner can answer approvals".into())
+            };
+            let answer = match result {
+                Ok(label) => format!("Applied: {label}"),
+                Err(error) => {
+                    tracing::warn!(
+                        request_id = %approval.request_id,
+                        error = %error,
+                        "Telegram approval response was rejected"
+                    );
+                    "This approval is stale or unavailable".to_string()
+                }
+            };
+            poller
+                .answer_callback(&approval.query_id, &answer)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         batch
             .messages
             .retain(|message| message.sender_id.as_deref() == Some(owner.as_str()));
