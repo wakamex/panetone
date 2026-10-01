@@ -340,6 +340,13 @@ set -euo pipefail
 operation="$*"
 if [[ "$operation" == *"--version"* ]]; then
   echo 'wakterm source-pane-test'
+elif [[ "$operation" == *"agent caller"* ]]; then
+  case "${{CODEX_THREAD_ID-}}" in
+    thread-caller) incarnation=inc-caller ;;
+    thread-replaced) incarnation=inc-replaced ;;
+    *) echo "caller not identified" >&2; exit 1 ;;
+  esac
+  echo '{{"schema":"wakterm.agent-api.v1","resolved_by":"codex_thread","agent":{{"agent_id":"agent-caller","incarnation_id":"'"$incarnation"'","pane_id":85,"name":"inq2","harness":"claude","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-09-24T00:00:00Z"}}}}'
 elif [[ "$operation" == *"agent capabilities"* ]]; then
   echo '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
 elif [[ "$operation" == *"agent catalog"* ]]; then
@@ -379,7 +386,7 @@ fi
 }
 
 #[tokio::test]
-async fn wakterm_source_pane_derives_the_route_without_from() {
+async fn wakterm_caller_derives_the_route_and_callback_without_from() {
     let directory = tempdir().unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let database = directory.path().join("state.sqlite3");
@@ -414,7 +421,9 @@ async fn wakterm_source_pane_derives_the_route_without_from() {
             "--return-final",
             "do the work",
         ])
-        .env("WAKTERM_PANE", "85")
+        .env("WAKTERM_BIN", &wakterm)
+        .env("CODEX_THREAD_ID", "thread-caller")
+        .env_remove("WAKTERM_PANE")
         .output()
         .unwrap();
     assert!(
@@ -446,6 +455,55 @@ async fn wakterm_source_pane_derives_the_route_without_from() {
     assert_eq!(returned.agent.source.agent_id, "agent-caller");
     assert_eq!(returned.agent.source.pane_id, Some(85));
     store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn send_rejects_a_caller_incarnation_that_is_no_longer_live() {
+    let directory = tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let database = directory.path().join("state.sqlite3");
+    let store = StoreHandle::open(&database).unwrap();
+    store
+        .save_route(unavailable_route(42, "inq2", 402), 1)
+        .await
+        .unwrap();
+    store
+        .save_route(unavailable_route(43, "target", 403), 1)
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+    let telegram = HttpCapture::start();
+    let (wakterm, admissions) =
+        write_source_pane_wakterm_fake(directory.path(), "55555555-5555-4555-8555-555555555555");
+    let daemon = Daemon::start(directory.path(), &database, &wakterm, &telegram.base);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_panetone"))
+        .args([
+            "send",
+            "--socket",
+            daemon.socket.to_str().unwrap(),
+            "--to",
+            "target",
+            "do the work",
+        ])
+        .env("WAKTERM_BIN", &wakterm)
+        .env("CODEX_THREAD_ID", "thread-replaced")
+        .env_remove("WAKTERM_PANE")
+        .output()
+        .unwrap();
+    daemon.stop();
+    assert!(!output.status.success());
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["error"]["code"], "source_agent_unavailable");
+    assert_eq!(
+        response["error"]["details"]["incarnation_id"],
+        "inc-replaced"
+    );
+    assert!(
+        fs::read_to_string(&admissions)
+            .unwrap_or_default()
+            .is_empty()
+    );
 }
 
 fn write_busy_steering_wakterm_fake(directory: &Path) -> (PathBuf, PathBuf, PathBuf) {

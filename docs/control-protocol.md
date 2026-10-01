@@ -193,7 +193,10 @@ disposition, and exits nonzero after its local timeout while still pending.
   "params": {
     "to": "wakterm",
     "message": "Investigate the observer bug",
-    "source_pane_id": 42,
+    "source_agent": {
+      "agent_id": "8a6c0e8e-0d5f-4b52-9b63-2f0b4a6c9d10",
+      "incarnation_id": "c3f1d2a4-7b9e-4e1a-8f60-5d2c7b1e9a34"
+    },
     "return_final": false,
     "steer": false,
     "timeout_ms": 0
@@ -201,7 +204,7 @@ disposition, and exits nonzero after its local timeout while still pending.
 }
 ```
 
-`to` and `message` must be non-empty. A caller must provide either `source_pane_id` or `from`. The CLI automatically supplies `source_pane_id` from `WAKTERM_PANE`, so normal calls from a Wakterm agent omit `--from`. Panetone validates that the pane contains a live agent and derives the source route from its current effective title. `from` remains an optional route override for the shared channel mirror and audit identity, and is required for callers outside Wakterm. Route titles resolve by exact case-insensitive match and fail when missing. Every live agent with the same effective title belongs to the route, including agents in separate tabs. `return_final` and `steer` default to false, and `timeout_ms` defaults to zero. A nonzero timeout is rejected because asynchronous final callbacks do not expire.
+`to` and `message` must be non-empty. A caller must provide `source_agent`, `source_pane_id`, or `from`, and at most one of `source_agent` and `source_pane_id`. Without `--source-pane-id`, the CLI runs `wakterm agent caller` in its inherited environment and supplies the resulting `agent_id` and `incarnation_id` as `source_agent`, so normal calls from a Wakterm agent omit `--from`. Wakterm resolves pane harnesses through `WAKTERM_PANE` and managed Codex tool commands, which run in a shared app server without a pane, through `CODEX_THREAD_ID`. If Wakterm cannot identify exactly one caller, the CLI fails unless `--from` is given. Panetone validates that the exact agent incarnation, or the agent in `source_pane_id`, is live and derives the source route from its pane's current effective title. A stale source fails with `source_agent_unavailable` or `source_pane_unavailable` unless `from` is also given. `from` remains an optional route override for the shared channel mirror and audit identity, and is required for callers outside Wakterm. Route titles resolve by exact case-insensitive match and fail when missing. Every live agent with the same effective title belongs to the route, including agents in separate tabs. `return_final` and `steer` default to false, and `timeout_ms` defaults to zero. A nonzero timeout is rejected because asynchronous final callbacks do not expire.
 
 The normal sequence is:
 

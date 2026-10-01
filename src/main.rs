@@ -10,7 +10,7 @@ use panetone::channels::{
 };
 use panetone::control::{
     CONTROL_SCHEMA, ControlRequest, ControlServer, OutputDispositionParams, RouteEnsureParams,
-    RouteInspectParams, SendParams, request,
+    RouteInspectParams, SendParams, SourceAgent, request,
 };
 use panetone::service::{InboundIngestor, ProductionService};
 use panetone::store::StoreHandle;
@@ -102,8 +102,7 @@ struct SendArgs {
     id: Option<Uuid>,
     #[arg(
         long,
-        env = "WAKTERM_PANE",
-        help = "Exact calling pane (default: $WAKTERM_PANE inside Wakterm)"
+        help = "Exact calling pane (default: the agent `wakterm agent caller` identifies)"
     )]
     source_pane_id: Option<u64>,
     #[arg(
@@ -703,11 +702,19 @@ async fn shutdown_signal() {
 
 async fn run_send(args: SendArgs) -> Result<()> {
     let socket = control_socket(args.control.socket)?;
+    let source_agent = match (args.source_pane_id, &args.source) {
+        (Some(_), _) => None,
+        (None, None) => Some(wakterm_caller().await.context(
+            "cannot identify the calling Wakterm agent; pass --from ROUTE or --source-pane-id PANE",
+        )?),
+        (None, Some(_)) => wakterm_caller().await.ok(),
+    };
     let params = SendParams {
         source: args.source,
         target: args.target,
         message: args.message,
         source_pane_id: args.source_pane_id,
+        source_agent,
         return_final: args.return_final,
         steer: args.steer,
         timeout_ms: 0,
@@ -728,6 +735,30 @@ async fn run_send(args: SendArgs) -> Result<()> {
     } else {
         bail!("send was rejected")
     }
+}
+
+/// Asks Wakterm which live agent this command runs for. Wakterm resolves it
+/// from the inherited environment, including managed Codex tool commands that
+/// run outside the agent's pane, so the environment must be passed unchanged.
+async fn wakterm_caller() -> Result<SourceAgent> {
+    let binary = std::env::var_os("WAKTERM_BIN").unwrap_or_else(|| "wakterm".into());
+    let output = tokio::process::Command::new(&binary)
+        .args(["--skip-config", "cli", "--prefer-mux", "--no-auto-start"])
+        .args(["agent", "caller"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .with_context(|| format!("failed to run {}", Path::new(&binary).display()))?;
+    if !output.status.success() {
+        bail!(
+            "wakterm agent caller failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let caller: Value = serde_json::from_slice(&output.stdout)
+        .context("wakterm agent caller returned invalid JSON")?;
+    serde_json::from_value(caller["agent"].clone())
+        .context("wakterm agent caller returned no agent identity")
 }
 
 async fn run_status(args: StatusArgs) -> Result<()> {

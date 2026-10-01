@@ -148,7 +148,7 @@ The wait exits successfully only for `projected`. It fails immediately for
 `unrouted` or `misrouted` output. This reads Panetone's existing durable event
 disposition and does not use the SQLite file or retired Python state.
 
-Send a one-way message from a Wakterm agent. The CLI derives its source agent and route from `WAKTERM_PANE`:
+Send a one-way message from a Wakterm agent. The CLI asks `wakterm agent caller` for the exact calling agent, which works for pane harnesses and for managed Codex tool commands that run outside the pane, and derives the route from that agent:
 
 ```sh
 target/release/panetone send \

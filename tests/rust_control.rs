@@ -175,27 +175,58 @@ async fn client_socket_precedence_is_flag_then_environment_then_runtime_director
     task.await.unwrap().unwrap();
 }
 
+fn write_caller_fake(directory: &std::path::Path) -> std::path::PathBuf {
+    let path = directory.join("wakterm-caller-fake");
+    std::fs::write(
+        &path,
+        r#"#!/bin/bash
+set -euo pipefail
+[[ "$*" == *"agent caller"* ]] || { echo "unexpected: $*" >&2; exit 92; }
+if [[ "${CODEX_THREAD_ID-}" == "thread-a" ]]; then
+  echo '{"schema":"wakterm.agent-api.v1","resolved_by":"codex_thread","agent":{"agent_id":"agent-a","incarnation_id":"inc-a","pane_id":17,"name":"a","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-09-30T00:00:00Z"}}'
+else
+  echo "neither WAKTERM_PANE nor CODEX_THREAD_ID identifies the caller" >&2
+  exit 1
+fi
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
 #[tokio::test]
-async fn send_inherits_the_exact_wakterm_source_pane_without_from() {
+async fn send_identifies_the_exact_calling_agent_through_wakterm_without_from() {
     let directory = private_directory();
     let socket = directory.path().join("control.sock");
     let server = ControlServer::bind(&socket).await.unwrap();
     let (shutdown, receiver) = watch::channel(false);
     let task = tokio::spawn(server.run(Arc::new(Echo), receiver));
-
-    let output = Command::new(env!("CARGO_BIN_EXE_panetone"))
-        .args([
+    let wakterm = write_caller_fake(directory.path());
+    let send = |thread: Option<&str>, from: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_panetone"));
+        command.args([
             "send",
             "--socket",
             socket.to_str().unwrap(),
             "--to",
             "target",
-            "do the work",
-        ])
-        .env("WAKTERM_PANE", "85")
-        .output()
-        .await
-        .unwrap();
+        ]);
+        if let Some(from) = from {
+            command.args(["--from", from]);
+        }
+        command
+            .arg("do the work")
+            .env("WAKTERM_BIN", &wakterm)
+            .env_remove("WAKTERM_PANE")
+            .env_remove("CODEX_THREAD_ID");
+        if let Some(thread) = thread {
+            command.env("CODEX_THREAD_ID", thread);
+        }
+        command.output()
+    };
+
+    let output = send(Some("thread-a"), None).await.unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -203,8 +234,29 @@ async fn send_inherits_the_exact_wakterm_source_pane_without_from() {
     );
     let response: ControlResponse = serde_json::from_slice(&output.stdout).unwrap();
     let params = response.result.unwrap();
-    assert_eq!(params["source_pane_id"], 85);
+    assert_eq!(
+        params["source_agent"],
+        json!({"agent_id": "agent-a", "incarnation_id": "inc-a"})
+    );
+    assert_eq!(params["source_pane_id"], Value::Null);
     assert_eq!(params["from"], Value::Null);
+
+    let unidentified = send(None, None).await.unwrap();
+    assert!(!unidentified.status.success());
+    assert!(unidentified.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&unidentified.stderr);
+    assert!(stderr.contains("--from ROUTE"), "{stderr}");
+    assert!(
+        stderr.contains("neither WAKTERM_PANE nor CODEX_THREAD_ID"),
+        "{stderr}"
+    );
+
+    let routed = send(None, Some("source")).await.unwrap();
+    assert!(routed.status.success());
+    let response: ControlResponse = serde_json::from_slice(&routed.stdout).unwrap();
+    let params = response.result.unwrap();
+    assert_eq!(params["from"], "source");
+    assert_eq!(params["source_agent"], Value::Null);
 
     shutdown.send(true).unwrap();
     task.await.unwrap().unwrap();

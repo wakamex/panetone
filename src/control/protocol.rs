@@ -24,12 +24,21 @@ pub struct SendParams {
     pub message: String,
     #[serde(default)]
     pub source_pane_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_agent: Option<SourceAgent>,
     #[serde(default)]
     pub return_final: bool,
     #[serde(default)]
     pub steer: bool,
     #[serde(default)]
     pub timeout_ms: u64,
+}
+
+/// The exact calling agent incarnation, as `wakterm agent caller` reports it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SourceAgent {
+    pub agent_id: String,
+    pub incarnation_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

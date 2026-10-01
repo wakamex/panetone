@@ -573,12 +573,22 @@ impl ProductionService {
             .is_some_and(|source| source.is_empty())
             || params.target.is_empty()
             || params.message.is_empty()
-            || (params.source.is_none() && params.source_pane_id.is_none())
+            || (params.source.is_none()
+                && params.source_pane_id.is_none()
+                && params.source_agent.is_none())
         {
             return error_response(
                 id,
                 "invalid_request",
-                "send requires non-empty to and message fields plus either from or a Wakterm source pane",
+                "send requires non-empty to and message fields plus from, a Wakterm source pane, or a source agent",
+                None,
+            );
+        }
+        if params.source_pane_id.is_some() && params.source_agent.is_some() {
+            return error_response(
+                id,
+                "invalid_request",
+                "send accepts a Wakterm source pane or a source agent, not both",
                 None,
             );
         }
@@ -597,21 +607,36 @@ impl ProductionService {
             }
         };
         let last_agents = self.last_agents.read().await;
-        let source_pane = params
-            .source_pane_id
-            .and_then(|pane_id| live.source_in_pane(pane_id));
-        if let Some(pane_id) = params.source_pane_id
-            && source_pane.is_none()
-            && params.source.is_none()
-        {
-            return error_response(
-                id,
-                "source_pane_unavailable",
-                format!("source pane {pane_id} has no live Wakterm agent"),
-                Some(json!({"pane_id": pane_id})),
-            );
+        let source_agent = match (params.source_pane_id, &params.source_agent) {
+            (Some(pane_id), _) => live.source_in_pane(pane_id),
+            (None, Some(agent)) => live.source_agent(&agent.agent_id, &agent.incarnation_id),
+            (None, None) => None,
+        };
+        if source_agent.is_none() && params.source.is_none() {
+            if let Some(pane_id) = params.source_pane_id {
+                return error_response(
+                    id,
+                    "source_pane_unavailable",
+                    format!("source pane {pane_id} has no live Wakterm agent"),
+                    Some(json!({"pane_id": pane_id})),
+                );
+            }
+            if let Some(agent) = &params.source_agent {
+                return error_response(
+                    id,
+                    "source_agent_unavailable",
+                    format!(
+                        "source agent {} incarnation {} is not live in a Wakterm route",
+                        agent.agent_id, agent.incarnation_id
+                    ),
+                    Some(json!({
+                        "agent_id": agent.agent_id,
+                        "incarnation_id": agent.incarnation_id,
+                    })),
+                );
+            }
         }
-        let (source, source_binding) = match source_pane {
+        let (source, source_binding) = match source_agent {
             Some((pane_route, binding)) => {
                 let source_title = params.source.as_deref().unwrap_or(&pane_route.title);
                 let source = match exact_route(&routes, source_title) {
@@ -624,7 +649,7 @@ impl ProductionService {
                 let source_title = params
                     .source
                     .as_deref()
-                    .expect("a source route is required without a source pane");
+                    .expect("a source route is required without a live source agent");
                 let source = match exact_route(&routes, source_title) {
                     Ok(route) => route,
                     Err(response) => return route_error(id, "source", response),

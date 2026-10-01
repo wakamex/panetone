@@ -242,6 +242,21 @@ impl LiveRouteSnapshot {
         })
     }
 
+    pub fn source_agent(
+        &self,
+        agent_id: &str,
+        incarnation_id: &str,
+    ) -> Option<(&LiveRoute, AgentBinding)> {
+        self.routes.iter().find_map(|route| {
+            route
+                .agents
+                .iter()
+                .find(|agent| agent.agent_id == agent_id && agent.incarnation_id == incarnation_id)
+                .cloned()
+                .map(|agent| (route, agent))
+        })
+    }
+
     pub fn current_agent(&self, previous: &AgentBinding) -> Option<AgentBinding> {
         let mut agents = self.routes.iter().flat_map(|route| &route.agents);
         agents
