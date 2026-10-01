@@ -290,6 +290,44 @@ async fn busy_target_queues_durably_and_re_resolves_the_same_route_before_retry(
 }
 
 #[tokio::test]
+async fn busy_target_retry_during_the_queued_status_post_keeps_the_queued_acknowledgement() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let wakterm = FakeWakterm::new(contract());
+    wakterm.script_receipts([AdmissionStatus::Busy]);
+    let faults = Arc::new(FaultInjector::default());
+    faults.arm(FaultPoint::AfterReceiptCheckpoint);
+    let service =
+        OfflineService::with_faults(store.clone(), wakterm, RecordingChannels::default(), faults);
+    let (source, target) = routes();
+    let request = command(125, true);
+
+    // Stop the sender's request after the busy receipt is saved and before
+    // the queued status post, where the busy-target retry can run.
+    assert!(matches!(
+        service.submit(request.clone(), &source, &target, 100).await,
+        Err(ServiceError::Injected(FaultPoint::AfterReceiptCheckpoint))
+    ));
+    let queued = store.get_workflow(request.id).await.unwrap().unwrap();
+    assert_eq!(queued.workflow.state, WorkflowState::AwaitingTargetIdle);
+    assert_eq!(queued.response.unwrap()["delivery_state"], "queued");
+
+    let retry = OfflineService::new(
+        store.clone(),
+        FakeWakterm::new(contract()),
+        RecordingChannels::default(),
+    );
+    let submitted = retry
+        .retry_busy_target(request.id, &target, 200)
+        .await
+        .unwrap();
+    assert!(submitted.submitted);
+    drop(retry);
+    drop(service);
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn explicit_steering_redirects_a_busy_target_once_and_returns_its_acknowledgement() {
     let directory = tempdir().unwrap();
     let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();

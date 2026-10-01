@@ -581,6 +581,12 @@ impl OfflineService {
         }
         let expected = record.workflow.state;
         let state = record.workflow.apply_target_receipt(&receipt, &target)?;
+        // A queued workflow can be retried and submitted as soon as it is saved,
+        // so its acknowledgement is saved with it rather than after the status post.
+        let queued = ServiceAck::queued(record.command.return_final);
+        if state == WorkflowState::AwaitingTargetIdle {
+            record.response = Some(serde_json::to_value(&queued)?);
+        }
         record.updated_at_ms = now_ms;
         self.store.save_workflow(record.clone(), expected).await?;
         self.faults.hit(FaultPoint::AfterReceiptCheckpoint)?;
@@ -596,8 +602,7 @@ impl OfflineService {
                     )
                     .await?;
                 }
-                let ack = ServiceAck::queued(record.command.return_final);
-                persist_ack(&self.store, record, ack, now_ms).await
+                Ok(queued)
             }
             WorkflowState::Submitted => {
                 let ack = ServiceAck::submitted(record.command.return_final);
