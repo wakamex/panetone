@@ -115,6 +115,14 @@ Inspect the running daemon:
 target/release/panetone status
 ```
 
+List every configured send target and its current availability:
+
+```sh
+target/release/panetone route list
+```
+
+The JSON result is sorted by title. An available entry includes every live agent currently sharing that route. Channel bindings are omitted from the listing.
+
 Manual Wakterm agents are discovered automatically from their effective title.
 Use `route ensure` when a launcher needs synchronous confirmation that the
 route exists before it sends a bootstrap prompt:

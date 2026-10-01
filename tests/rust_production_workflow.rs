@@ -687,6 +687,12 @@ async fn launcher_can_ensure_a_route_and_wait_for_exact_durable_output() {
     let directory = tempdir().unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let database = directory.path().join("state.sqlite3");
+    let store = StoreHandle::open(&database).unwrap();
+    store
+        .save_route(unavailable_route(99, "offline-project", 999), 1)
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
     let telegram = HttpCapture::start();
     let (wakterm, ready) = write_launcher_wakterm_fake(directory.path());
     let daemon = Daemon::start(directory.path(), &database, &wakterm, &telegram.base);
@@ -717,6 +723,25 @@ async fn launcher_can_ensure_a_route_and_wait_for_exact_durable_output() {
         ensured["result"]["route"]["id"]
     );
     assert_eq!(inspected["result"]["event_cursor"], 500);
+
+    let listed = cli(&daemon.socket, &["route", "list"]);
+    assert!(listed.status.success());
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["result"]["routes"][0]["title"], "infobase");
+    assert_eq!(listed["result"]["routes"][0]["available"], true);
+    assert_eq!(
+        listed["result"]["routes"][0]["agents"][0]["agent_id"],
+        "agent-infobase"
+    );
+    assert_eq!(
+        listed["result"]["routes"][1],
+        serde_json::json!({
+            "title": "offline-project",
+            "available": false,
+            "agents": [],
+        })
+    );
+
     let ensured_again = cli(&daemon.socket, &["route", "ensure", "Infobase"]);
     assert!(ensured_again.status.success());
     let ensured_again: Value = serde_json::from_slice(&ensured_again.stdout).unwrap();

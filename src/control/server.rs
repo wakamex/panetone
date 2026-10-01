@@ -27,7 +27,10 @@ impl ControlAuthority {
         match self {
             Self::Host => true,
             Self::RestrictedLocal { .. } => {
-                matches!(method, "status" | "route.inspect" | "output.disposition")
+                matches!(
+                    method,
+                    "status" | "route.list" | "route.inspect" | "output.disposition"
+                )
             }
         }
     }
@@ -361,7 +364,12 @@ mod tests {
     #[test]
     fn restricted_local_authority_allows_passive_methods_only() {
         let authority = ControlAuthority::RestrictedLocal { peer_pid: 42 };
-        for method in ["status", "route.inspect", "output.disposition"] {
+        for method in [
+            "status",
+            "route.list",
+            "route.inspect",
+            "output.disposition",
+        ] {
             assert!(authority.permits(method), "{method}");
         }
         for method in ["send", "route.ensure", "future.method"] {

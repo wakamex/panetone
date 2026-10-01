@@ -718,6 +718,46 @@ impl ProductionService {
         self.route_response(id, route, false, false, None).await
     }
 
+    async fn handle_route_list(&self, id: Uuid) -> ControlResponse {
+        let routes = match self.store.list_routes().await {
+            Ok(routes) => routes,
+            Err(error) => return internal(id, error),
+        };
+        let live = match self.wakterm.live_routes().await {
+            Ok(live) => live,
+            Err(error) => {
+                return error_response(id, "route_resolution_failed", error.to_string(), None);
+            }
+        };
+        let mut listed = Vec::with_capacity(routes.len());
+        for route in routes {
+            match live.route(&route.title) {
+                Ok(live) => listed.push(json!({
+                    "title": route.title,
+                    "available": true,
+                    "agents": live.agents,
+                })),
+                Err(WaktermCliError::RouteNotFound(_) | WaktermCliError::RouteUnavailable(_)) => {
+                    listed.push(json!({
+                        "title": route.title,
+                        "available": false,
+                        "agents": [],
+                    }));
+                }
+                Err(error) => {
+                    return error_response(id, "route_resolution_failed", error.to_string(), None);
+                }
+            }
+        }
+        listed.sort_by_cached_key(|entry| {
+            entry["title"]
+                .as_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+        });
+        success_response(id, json!({"routes": listed}))
+    }
+
     async fn handle_route_ensure(&self, id: Uuid, params: RouteEnsureParams) -> ControlResponse {
         if !valid_route_title(&params.title)
             || params
@@ -1007,6 +1047,7 @@ impl ControlHandler for ProductionService {
                     Ok(params) => self.handle_send(request, params).await,
                     Err(error) => invalid(request.id, error),
                 },
+                "route.list" => self.handle_route_list(request.id).await,
                 "route.inspect" => {
                     match serde_json::from_value::<RouteInspectParams>(request.params) {
                         Ok(params) => self.handle_route_inspect(request.id, params).await,

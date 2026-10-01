@@ -138,10 +138,18 @@ struct RouteArgs {
 
 #[derive(Subcommand)]
 enum RouteCommand {
+    /// List configured routes and their current availability.
+    List(RouteListArgs),
     /// Inspect one exact case-insensitive route title.
     Inspect(RouteInspectArgs),
     /// Ensure a live title has durable channel bindings.
     Ensure(RouteEnsureArgs),
+}
+
+#[derive(Args)]
+struct RouteListArgs {
+    #[command(flatten)]
+    control: ControlSocketArgs,
 }
 
 #[derive(Args)]
@@ -748,6 +756,11 @@ async fn run_status(args: StatusArgs) -> Result<()> {
 
 async fn run_route(args: RouteArgs) -> Result<()> {
     let (socket, method, params) = match args.command {
+        RouteCommand::List(args) => (
+            control_socket(args.control.socket)?,
+            "route.list",
+            Value::Null,
+        ),
         RouteCommand::Inspect(args) => (
             control_socket(args.control.socket)?,
             "route.inspect",

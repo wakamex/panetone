@@ -17,7 +17,7 @@ $XDG_RUNTIME_DIR/panetone/control.sock
 
 The CLI uses this path when neither `--socket` nor `PANETONE_CONTROL_SOCKET` is supplied. The explicit flag has highest precedence, followed by the environment variable and then the runtime-directory default. Commands fail with a direct configuration error when no override is supplied and `XDG_RUNTIME_DIR` is missing or invalid.
 
-Its parent is a real mode `0700` directory and the socket is mode `0600`. On Linux, the server accepts only the same UID and classifies the peer from its Unix credentials, pidfd, and user, mount, PID, and IPC namespaces before parsing the request. A same-UID peer in different namespaces may call the read-only `status`, `route.inspect`, and `output.disposition` methods. `send`, `route.ensure`, and unknown future methods are denied before any workflow, channel, route, or Wakterm side effect. Client-supplied route names and request IDs never establish authority.
+Its parent is a real mode `0700` directory and the socket is mode `0600`. On Linux, the server accepts only the same UID and classifies the peer from its Unix credentials, pidfd, and user, mount, PID, and IPC namespaces before parsing the request. A same-UID peer in different namespaces may call the read-only `status`, `route.list`, `route.inspect`, and `output.disposition` methods. `send`, `route.ensure`, and unknown future methods are denied before any workflow, channel, route, or Wakterm side effect. Client-supplied route names and request IDs never establish authority.
 
 The namespace check detects a known Linux sandbox boundary but does not prove that a same-namespace process is unrestricted. Inherited descriptors, proxies, readable credentials, confinement without distinct namespaces, and non-Linux systems require enforcement by the sandbox or credential owner. Sending to a more privileged agent is privilege delegation, so a restricted caller cannot use the host Panetone daemon as an authority broker.
 
@@ -65,6 +65,30 @@ Errors use:
 `send`.
 
 ## Route inspection and establishment
+
+`route.list` returns every configured route title with its current send availability and exact live agents. The result is sorted case-insensitively by title and omits channel bindings:
+
+```json
+{
+  "routes": [
+    {
+      "title": "infobase",
+      "available": true,
+      "agents": [{
+        "agent_id": "detected-pane-14",
+        "incarnation_id": "01K...",
+        "harness": "codex",
+        "pane_id": 14
+      }]
+    },
+    {
+      "title": "offline-project",
+      "available": false,
+      "agents": []
+    }
+  ]
+}
+```
 
 `route.inspect` reads one exact case-insensitive durable title and its current
 Wakterm resolution:
