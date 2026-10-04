@@ -27,7 +27,7 @@ fi
 "#,
     )
     .unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    panetone::test_support::seal_executable(&binary);
     let socket = directory.path().join("development-mux.sock");
     let output = Command::new(env!("CARGO_BIN_EXE_panetone"))
         .args([

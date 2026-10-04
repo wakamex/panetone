@@ -200,7 +200,7 @@ fi
         ),
     )
     .unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    panetone::test_support::seal_executable(&path);
     (path, ready)
 }
 
@@ -325,7 +325,7 @@ fi
         ),
     )
     .unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    panetone::test_support::seal_executable(&path);
     (path, admissions)
 }
 
@@ -381,7 +381,7 @@ fi
         ),
     )
     .unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    panetone::test_support::seal_executable(&path);
     (path, admissions)
 }
 
@@ -552,7 +552,7 @@ fi
         ),
     )
     .unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    panetone::test_support::seal_executable(&path);
     (path, admitted_prompt, steered_prompt)
 }
 

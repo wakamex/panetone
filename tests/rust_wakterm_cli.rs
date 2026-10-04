@@ -1,5 +1,4 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -16,7 +15,7 @@ fn fake_cli(script_body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         format!("#!/bin/bash\nset -euo pipefail\n{script_body}\n"),
     )
     .unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    panetone::test_support::seal_executable(&path);
     (directory, path)
 }
 

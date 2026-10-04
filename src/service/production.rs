@@ -1331,7 +1331,6 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
     use tempfile::tempdir;
@@ -1412,7 +1411,7 @@ fi
             ),
         )
         .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::seal_executable(&binary);
 
         let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
         let route = Route {
@@ -1475,7 +1474,7 @@ fi
             ),
         )
         .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::seal_executable(&binary);
 
         let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
         let route = Route {
@@ -1551,7 +1550,7 @@ fi
             ),
         )
         .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::seal_executable(&binary);
         let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
         let service = ProductionService::new(
             store.clone(),
@@ -1597,7 +1596,7 @@ fi
             ),
         )
         .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::seal_executable(&binary);
 
         let source = Route {
             id: RouteId::new(Uuid::from_u128(10)),
@@ -1730,7 +1729,7 @@ fi
 "#,
         )
         .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::seal_executable(&binary);
 
         let source = Route {
             id: RouteId::new(Uuid::from_u128(900)),
@@ -1876,7 +1875,7 @@ fi
             ),
         )
         .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::seal_executable(&binary);
 
         let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
         store
@@ -1955,7 +1954,7 @@ fi
 "#,
         )
         .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::seal_executable(&binary);
         let database = directory.path().join("state.sqlite3");
         let store = StoreHandle::open(&database).unwrap();
         store
@@ -2063,7 +2062,7 @@ fi
             ),
         )
         .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::seal_executable(&binary);
 
         let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
         store

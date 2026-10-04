@@ -124,7 +124,7 @@ fi
         ),
     )
     .unwrap();
-    fs::set_permissions(&wakterm, fs::Permissions::from_mode(0o700)).unwrap();
+    panetone::test_support::seal_executable(&wakterm);
     let daemon = ProductionDaemon::start(
         directory.path(),
         &database,

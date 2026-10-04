@@ -115,7 +115,7 @@ fi
         ),
     )
     .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    panetone::test_support::seal_executable(&script);
     let wakterm = WaktermCli::new(
         &script,
         directory.path().join("dev-mux.sock"),
@@ -206,7 +206,7 @@ fi
 "#,
     )
     .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    panetone::test_support::seal_executable(&script);
     let wakterm = WaktermCli::new(
         &script,
         directory.path().join("dev-mux.sock"),
@@ -296,7 +296,7 @@ fi
         ),
     )
     .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    panetone::test_support::seal_executable(&script);
     let wakterm = WaktermCli::new(
         &script,
         directory.path().join("dev-mux.sock"),

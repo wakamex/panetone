@@ -191,7 +191,7 @@ fi
 "#,
     )
     .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    panetone::test_support::seal_executable(&path);
     path
 }
 
