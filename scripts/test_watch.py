@@ -26,7 +26,7 @@ class AgentProblems(unittest.TestCase):
         ]
         titles = {1: "a", 2: "b", 3: "c", 4: "Routed", 5: "unrouted", 6: "c", 7: "c"}
         problems = agent_problems(agents, {"routed"}, titles)
-        self.assertEqual(sorted(problems), ["detected:id-detected:/dev/pts/4", "unobserved:id-plain:/dev/pts/3"])
+        self.assertEqual(sorted(problems), ["detected:id-detected", "unobserved:id-plain"])
 
 
 class StoreProblems(unittest.TestCase):

@@ -67,7 +67,8 @@ def agent_problems(agents, routed_titles, pane_titles):
             continue
         metadata = agent["metadata"]
         title = pane_titles.get(agent["pane_id"], "")
-        identity = f"{metadata['agent_id']}:{runtime['tty_name']}"
+        # Agent IDs survive mux restarts, so a known problem is not re-reported.
+        identity = metadata["agent_id"]
         where = f"{metadata['name']} (pane {agent['pane_id']}, tab {title or '?'})"
         if agent["origin"] == "detected":
             if title.lower() in routed_titles:
