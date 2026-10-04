@@ -28,11 +28,12 @@ REPORT_HEADER = "Panetone watch found new problems:"
 def store_problems(connection, now_ms):
     """Return {key: description} for failed or unconfirmed store records."""
     problems = {}
-    for effect_id, channel, error, body in connection.execute(
-        "SELECT effect_id, channel, json_extract(record_json, '$.last_error'),"
-        " json_extract(record_json, '$.body') FROM outbox WHERE state = 'failed'"
+    for effect_id, channel, state, error, body in connection.execute(
+        "SELECT effect_id, channel, state, json_extract(record_json, '$.last_error'),"
+        " json_extract(record_json, '$.body') FROM outbox WHERE state IN ('failed', 'indeterminate')"
     ):
-        problems[f"outbox:{effect_id}"] = f"{channel} post failed ({error}): {snippet(body)}"
+        what = "failed" if state == "failed" else "gave up after attempts that may have posted"
+        problems[f"outbox:{effect_id}"] = f"{channel} post {what} ({error}): {snippet(body)}"
     for effect_id, channel, state, created, body in connection.execute(
         "SELECT effect_id, channel, state, created_at_ms, json_extract(record_json, '$.body')"
         " FROM inbox WHERE state = 'indeterminate'"

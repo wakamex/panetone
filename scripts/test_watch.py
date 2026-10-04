@@ -40,6 +40,7 @@ class StoreProblems(unittest.TestCase):
         rows = [
             ("outbox", "o1", "telegram", "failed", '{"last_error": "Bad Gateway", "body": "reply"}', 0),
             ("outbox", "o2", "telegram", "delivered", '{"body": "fine"}', 0),
+            ("outbox", "o3", "signal", "indeterminate", '{"last_error": "closed", "body": "maybe"}', 0),
             ("inbox", "i1", "telegram", "indeterminate", '{"body": "hello"}', 0),
             ("inbox", "i2", "signal", "pending", '{"body": "old"}', 0),
             ("inbox", "i3", "signal", "pending", '{"body": "fresh"}', 999_900_000),
@@ -53,7 +54,7 @@ class StoreProblems(unittest.TestCase):
         problems = store_problems(self.db, 1_000_000_000)
         self.assertEqual(
             sorted(problems),
-            ["inbox:i1:indeterminate", "inbox:i2:pending", "outbox:o1", "return:r1", "workflow:w1"],
+            ["inbox:i1:indeterminate", "inbox:i2:pending", "outbox:o1", "outbox:o3", "return:r1", "workflow:w1"],
         )
         self.assertIn("Bad Gateway", problems["outbox:o1"])
 
