@@ -17,10 +17,10 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::domain::{
-    AgentBinding, CallbackDelivery, ChannelAttachment, ChannelKind, DeliveryState, EffectId,
-    MAX_CHANNEL_ATTACHMENT_BYTES, MAX_CHANNEL_ATTACHMENT_TOTAL_BYTES, MAX_CHANNEL_ATTACHMENTS,
-    OutboxItem, OutboxState, Route, RouteId, SEMANTIC_HASH_KIND, SendCommand, Workflow, WorkflowId,
-    WorkflowState, semantic_request_hash,
+    AdmissionReceipt, AgentBinding, CallbackDelivery, ChannelAttachment, ChannelKind,
+    DeliveryState, EffectId, MAX_CHANNEL_ATTACHMENT_BYTES, MAX_CHANNEL_ATTACHMENT_TOTAL_BYTES,
+    MAX_CHANNEL_ATTACHMENTS, OutboxItem, OutboxState, Route, RouteId, SEMANTIC_HASH_KIND,
+    SendCommand, Workflow, WorkflowId, WorkflowState, semantic_request_hash,
 };
 use crate::wakterm::{AgentCatalog, ApprovalRequest, EventRecord};
 
@@ -104,6 +104,11 @@ pub struct InboxItem {
     pub body: String,
     pub state: String,
     pub created_at_ms: i64,
+    /// Wakterm's admission receipt, kept so a lost delivery can be traced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<AdmissionReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steering_acknowledged: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

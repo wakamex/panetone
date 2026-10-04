@@ -12,8 +12,8 @@ use crate::control::{
     RouteEnsureParams, RouteInspectParams, SendParams, error_response, success_response,
 };
 use crate::domain::{
-    AdmissionStatus, AgentBinding, ChannelBinding, ChannelKind, OutboxState, Route, RouteId,
-    WorkflowId, WorkflowState,
+    AdmissionStatus, AgentBinding, ChannelBinding, ChannelKind, EffectId, OutboxItem, OutboxState,
+    Route, RouteId, WorkflowId, WorkflowState,
 };
 use crate::store::{EventCursorGap, InboxItem, RouteAgent, StoreHandle};
 use crate::supervisor::SupervisorHandle;
@@ -504,6 +504,8 @@ impl ProductionService {
             {
                 Ok(receipt) => receipt,
                 Err(error) => {
+                    self.notify_unconfirmed(&item, route, &error.to_string())
+                        .await?;
                     item.state = "indeterminate".into();
                     self.store
                         .save_inbox(item, "admission_prepared", None)
@@ -513,12 +515,15 @@ impl ProductionService {
                 }
             };
             receipt.validate(item.id, &binding).map_err(error_string)?;
+            item.receipt = Some(receipt.clone());
             item.state = match receipt.status {
                 AdmissionStatus::Accepted => "delivered",
                 AdmissionStatus::Busy => {
                     let steering = match self.wakterm.steer(&binding, &item.body).await {
                         Ok(steering) => steering,
                         Err(error) => {
+                            self.notify_unconfirmed(&item, route, &error.to_string())
+                                .await?;
                             item.state = "indeterminate".into();
                             self.store
                                 .save_inbox(item, "admission_prepared", None)
@@ -527,16 +532,32 @@ impl ProductionService {
                             return Err(error.to_string());
                         }
                     };
-                    if !steering.acknowledged() {
+                    item.steering_acknowledged = Some(steering.acknowledged());
+                    if steering.acknowledged() {
+                        "delivered"
+                    } else {
                         tracing::warn!(
                             agent_id = %binding.agent_id,
                             pane_id = ?binding.pane_id,
                             "Wakterm submitted channel steering without observer acknowledgement"
                         );
+                        self.notify_unconfirmed(
+                            &item,
+                            route,
+                            "the message was typed into the busy agent's turn, but the agent did not acknowledge it",
+                        )
+                        .await?;
+                        "indeterminate"
                     }
-                    "delivered"
                 }
-                AdmissionStatus::Indeterminate => "indeterminate",
+                AdmissionStatus::Indeterminate => {
+                    let detail = receipt
+                        .detail
+                        .as_deref()
+                        .unwrap_or("Wakterm could not confirm the agent received it");
+                    self.notify_unconfirmed(&item, route, detail).await?;
+                    "indeterminate"
+                }
                 _ => "pending",
             }
             .into();
@@ -547,6 +568,45 @@ impl ProductionService {
                 .map_err(error_string)?;
         }
         Ok(attempted)
+    }
+
+    /// Tells the sender's chat that an inbound message may not have reached the
+    /// agent. The text may still be sitting in the pane, so the notice asks the
+    /// user to check there rather than resending.
+    async fn notify_unconfirmed(
+        &self,
+        item: &InboxItem,
+        route: &Route,
+        detail: &str,
+    ) -> Result<(), String> {
+        let namespace = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            b"https://panetone.dev/inbox/unconfirmed/v1",
+        );
+        let notice = OutboxItem {
+            id: EffectId::new(Uuid::new_v5(&namespace, item.id.to_string().as_bytes())),
+            route_id: Some(route.id),
+            sender_harness: None,
+            source_agent: None,
+            kind: item.channel,
+            destination: item.destination.clone(),
+            body: format!(
+                "[unconfirmed] {} may not have received your message: {detail}. \
+                 Check the pane before resending; the text may still be there.",
+                route.title
+            ),
+            attachments: Vec::new(),
+            actions: Vec::new(),
+            state: OutboxState::Pending,
+            attempts: 0,
+            last_error: None,
+            external_receipt: None,
+        };
+        self.store
+            .enqueue_outbox(None, notice, now_ms())
+            .await
+            .map(|_| ())
+            .map_err(error_string)
     }
 
     async fn handle_send(&self, request: ControlRequest, params: SendParams) -> ControlResponse {
@@ -1466,6 +1526,8 @@ fi
                 body: "continue the active work".into(),
                 state: "pending".into(),
                 created_at_ms: 2,
+                receipt: None,
+                steering_acknowledged: None,
             })
             .await
             .unwrap();
@@ -1842,6 +1904,8 @@ fi
                 body: body.into(),
                 state: "pending".into(),
                 created_at_ms: 1,
+                receipt: None,
+                steering_acknowledged: None,
             })
             .await
             .unwrap();
@@ -1861,8 +1925,105 @@ fi
         assert_eq!(service.inbox_once().await.unwrap(), 1);
         assert_eq!(fs::read_to_string(prompt).unwrap(), body);
         assert_eq!(store.status().await.unwrap().pending_inbox, 0);
+        assert!(store.pending_outbox().await.unwrap().is_empty());
         drop(service);
         store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_channel_input_keeps_the_receipt_and_tells_the_sender() {
+        let directory = tempdir().unwrap();
+        let binary = directory.path().join("wakterm-fake");
+        fs::write(
+            &binary,
+            r#"#!/bin/bash
+set -euo pipefail
+operation="$*"
+if [[ "$operation" == *"agent capabilities"* ]]; then
+  echo '{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}'
+elif [[ "$operation" == *"agent catalog"* ]]; then
+  echo '{"schema":"wakterm.agent-api.v1","as_of_event_sequence":10,"agents":[{"agent_id":"agent-route","incarnation_id":"inc-route","pane_id":1,"name":"route","harness":"claude","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-10-02T00:00:00Z"}]}'
+elif [[ "$operation" == *"list --format json"* ]]; then
+  echo '[{"pane_id":1,"tab_id":2,"window_id":3,"effective_title":"route"}]'
+elif [[ "$operation" == *"agent admit"* ]]; then
+  cat >/dev/null
+  echo '{"schema":"wakterm.agent-api.v1","request_id":"00000000-0000-0000-0000-00000000007e","status":"indeterminate","definitive":false,"prompt_written":true,"agent_id":"agent-route","incarnation_id":"inc-route","detail":"prompt was written, but the agent did not start a turn within 15 s"}'
+else
+  echo "unexpected fake invocation: $operation" >&2
+  exit 9
+fi
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let database = directory.path().join("state.sqlite3");
+        let store = StoreHandle::open(&database).unwrap();
+        store
+            .save_route(
+                Route {
+                    id: RouteId::new(Uuid::new_v4()),
+                    title: "route".into(),
+                    channels: vec![ChannelBinding::Telegram { topic_id: 10 }],
+                    agent: None,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        store
+            .accept_inbox(InboxItem {
+                id: EffectId::new(Uuid::from_u128(126)),
+                channel: ChannelKind::Telegram,
+                external_id: "update-3".into(),
+                destination: "10".into(),
+                sender_id: Some("42".into()),
+                sender: Some("Mihai".into()),
+                reply_to_external_id: None,
+                body: "I just woke up. summarize.".into(),
+                state: "pending".into(),
+                created_at_ms: 1,
+                receipt: None,
+                steering_acknowledged: None,
+            })
+            .await
+            .unwrap();
+        let service = ProductionService::new(
+            store.clone(),
+            WaktermCli::new(
+                binary,
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            RealChannels::default(),
+            SupervisorHandle::default(),
+            vec!["event_stream.v1".into()],
+            directory.path().join("control.sock"),
+        );
+
+        assert_eq!(service.inbox_once().await.unwrap(), 1);
+        let notices = store.pending_outbox().await.unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].destination, "10");
+        assert!(
+            notices[0]
+                .body
+                .starts_with("[unconfirmed] route may not have received")
+        );
+        assert!(notices[0].body.contains("did not start a turn within 15 s"));
+        // The item is settled rather than retried, so no second notice follows.
+        assert_eq!(store.status().await.unwrap().pending_inbox, 0);
+        assert_eq!(service.inbox_once().await.unwrap(), 0);
+        drop(service);
+        store.shutdown().await.unwrap();
+
+        let record: String = rusqlite::Connection::open(&database)
+            .unwrap()
+            .query_row("SELECT record_json FROM inbox", [], |row| row.get(0))
+            .unwrap();
+        let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+        assert_eq!(record["state"], "indeterminate");
+        assert_eq!(record["receipt"]["status"], "indeterminate");
+        assert_eq!(record["receipt"]["prompt_written"], true);
     }
 
     #[tokio::test]
@@ -1930,6 +2091,8 @@ fi
                 body: body.into(),
                 state: "pending".into(),
                 created_at_ms: 2,
+                receipt: None,
+                steering_acknowledged: None,
             })
             .await
             .unwrap();

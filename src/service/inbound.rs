@@ -38,6 +38,8 @@ impl InboundIngestor {
             body: message.body,
             state: "pending".into(),
             created_at_ms: now_ms,
+            receipt: None,
+            steering_acknowledged: None,
         };
         Ok(self.store.accept_inbox(item).await?)
     }

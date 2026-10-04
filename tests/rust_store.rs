@@ -478,6 +478,8 @@ async fn routes_outbox_inbox_and_metadata_are_durable_and_deduplicated() {
         body: "hello".into(),
         state: "pending".into(),
         created_at_ms: 100,
+        receipt: None,
+        steering_acknowledged: None,
     };
     assert!(store.accept_inbox(inbox.clone()).await.unwrap());
     assert!(!store.accept_inbox(inbox).await.unwrap());
