@@ -17,9 +17,9 @@ availability status.
 
 Before each admission Panetone reads Wakterm's current effective titles and catalog. An exact case-insensitive title identifies one workspace route, and every live agent pane with that title belongs to it regardless of its physical tab. Panetone then submits through the selected pane's current agent and incarnation pair. That pair protects the individual admission from a process replacement between lookup and submission, but it is not route state.
 
-One route may contain multiple live agent panes across one or more tabs. A channel reply prefers the agent that produced the quoted message. Otherwise Panetone prefers the last agent that produced visible output for the route, then the lowest live pane ID. This extends the normal multi-pane routing rule without treating a workspace as one agent.
+One route may contain multiple live agent panes across one or more tabs. A channel reply prefers the agent that produced the quoted message. Otherwise Panetone prefers the last agent that produced visible output for the route, then the lowest live pane ID. A local `send` does not guess: its `to` names a route with exactly one live agent or one agent by its Wakterm name, and a title whose route has several live agents is refused with their names.
 
-Zero matching agent panes leave the work pending or return unavailable. Busy retries and final callbacks resolve the workspace again. Workflow records retain the exact pair used for an attempted admission so receipts and terminal results can still be validated.
+Zero matching agent panes leave the work pending or return unavailable. A busy retry is admitted to the agent chosen when the work was sent, or to that agent's replacement incarnation. Final callbacks resolve the workspace again. Workflow records retain the exact pair used for an attempted admission so receipts and terminal results can still be validated.
 
 ## Consequences
 

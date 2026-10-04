@@ -39,7 +39,7 @@ The Telegram audit uses `[queued]` while waiting and `[submitted]` only after Wa
 
 Queued work survives Panetone and Wakterm restarts. It has no automatic expiry in control v1. It remains visible through future status and cancellation operations until submitted or explicitly cancelled. The worker uses bounded backoff or lifecycle notification rather than a tight poll.
 
-Before submission, Panetone resolves the persisted workspace title again. A new agent incarnation may receive the work when the title still has a live agent. Panetone records both the originally observed and submitted incarnation in the workflow audit. Missing live routes are not guessed.
+Before submission, Panetone resolves the persisted workspace title again and selects the agent chosen when the work was sent. A new incarnation of that agent may receive the work after a restart. Panetone records both the originally observed and submitted incarnation in the workflow audit. Missing live routes are not guessed.
 
 A target with no live agent pane is not the same as a busy target. Control v1 continues to return `route_unavailable` before external side effects for a genuinely agentless route. Waiting for a route that does not exist would require a separate bounded workflow and is not part of this decision.
 
@@ -49,6 +49,6 @@ Wakterm must classify `busy` as a definitive non-acceptance result. Panetone may
 
 Audit failure still fails closed. A crash after a queued audit but before its durable queued checkpoint is indeterminate and receives a visible failure annotation. A crash after the queued checkpoint resumes the queue without adding another audit.
 
-Before either steering path, Panetone persists `admission_prepared`. A steering command or receipt failure changes the inbox item or local workflow to `indeterminate` and is not retried automatically. This avoids duplicate steering when it is unknown whether the pane write occurred. Local queued work continues to use the durable workflow and audit states described above.
+Before either steering path, Panetone persists `admission_prepared`. When Wakterm refuses to steer because a dialog, shell mode or startup prompt holds the target's keyboard, nothing was written: channel input stays pending and local work waits as queued. Any other steering command or receipt failure, or an unacknowledged steer of channel input, changes the inbox item or local workflow to `indeterminate`, notifies the sender's chat for channel input, and is not retried automatically. This avoids duplicate steering when it is unknown whether the pane write occurred. Local queued work continues to use the durable workflow and audit states described above.
 
 The return-terminal stream may race the admission receipt. A terminal for a workflow still in `admission_prepared` remains unread until that workflow records whether submission occurred. If the workflow then ends without a submitted target, Panetone consumes the redundant terminal without manufacturing a callback. One request-level inconsistency therefore cannot stop unrelated routes or channel workers.
