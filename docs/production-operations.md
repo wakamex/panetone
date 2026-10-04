@@ -91,7 +91,7 @@ the current effective title and live agent panes through Wakterm before each
 admission, retry, and callback. Closing and recreating a workspace therefore
 requires no Panetone repair or reconciliation command.
 
-`panetone route list` returns all configured route titles with current availability and exact live agent identities. Use it for target discovery instead of joining Wakterm pane and catalog output. The read-only listing omits channel bindings.
+`panetone route list` returns all configured route titles with current availability and exact live agent identities and names. Use it for target discovery instead of joining Wakterm pane and catalog output. The read-only listing omits channel bindings.
 
 At startup Panetone creates a durable route and Telegram topic for each live Wakterm title that contains an agent. Every agent with the same effective title shares that route even when the agents are in different tabs. Panetone repeats reconciliation when Wakterm reports an agent lifecycle change or visible output. An agent started manually in a shell therefore does not require `route ensure`. Empty tabs are ignored.
 

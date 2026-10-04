@@ -317,8 +317,11 @@ impl ProductionService {
             else {
                 continue;
             };
-            let preferred = self.last_agents.read().await.get(&route.id).cloned();
-            let Some(binding) = resolve_live(&live, &route, preferred.as_ref())? else {
+            // Keep the agent chosen when the message was sent; select falls
+            // back to that agent's replacement only if it is gone.
+            let Some(binding) =
+                resolve_live(&live, &route, Some(&workflow.workflow.observed_target))?
+            else {
                 continue;
             };
             let live_route = route.with_agent(binding);
@@ -671,15 +674,48 @@ impl ProductionService {
             Ok(routes) => routes,
             Err(error) => return internal(id, error),
         };
-        let target = match exact_route(&routes, &params.target) {
-            Ok(route) => route,
-            Err(response) => return route_error(id, "target", response),
-        };
         let live = match self.wakterm.live_routes().await {
             Ok(live) => live,
             Err(error) => {
                 return error_response(id, "route_resolution_failed", error.to_string(), None);
             }
+        };
+        // `to` names a route or one live agent by its Wakterm name. A route
+        // title must not leave the choice between several agents to a guess.
+        let (target, named_target) = match exact_route(&routes, &params.target) {
+            Ok(route) => {
+                if let Ok(live_route) = live.route(&route.title)
+                    && live_route.agents.len() > 1
+                {
+                    let names = live_route
+                        .agents
+                        .iter()
+                        .map(|agent| live.agent_name(agent).unwrap_or(&agent.agent_id))
+                        .collect::<Vec<_>>();
+                    return error_response(
+                        id,
+                        "target_route_has_several_agents",
+                        format!(
+                            "target route {} has {} agents; send to one by name: {}",
+                            route.title,
+                            names.len(),
+                            names.join(", ")
+                        ),
+                        Some(json!({"agents": names})),
+                    );
+                }
+                (route, None)
+            }
+            Err("not_found") => {
+                let Some((live_route, binding)) = live.agent_named(&params.target) else {
+                    return route_error(id, "target", "not_found");
+                };
+                match exact_route(&routes, &live_route.title) {
+                    Ok(route) => (route, Some(binding)),
+                    Err(response) => return route_error(id, "target", response),
+                }
+            }
+            Err(response) => return route_error(id, "target", response),
         };
         let last_agents = self.last_agents.read().await;
         let source_agent = match (params.source_pane_id, &params.source_agent) {
@@ -739,10 +775,13 @@ impl ProductionService {
                 (source, binding)
             }
         };
-        let target_binding = match resolve_live(&live, target, last_agents.get(&target.id)) {
-            Ok(Some(binding)) => binding,
-            Ok(None) => return route_unavailable(id, "target", target),
-            Err(error) => return error_response(id, "route_resolution_failed", error, None),
+        let target_binding = match named_target {
+            Some(binding) => binding,
+            None => match resolve_live(&live, target, last_agents.get(&target.id)) {
+                Ok(Some(binding)) => binding,
+                Ok(None) => return route_unavailable(id, "target", target),
+                Err(error) => return error_response(id, "route_resolution_failed", error, None),
+            },
         };
         drop(last_agents);
         let command_source = source.title.clone();
@@ -832,10 +871,14 @@ impl ProductionService {
         let mut listed = Vec::with_capacity(routes.len());
         for route in routes {
             match live.route(&route.title) {
-                Ok(live) => listed.push(json!({
+                Ok(live_route) => listed.push(json!({
                     "title": route.title,
                     "available": true,
-                    "agents": live.agents,
+                    "agents": live_route.agents.iter().map(|agent| {
+                        let mut entry = json!(agent);
+                        entry["name"] = json!(live.agent_name(agent));
+                        entry
+                    }).collect::<Vec<_>>(),
                 })),
                 Err(WaktermCliError::RouteNotFound(_) | WaktermCliError::RouteUnavailable(_)) => {
                     listed.push(json!({

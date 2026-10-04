@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use panetone::domain::{ChannelBinding, Route, RouteId};
 use panetone::store::StoreHandle;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::tempdir;
 use uuid::Uuid;
 
@@ -455,6 +455,147 @@ async fn wakterm_caller_derives_the_route_and_callback_without_from() {
     assert_eq!(returned.agent.source.agent_id, "agent-caller");
     assert_eq!(returned.agent.source.pane_id, Some(85));
     store.shutdown().await.unwrap();
+}
+
+fn write_shared_route_wakterm_fake(directory: &Path) -> (PathBuf, PathBuf) {
+    let path = directory.join("wakterm-shared-route-fake");
+    let admissions = directory.join("shared-route-admissions.log");
+    fs::write(
+        &path,
+        format!(
+            r#"#!/bin/bash
+set -euo pipefail
+operation="$*"
+if [[ "$operation" == *"--version"* ]]; then
+  echo 'wakterm shared-route-test'
+elif [[ "$operation" == *"agent caller"* ]]; then
+  echo '{{"schema":"wakterm.agent-api.v1","resolved_by":"wakterm_pane","agent":{{"agent_id":"agent-source","incarnation_id":"inc-source","pane_id":1,"name":"source_codex","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-10-04T00:00:00Z"}}}}'
+elif [[ "$operation" == *"agent capabilities"* ]]; then
+  echo '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
+elif [[ "$operation" == *"agent catalog"* ]]; then
+  echo '{{"schema":"wakterm.agent-api.v1","as_of_event_sequence":500,"agents":[{{"agent_id":"agent-source","incarnation_id":"inc-source","pane_id":1,"name":"source_codex","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-10-04T00:00:00Z"}},{{"agent_id":"agent-claude","incarnation_id":"inc-claude","pane_id":2,"name":"shared_claude","harness":"claude","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-10-04T00:00:00Z"}},{{"agent_id":"agent-codex","incarnation_id":"inc-codex","pane_id":3,"name":"shared_codex","harness":"codex","status":"busy","turn_state":"waiting_on_agent","alive":true,"observed_at":"2026-10-04T00:00:00Z"}}]}}'
+elif [[ "$operation" == *"list --format json"* ]]; then
+  echo '[{{"pane_id":1,"tab_id":1,"window_id":1,"effective_title":"source"}},{{"pane_id":2,"tab_id":2,"window_id":1,"effective_title":"shared"}},{{"pane_id":3,"tab_id":2,"window_id":1,"effective_title":"shared"}}]'
+elif [[ "$operation" == *"agent events"* ]]; then
+  echo '{{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":500,"oldest_available_sequence":1,"latest_sequence":500,"next_after_sequence":500,"events":[]}}'
+elif [[ "$operation" == *"agent admit"* ]]; then
+  target=""
+  request_id=""
+  incarnation=""
+  previous=""
+  for argument in "$@"; do
+    if [[ "$previous" == "admit" ]]; then target="$argument"; fi
+    if [[ "$previous" == "--request-id" ]]; then request_id="$argument"; fi
+    if [[ "$previous" == "--incarnation" ]]; then incarnation="$argument"; fi
+    previous="$argument"
+  done
+  cat >/dev/null
+  printf '%s\n' "$target" >> '{}'
+  # The Codex is busy for its first admission only.
+  if [[ "$target" == "agent-codex" && ! -e '{}.busy-once' ]]; then
+    touch '{}.busy-once'
+    printf '{{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"busy","definitive":true,"prompt_written":false,"agent_id":"%s","incarnation_id":"%s","detail":"target is busy"}}\n' "$request_id" "$target" "$incarnation"
+    exit 0
+  fi
+  printf '{{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"accepted","definitive":true,"prompt_written":true,"agent_id":"%s","incarnation_id":"%s","detail":null}}\n' "$request_id" "$target" "$incarnation"
+else
+  echo "unexpected fake invocation: $operation" >&2
+  exit 92
+fi
+"#,
+            admissions.display(),
+            admissions.display(),
+            admissions.display(),
+        ),
+    )
+    .unwrap();
+    panetone::test_support::seal_executable(&path);
+    (path, admissions)
+}
+
+#[tokio::test]
+async fn a_route_with_several_agents_is_addressed_by_agent_name() {
+    let directory = tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let database = directory.path().join("state.sqlite3");
+    let store = StoreHandle::open(&database).unwrap();
+    store
+        .save_route(unavailable_route(51, "source", 501), 1)
+        .await
+        .unwrap();
+    store
+        .save_route(unavailable_route(52, "shared", 502), 1)
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+    let telegram = HttpCapture::start();
+    let (wakterm, admissions) = write_shared_route_wakterm_fake(directory.path());
+    let daemon = Daemon::start(directory.path(), &database, &wakterm, &telegram.base);
+    let send = |target: &str| {
+        Command::new(env!("CARGO_BIN_EXE_panetone"))
+            .args([
+                "send",
+                "--socket",
+                daemon.socket.to_str().unwrap(),
+                "--to",
+                target,
+                "hello",
+            ])
+            .env("WAKTERM_BIN", &wakterm)
+            .env_remove("WAKTERM_PANE")
+            .output()
+            .unwrap()
+    };
+
+    let ambiguous = send("shared");
+    assert!(!ambiguous.status.success());
+    let response: Value = serde_json::from_slice(&ambiguous.stdout).unwrap();
+    assert_eq!(response["error"]["code"], "target_route_has_several_agents");
+    assert_eq!(
+        response["error"]["details"]["agents"],
+        json!(["shared_claude", "shared_codex"])
+    );
+
+    let named = send("SHARED_CLAUDE");
+    assert!(
+        named.status.success(),
+        "{}",
+        String::from_utf8_lossy(&named.stdout)
+    );
+
+    let listed = Command::new(env!("CARGO_BIN_EXE_panetone"))
+        .args(["route", "list", "--socket", daemon.socket.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let shared = listed["result"]["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|route| route["title"] == "shared")
+        .unwrap()
+        .clone();
+    assert_eq!(shared["agents"][0]["name"], "shared_claude");
+
+    // A queued message is retried to the agent it was sent to, never to
+    // another agent in the same route.
+    let queued = send("shared_codex");
+    let response: Value = serde_json::from_slice(&queued.stdout).unwrap();
+    assert_eq!(response["result"]["delivery_state"], "queued");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fs::read_to_string(&admissions).unwrap().lines().count() < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "the queued message was not retried"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    daemon.stop();
+
+    assert_eq!(
+        fs::read_to_string(&admissions).unwrap(),
+        "agent-claude\nagent-codex\nagent-codex\n"
+    );
 }
 
 #[tokio::test]

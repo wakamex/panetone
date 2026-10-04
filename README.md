@@ -121,7 +121,7 @@ List every configured send target and its current availability:
 target/release/panetone route list
 ```
 
-The JSON result is sorted by title. An available entry includes every live agent currently sharing that route. Channel bindings are omitted from the listing.
+The JSON result is sorted by title. An available entry includes every live agent currently sharing that route, with its Wakterm `name`. Channel bindings are omitted from the listing. When a route has several live agents, `panetone send --to` takes one agent's name instead of the route title.
 
 Manual Wakterm agents are discovered automatically from their effective title.
 Use `route ensure` when a launcher needs synchronous confirmation that the

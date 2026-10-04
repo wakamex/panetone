@@ -227,11 +227,32 @@ impl LiveRoute {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LiveRouteSnapshot {
     routes: Vec<LiveRoute>,
+    /// Wakterm agent names by agent ID.
+    names: BTreeMap<String, String>,
 }
 
 impl LiveRouteSnapshot {
     pub fn routes(&self) -> &[LiveRoute] {
         &self.routes
+    }
+
+    pub fn agent_name(&self, agent: &AgentBinding) -> Option<&str> {
+        self.names.get(&agent.agent_id).map(String::as_str)
+    }
+
+    /// The live agent with this Wakterm name, matched case-insensitively.
+    pub fn agent_named(&self, name: &str) -> Option<(&LiveRoute, AgentBinding)> {
+        self.routes.iter().find_map(|route| {
+            route
+                .agents
+                .iter()
+                .find(|agent| {
+                    self.agent_name(agent)
+                        .is_some_and(|agent_name| agent_name.eq_ignore_ascii_case(name))
+                })
+                .cloned()
+                .map(|agent| (route, agent))
+        })
     }
 
     pub fn source_in_pane(&self, pane_id: u64) -> Option<(&LiveRoute, AgentBinding)> {
@@ -436,7 +457,12 @@ impl WaktermCli {
                 route
             })
             .collect();
-        Ok(LiveRouteSnapshot { routes })
+        let names = after
+            .agents
+            .iter()
+            .map(|agent| (agent.agent_id.clone(), agent.name.clone()))
+            .collect();
+        Ok(LiveRouteSnapshot { routes, names })
     }
 
     pub async fn resolve_route_binding(

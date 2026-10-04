@@ -96,7 +96,10 @@ struct ControlSocketArgs {
 struct SendArgs {
     #[arg(long = "from")]
     source: Option<String>,
-    #[arg(long = "to")]
+    #[arg(
+        long = "to",
+        help = "Target route title, or an agent's Wakterm name when the route has several agents"
+    )]
     target: String,
     #[arg(long)]
     id: Option<Uuid>,
