@@ -86,7 +86,11 @@ impl AdmissionReceipt {
         }
         let valid = match self.status {
             AdmissionStatus::Accepted => self.definitive && self.prompt_written == Some(true),
-            AdmissionStatus::Indeterminate => !self.definitive && self.prompt_written.is_none(),
+            // Wakterm reports prompt_written: true when it wrote the prompt but
+            // could not confirm the agent started a turn.
+            AdmissionStatus::Indeterminate => {
+                !self.definitive && self.prompt_written != Some(false)
+            }
             _ => self.definitive && self.prompt_written == Some(false),
         };
         if !valid {
