@@ -110,6 +110,14 @@ impl EventRecord {
                 .text()
                 .map(|text| Some(text.to_owned()))
                 .ok_or("visible output event has no text"),
+            // A turn that ends without a reply is reported to the sender through
+            // the unconfirmed-delivery notice, so it is not shown again.
+            "turn_final"
+                if self.fields.get("outcome").and_then(Value::as_str) == Some("aborted")
+                    && self.fields.get("reason").and_then(Value::as_str) == Some("no_reply") =>
+            {
+                Ok(None)
+            }
             "turn_final"
                 if self.fields.get("outcome").and_then(Value::as_str) == Some("aborted") =>
             {

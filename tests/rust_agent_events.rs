@@ -248,6 +248,38 @@ async fn aborted_final_detail_is_projected_once_as_a_failure_notice() {
 }
 
 #[tokio::test]
+async fn a_turn_ended_without_a_reply_is_not_projected() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let route = route();
+    store.save_route(route.clone(), 1).await.unwrap();
+    let mut silent = policy_aborted_final();
+    silent.fields.insert("reason".into(), "no_reply".into());
+    silent
+        .fields
+        .insert("detail".into(), "Claude went idle without replying.".into());
+    store
+        .initialize_event_cursor(silent.sequence - 1)
+        .await
+        .unwrap();
+
+    let outcome = store
+        .ingest_agent_events(
+            silent.sequence - 1,
+            silent.sequence,
+            vec![silent.clone()],
+            live_agents(&route),
+            3,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.visible_outputs, 0);
+    assert!(store.pending_outbox().await.unwrap().is_empty());
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn completed_final_and_aborted_final_without_detail_are_not_projected() {
     let directory = tempdir().unwrap();
     let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
