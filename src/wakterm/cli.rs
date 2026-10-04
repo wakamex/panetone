@@ -20,6 +20,9 @@ use super::{AgentCatalog, ContractError, EventRead, EventRecord, join_catalog_bi
 const AGENT_API_SCHEMA: &str = "wakterm.agent-api.v1";
 const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+/// How long Wakterm waits for the target to start a turn before it answers a
+/// one-way admission (Wakterm `docs/agent-api/v1/index.md`).
+const ADMISSION_CONFIRMATION_WINDOW: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct AgentApiCapabilities {
@@ -328,7 +331,9 @@ impl WaktermCli {
     }
 
     pub async fn version(&self) -> Result<String, WaktermCliError> {
-        let output = self.run_command(&["--version"], None, false).await?;
+        let output = self
+            .run_command(&["--version"], None, false, self.deadline)
+            .await?;
         let version = String::from_utf8(output)
             .map_err(|_| WaktermCliError::Rejected("version output was not UTF-8".into()))?;
         let version = version.trim();
@@ -471,7 +476,17 @@ impl WaktermCli {
             owned.push(final_timeout_ms.to_string());
         }
         let borrowed = owned.iter().map(String::as_str).collect::<Vec<_>>();
-        let wire: WireReceipt = self.run_json(&borrowed, Some(prompt.as_bytes())).await?;
+        // Wakterm accepts a one-way prompt only after the agent starts a turn,
+        // waiting up to its confirmation window before answering.
+        let output = self
+            .run_command(
+                &borrowed,
+                Some(prompt.as_bytes()),
+                true,
+                self.deadline + ADMISSION_CONFIRMATION_WINDOW,
+            )
+            .await?;
+        let wire: WireReceipt = serde_json::from_slice(&output)?;
         if wire.schema != AGENT_API_SCHEMA {
             return Err(WaktermCliError::UnexpectedSchema);
         }
@@ -683,7 +698,7 @@ impl WaktermCli {
     }
 
     async fn run(&self, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>, WaktermCliError> {
-        self.run_command(args, input, true).await
+        self.run_command(args, input, true, self.deadline).await
     }
 
     async fn run_command(
@@ -691,6 +706,7 @@ impl WaktermCli {
         args: &[&str],
         input: Option<&[u8]>,
         cli_mode: bool,
+        deadline: Duration,
     ) -> Result<Vec<u8>, WaktermCliError> {
         let mut command = Command::new(&self.binary);
         command.arg("--skip-config");
@@ -725,7 +741,7 @@ impl WaktermCli {
             }
             child.wait().await
         };
-        let status = match timeout(self.deadline, operation).await {
+        let status = match timeout(deadline, operation).await {
             Ok(status) => status?,
             Err(_) => {
                 let _ = child.start_kill();

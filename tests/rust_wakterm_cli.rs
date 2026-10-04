@@ -299,6 +299,38 @@ printf '{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"observer_fa
 }
 
 #[tokio::test]
+async fn admission_may_outlast_the_operation_deadline_while_wakterm_confirms_the_turn() {
+    let (_directory, binary) = fake_cli(
+        r#"
+if [[ "$*" == *"agent capabilities"* ]]; then
+  printf '%s\n' '{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}'
+  exit 0
+fi
+cat >/dev/null
+request_id=""
+while (($#)); do
+  if [[ "$1" == "--request-id" ]]; then request_id=$2; break; fi
+  shift
+done
+sleep 1
+printf '{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"accepted","definitive":true,"prompt_written":true,"agent_id":"agent-zola","incarnation_id":"incarnation-zola-7","detail":null}\n' "$request_id"
+"#,
+    );
+    // Wakterm answers only after the agent starts a turn, which can take
+    // longer than an ordinary operation's deadline.
+    let cli = WaktermCli::new(
+        binary,
+        "/tmp/non-production.sock",
+        Duration::from_millis(500),
+    );
+    let receipt = cli
+        .admit(EffectId::random(), &binding(), "prompt", false, 0)
+        .await
+        .unwrap();
+    assert_eq!(receipt.status, AdmissionStatus::Accepted);
+}
+
+#[tokio::test]
 async fn real_cli_boundary_bounds_time_and_output() {
     let (_directory, sleeping) = fake_cli("while :; do :; done");
     let cli = WaktermCli::new(
