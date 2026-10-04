@@ -302,8 +302,10 @@ async fn malformed_and_oversized_frames_are_rejected_without_panicking() {
 async fn socket_startup_distinguishes_stale_live_and_unsafe_paths() {
     let directory = private_directory();
     let stale = directory.path().join("stale.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&stale).unwrap();
-    drop(listener);
+    // A socket file nobody accepts stream connections on. A dropped stream
+    // listener is not reliably stale here: a process spawned concurrently by
+    // another test can inherit it between fork and exec and keep it listening.
+    drop(std::os::unix::net::UnixDatagram::bind(&stale).unwrap());
     let server = ControlServer::bind(&stale).await.unwrap();
     drop(server);
 
