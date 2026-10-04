@@ -12,7 +12,9 @@ use crate::domain::{
 use crate::store::{
     ClaimResult, DestinationDelivery, ReturnDelivery, StoreError, StoreHandle, StoredWorkflow,
 };
-use crate::wakterm::{ContractError, EventRead, FakeWakterm, TerminalResult, WaktermCli};
+use crate::wakterm::{
+    ContractError, EventRead, FakeWakterm, TerminalResult, WaktermCli, WaktermCliError,
+};
 
 const ASYNC_REPLY_DETAIL: &str = "This command does not wait for completion. Panetone mirrors the final to the source route's channel when it arrives and delivers the agent callback when the source agent is idle.";
 
@@ -153,6 +155,8 @@ pub enum ServiceError {
     },
     #[error("adapter operation became uncertain: {0}")]
     Adapter(String),
+    #[error("the target cannot take input now: {0}")]
+    TargetBlocked(String),
     #[error("terminal result does not match the persisted workflow identity")]
     TerminalIdentity,
     #[error("the workflow is missing or not awaiting this operation")]
@@ -211,7 +215,10 @@ impl WaktermBackend {
                 .steer(binding, &prompt)
                 .await
                 .map(|receipt| receipt.acknowledged())
-                .map_err(|error| ServiceError::Adapter(error.to_string())),
+                .map_err(|error| match error {
+                    WaktermCliError::TargetBlocked(detail) => ServiceError::TargetBlocked(detail),
+                    error => ServiceError::Adapter(error.to_string()),
+                }),
         }
     }
 }
@@ -547,9 +554,19 @@ impl OfflineService {
             }
         };
         self.faults.hit(FaultPoint::AfterPromptEffect)?;
-        if receipt.status == AdmissionStatus::Busy && record.command.steer {
+        // A target whose keyboard is held by a dialog cannot be steered; the
+        // request then waits in the busy queue like an unsteered one.
+        let steering = if receipt.status == AdmissionStatus::Busy && record.command.steer {
+            match self.wakterm.steer(&target, prompt).await {
+                Err(ServiceError::TargetBlocked(_)) => None,
+                result => Some(result),
+            }
+        } else {
+            None
+        };
+        if let Some(steering) = steering {
             record.workflow.record_target_receipt(&receipt, &target)?;
-            let acknowledged = match self.wakterm.steer(&target, prompt).await {
+            let acknowledged = match steering {
                 Ok(acknowledged) => acknowledged,
                 Err(error) => {
                     transition(

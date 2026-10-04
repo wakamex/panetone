@@ -72,6 +72,16 @@ pub struct SteeringReceipt {
     pane_id: u64,
     submitted: bool,
     acknowledgement: SteeringAcknowledgement,
+    /// Set when Wakterm wrote nothing, for example while a dialog holds the
+    /// target's keyboard (reason `input_blocked`).
+    #[serde(default)]
+    refusal: Option<SteeringRefusal>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+struct SteeringRefusal {
+    reason: String,
+    detail: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -136,6 +146,8 @@ pub enum WaktermCliError {
     Join(#[from] tokio::task::JoinError),
     #[error("Wakterm CLI rejected the operation: {0}")]
     Rejected(String),
+    #[error("Wakterm did not send because the target cannot take input now: {0}")]
+    TargetBlocked(String),
     #[error("Wakterm CLI returned malformed JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("incompatible Wakterm Agent API schema {schema:?} major {major}")]
@@ -534,6 +546,12 @@ impl WaktermCli {
                 Some(prompt.as_bytes()),
             )
             .await?;
+        if let Some(refusal) = receipt.refusal {
+            return Err(WaktermCliError::TargetBlocked(format!(
+                "{}: {}",
+                refusal.reason, refusal.detail
+            )));
+        }
         receipt.validate(binding)?;
         Ok(receipt)
     }

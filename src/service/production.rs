@@ -538,6 +538,16 @@ impl ProductionService {
                 AdmissionStatus::Busy => {
                     let steering = match self.wakterm.steer(&binding, &item.body).await {
                         Ok(steering) => steering,
+                        // Nothing was written; a later pass retries.
+                        Err(WaktermCliError::TargetBlocked(_)) => {
+                            item.state = "pending".into();
+                            item.receipt = None;
+                            self.store
+                                .save_inbox(item, "admission_prepared", None)
+                                .await
+                                .map_err(error_string)?;
+                            continue;
+                        }
                         Err(error) => {
                             self.notify_unconfirmed(&item, route, &error.to_string())
                                 .await?;
@@ -2231,6 +2241,90 @@ fi
         assert_eq!(record["state"], "indeterminate");
         assert_eq!(record["receipt"]["status"], "indeterminate");
         assert_eq!(record["receipt"]["prompt_written"], true);
+    }
+
+    #[tokio::test]
+    async fn channel_input_waits_while_the_target_cannot_take_input() {
+        let directory = tempdir().unwrap();
+        let binary = directory.path().join("wakterm-fake");
+        fs::write(
+            &binary,
+            r#"#!/bin/bash
+set -euo pipefail
+operation="$*"
+if [[ "$operation" == *"agent capabilities"* ]]; then
+  echo '{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}'
+elif [[ "$operation" == *"agent catalog"* ]]; then
+  echo '{"schema":"wakterm.agent-api.v1","as_of_event_sequence":10,"agents":[{"agent_id":"agent-route","incarnation_id":"inc-route","pane_id":1,"name":"route","harness":"claude","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-10-02T00:00:00Z"}]}'
+elif [[ "$operation" == *"list --format json"* ]]; then
+  echo '[{"pane_id":1,"tab_id":2,"window_id":3,"effective_title":"route"}]'
+elif [[ "$operation" == *"agent admit"* ]]; then
+  cat >/dev/null
+  echo '{"schema":"wakterm.agent-api.v1","request_id":"00000000-0000-0000-0000-00000000007e","status":"busy","definitive":true,"prompt_written":false,"agent_id":"agent-route","incarnation_id":"inc-route","detail":"the target is waiting for dialog open"}'
+elif [[ "$operation" == *"agent send agent-route"* ]]; then
+  cat >/dev/null
+  echo '{"agent_id":"agent-route","agent_name":"route","pane_id":1,"transport":"ObservedPty","submitted":false,"acknowledgement":{"kind":"not_requested","acknowledged":false,"latency_ms":null,"session_path":null,"detail":null},"refusal":{"reason":"input_blocked","detail":"the target is waiting for dialog open"}}'
+else
+  echo "unexpected fake invocation: $operation" >&2
+  exit 9
+fi
+"#,
+        )
+        .unwrap();
+        crate::test_support::seal_executable(&binary);
+        let database = directory.path().join("state.sqlite3");
+        let store = StoreHandle::open(&database).unwrap();
+        store
+            .save_route(
+                Route {
+                    id: RouteId::new(Uuid::new_v4()),
+                    title: "route".into(),
+                    channels: vec![ChannelBinding::Telegram { topic_id: 10 }],
+                    agent: None,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        store
+            .accept_inbox(InboxItem {
+                id: EffectId::new(Uuid::from_u128(126)),
+                channel: ChannelKind::Telegram,
+                external_id: "update-3".into(),
+                destination: "10".into(),
+                sender_id: Some("42".into()),
+                sender: Some("Mihai".into()),
+                reply_to_external_id: None,
+                body: "I just woke up. summarize.".into(),
+                state: "pending".into(),
+                created_at_ms: 1,
+                receipt: None,
+                steering_acknowledged: None,
+            })
+            .await
+            .unwrap();
+        let service = ProductionService::new(
+            store.clone(),
+            WaktermCli::new(
+                binary,
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            RealChannels::default(),
+            SupervisorHandle::default(),
+            vec!["event_stream.v1".into()],
+            directory.path().join("control.sock"),
+        );
+
+        assert_eq!(service.inbox_once().await.unwrap(), 1);
+        assert!(store.pending_outbox().await.unwrap().is_empty());
+        assert_eq!(store.status().await.unwrap().pending_inbox, 1);
+        // Still blocked on the next pass: retried again, still no notice.
+        assert_eq!(service.inbox_once().await.unwrap(), 1);
+        assert!(store.pending_outbox().await.unwrap().is_empty());
+        assert_eq!(store.status().await.unwrap().pending_inbox, 1);
+        drop(service);
+        store.shutdown().await.unwrap();
     }
 
     #[tokio::test]

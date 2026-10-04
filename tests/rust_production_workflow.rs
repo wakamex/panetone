@@ -680,6 +680,9 @@ elif [[ "$operation" == *"agent admit"* ]]; then
   done
   cat > '{}'
   printf '{{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"busy","definitive":true,"prompt_written":false,"agent_id":"agent-target","incarnation_id":"%s","detail":"target is busy"}}\n' "$request_id" "$incarnation"
+elif [[ "$operation" == *"agent send agent-target"* && -e '{}' ]]; then
+  cat >/dev/null
+  echo '{{"agent_id":"agent-target","agent_name":"target","pane_id":2,"transport":"ObservedPty","submitted":false,"acknowledgement":{{"kind":"not_requested","acknowledged":false,"latency_ms":null,"session_path":null,"detail":null}},"refusal":{{"reason":"input_blocked","detail":"the target is waiting for dialog open"}}}}'
 elif [[ "$operation" == *"agent send agent-target"* ]]; then
   cat > '{}'
   echo '{{"agent_id":"agent-target","agent_name":"target","pane_id":2,"transport":"CodexAppServerTui","submitted":true,"acknowledgement":{{"kind":"app_server","acknowledged":true,"latency_ms":1,"session_path":null,"detail":"[app-server-tui running] Codex commandExecution"}}}}'
@@ -689,6 +692,7 @@ else
 fi
 "#,
             admitted_prompt.display(),
+            directory.join("blocked").display(),
             steered_prompt.display()
         ),
     )
@@ -879,6 +883,49 @@ async fn cli_steer_uses_the_busy_turn_path_and_deduplicates_retries() {
     assert_eq!(duplicate_ack["result"], ack["result"]);
     assert_eq!(telegram.sent_messages().len(), 2);
     daemon.stop();
+}
+
+#[tokio::test]
+async fn cli_steer_queues_when_the_target_cannot_take_input() {
+    let directory = tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let database = directory.path().join("state.sqlite3");
+    let store = StoreHandle::open(&database).unwrap();
+    store
+        .save_route(unavailable_route(31, "source", 301), 1)
+        .await
+        .unwrap();
+    store
+        .save_route(unavailable_route(32, "target", 302), 1)
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+    let telegram = HttpCapture::start();
+    let (wakterm, _, steered_prompt) = write_busy_steering_wakterm_fake(directory.path());
+    fs::write(directory.path().join("blocked"), b"").unwrap();
+    let daemon = Daemon::start(directory.path(), &database, &wakterm, &telegram.base);
+
+    let sent = cli(
+        &daemon.socket,
+        &[
+            "send",
+            "--from",
+            "source",
+            "--to",
+            "target",
+            "--steer",
+            "correct the active turn",
+        ],
+    );
+    daemon.stop();
+    assert!(
+        sent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sent.stdout)
+    );
+    let ack: Value = serde_json::from_slice(&sent.stdout).unwrap();
+    assert_eq!(ack["result"]["delivery_state"], "queued");
+    assert!(!steered_prompt.exists());
 }
 
 #[tokio::test]
