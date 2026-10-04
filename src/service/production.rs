@@ -21,6 +21,10 @@ use crate::wakterm::{EventRead, LiveRouteSnapshot, TerminalResult, WaktermCli, W
 
 use super::{OfflineService, ServiceError};
 
+/// Uncertain attempts after which an outbox item is left indeterminate
+/// instead of risking more duplicate posts.
+const MAX_UNCERTAIN_ATTEMPTS: u32 = 3;
+
 pub struct ProductionService {
     store: StoreHandle,
     wakterm: WaktermCli,
@@ -262,17 +266,27 @@ impl ProductionService {
             .save_outbox(item.clone(), now_ms())
             .await
             .map_err(error_string)?;
-        match self.channels.send(&item).await {
+        let attempt = OutboxItem {
+            body: item.attempt_body(),
+            ..item.clone()
+        };
+        match self.channels.send(&attempt).await {
             Ok(receipt) => {
                 item.state = OutboxState::Delivered;
                 item.external_receipt = Some(receipt.external_id);
                 item.last_error = None;
             }
             Err(error) => {
-                item.state = if error.retryable() {
-                    OutboxState::Pending
-                } else {
+                if error.may_have_delivered() {
+                    item.uncertain_attempts += 1;
+                }
+                item.state = if !error.retryable() {
                     OutboxState::Failed
+                } else if item.uncertain_attempts >= MAX_UNCERTAIN_ATTEMPTS {
+                    // Each further try risks another visible duplicate.
+                    OutboxState::Indeterminate
+                } else {
+                    OutboxState::Pending
                 };
                 item.last_error = Some(error.to_string());
             }
@@ -601,6 +615,7 @@ impl ProductionService {
             attempts: 0,
             last_error: None,
             external_receipt: None,
+            uncertain_attempts: 0,
         };
         self.store
             .enqueue_outbox(None, notice, now_ms())
@@ -1348,6 +1363,156 @@ mod tests {
             ProfileKind::Current,
         )
         .unwrap()
+    }
+
+    /// Serves signal-cli JSON-RPC sends from a script of responses: `None`
+    /// succeeds, `Some(message)` returns that error. Records each posted body.
+    fn scripted_signal(
+        socket: &std::path::Path,
+        script: Vec<Option<&'static str>>,
+    ) -> tokio::task::JoinHandle<Vec<String>> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            let mut posted = Vec::new();
+            for response in script {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                posted.push(request["params"]["message"].as_str().unwrap().to_owned());
+                let reply = match response {
+                    None => {
+                        json!({"jsonrpc": "2.0", "id": request["id"], "result": {"timestamp": 1}})
+                    }
+                    Some(message) => json!({"jsonrpc": "2.0", "id": request["id"],
+                        "error": {"code": -32603, "message": message}}),
+                };
+                reader
+                    .get_mut()
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            posted
+        })
+    }
+
+    async fn signal_outbox_service(
+        directory: &std::path::Path,
+        socket: &std::path::Path,
+    ) -> (StoreHandle, ProductionService, EffectId) {
+        let store = StoreHandle::open(directory.join("state.sqlite3")).unwrap();
+        let id = EffectId::new(Uuid::from_u128(77));
+        store
+            .enqueue_outbox(
+                None,
+                OutboxItem {
+                    id,
+                    route_id: None,
+                    sender_harness: None,
+                    source_agent: None,
+                    kind: ChannelKind::Signal,
+                    destination: "group-one".into(),
+                    body: "reply".into(),
+                    attachments: Vec::new(),
+                    actions: Vec::new(),
+                    state: OutboxState::Pending,
+                    attempts: 0,
+                    last_error: None,
+                    external_receipt: None,
+                    uncertain_attempts: 0,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let channels = RealChannels {
+            signal: Some(crate::channels::SignalClient::new(
+                socket,
+                "+15550000",
+                Duration::from_secs(2),
+            )),
+            ..RealChannels::default()
+        };
+        let service = ProductionService::new(
+            store.clone(),
+            WaktermCli::new(
+                "/bin/false",
+                directory.join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            channels,
+            SupervisorHandle::default(),
+            Vec::new(),
+            directory.join("control.sock"),
+        );
+        (store, service, id)
+    }
+
+    const INACTIVE: &str =
+        "Failed to send message: the connection was closed (ChatServiceInactiveException)";
+
+    #[tokio::test]
+    async fn outbox_labels_a_retry_after_an_attempt_that_may_have_posted() {
+        let directory = tempdir().unwrap();
+        let socket = directory.path().join("signal.sock");
+        // Unreachable first: nothing can have been posted, so no label yet.
+        let (store, service, id) = signal_outbox_service(directory.path(), &socket).await;
+        assert_eq!(service.outbox_once().await.unwrap(), 1);
+        let server = scripted_signal(&socket, vec![Some(INACTIVE), None]);
+        assert_eq!(service.outbox_once().await.unwrap(), 1);
+        assert_eq!(service.outbox_once().await.unwrap(), 1);
+        assert_eq!(server.await.unwrap(), ["reply", "[resent] reply"]);
+
+        let item = store
+            .pending_outbox()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == id);
+        assert!(item.is_none(), "the item was delivered");
+        assert_eq!(store.status().await.unwrap().failed_outbox, 0);
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn outbox_stops_retrying_after_three_attempts_that_may_have_posted() {
+        let directory = tempdir().unwrap();
+        let socket = directory.path().join("signal.sock");
+        let (store, service, _) = signal_outbox_service(directory.path(), &socket).await;
+        let server = scripted_signal(&socket, vec![Some(INACTIVE); 3]);
+        for _ in 0..3 {
+            assert_eq!(service.outbox_once().await.unwrap(), 1);
+        }
+        assert_eq!(service.outbox_once().await.unwrap(), 0);
+        assert_eq!(server.await.unwrap().len(), 3);
+        let status = store.status().await.unwrap();
+        assert_eq!(status.indeterminate_outbox, 1);
+        assert_eq!(status.pending_outbox, 0);
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_send_interrupted_by_restart_is_labeled_when_retried() {
+        let directory = tempdir().unwrap();
+        let socket = directory.path().join("signal.sock");
+        let (store, service, id) = signal_outbox_service(directory.path(), &socket).await;
+        let mut item = store.pending_outbox().await.unwrap().remove(0);
+        item.state = OutboxState::Delivering;
+        store.save_outbox(item, 2).await.unwrap();
+        drop(service);
+        store.shutdown().await.unwrap();
+
+        let reopened = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        let item = reopened.pending_outbox().await.unwrap().remove(0);
+        assert_eq!(item.id, id);
+        assert_eq!(item.uncertain_attempts, 1);
+        assert_eq!(item.attempt_body(), "[resent] reply");
+        reopened.shutdown().await.unwrap();
     }
 
     #[test]

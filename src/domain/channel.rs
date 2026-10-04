@@ -6,7 +6,8 @@ use super::{EffectId, RouteId};
 
 const TELEGRAM_TEXT_UNITS: usize = 3900;
 const SIGNAL_TEXT_CHARS: usize = 4000;
-const ATTACHMENT_CAPTION_CHARS: usize = 1024;
+// Telegram allows 1,024 caption characters; room is left for RESEND_PREFIX.
+const ATTACHMENT_CAPTION_CHARS: usize = 1024 - RESEND_PREFIX.len();
 pub const MAX_CHANNEL_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 pub const MAX_CHANNEL_ATTACHMENTS: usize = 10;
 pub const MAX_CHANNEL_ATTACHMENT_TOTAL_BYTES: u64 = 50 * 1024 * 1024;
@@ -82,6 +83,28 @@ pub struct OutboxItem {
     pub attempts: u32,
     pub last_error: Option<String>,
     pub external_receipt: Option<String>,
+    /// Attempts that failed after the channel may already have posted the
+    /// message. A later attempt is labeled as a resend.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub uncertain_attempts: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+pub const RESEND_PREFIX: &str = "[resent] ";
+
+impl OutboxItem {
+    /// The body to post on this attempt: labeled when an earlier attempt may
+    /// already have appeared, so a duplicate is recognizable.
+    pub fn attempt_body(&self) -> String {
+        if self.uncertain_attempts == 0 {
+            self.body.clone()
+        } else {
+            format!("{RESEND_PREFIX}{}", self.body)
+        }
+    }
 }
 
 pub fn chunk_outbox(mut item: OutboxItem) -> Vec<OutboxItem> {
@@ -204,6 +227,7 @@ mod tests {
             attempts: 0,
             last_error: None,
             external_receipt: None,
+            uncertain_attempts: 0,
         }
     }
 
@@ -239,11 +263,13 @@ mod tests {
             sha256: "hash".into(),
             data_base64: "eA==".into(),
         });
-        let chunks = chunk_outbox(original);
+        let mut chunks = chunk_outbox(original);
         assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].body.chars().count(), 1024);
         assert_eq!(chunks[0].attachments.len(), 1);
-        assert_eq!(chunks[1].body, "x");
+        assert_eq!(chunks[1].body, "x".repeat(10));
         assert!(chunks[1].attachments.is_empty());
+        // A resent caption still fits Telegram's 1,024-character limit.
+        chunks[0].uncertain_attempts = 1;
+        assert_eq!(chunks[0].attempt_body().chars().count(), 1024);
     }
 }

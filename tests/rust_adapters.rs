@@ -168,6 +168,7 @@ fn item(index: u128, kind: ChannelKind) -> OutboxItem {
         attempts: 0,
         last_error: None,
         external_receipt: None,
+        uncertain_attempts: 0,
     }
 }
 

@@ -164,6 +164,8 @@ or Signal's text limit. Every chunk has a deterministic effect ID and is
 committed with the source event cursor, so restart resumes at the first unsent
 chunk.
 
+Outbound posts are retried according to whether the failed attempt may have reached the chat. Neither Telegram nor Signal lets Panetone check whether a post appeared, so a retry after such an attempt starts with `[resent] ` and a duplicate is recognizable. Unreachable endpoints and rate limits mean nothing was posted, so those retries are unlabeled and unlimited. Timeouts, dropped connections, malformed responses, Telegram 5xx responses, and signal-cli's `ChatServiceInactiveException` may have posted; after three such attempts the item becomes indeterminate instead of risking further duplicates. Other rejections fail the item at once.
+
 Telegram inbound polling retries timeouts, transport failures, rate limits, and
 upstream 5xx responses in place. Backoff starts at one second, caps at 30
 seconds, and honors a longer Telegram `retry_after`. Other polling errors still
@@ -174,8 +176,8 @@ Signal inbound reconnects after subscription timeouts and transport disconnects 
 ## Durable failure rules
 
 - Never replay an indeterminate prompt merely because the daemon restarted.
-- A delivering outbox item returns to pending after restart because channel
-  sends use stable effect IDs and channel-level deduplication where available.
+- A delivering outbox item returns to pending after restart and counts as an
+  attempt that may have posted, so its retry is labeled `[resent]`.
 - An admission prepared without a definitive receipt becomes indeterminate.
 - Preserve the database before manual repair.
 - Attribute Wakterm client, mux, Telegram, Signal, and Panetone failures to one
@@ -192,7 +194,7 @@ duplicate post-cutover state.
 
 `scripts/watch.py` runs every 5 minutes from the user units `panetone-watch.service` and `panetone-watch.timer` in `~/.config/systemd/user/`. It reads the store read-only and Wakterm's agent list, and sends one Panetone message to the `panetone` route listing problems it has not reported before:
 
-- channel posts that failed
+- channel posts that failed, or that stopped retrying after attempts that may have posted
 - inbound messages that are unconfirmed or still undelivered after 10 minutes
 - agent-to-agent sends and final returns that are unconfirmed
 - registered Claude or Codex agents with a plain PTY transport, whose output is not forwarded

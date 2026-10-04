@@ -927,8 +927,11 @@ fn recover(connection: &mut Connection) -> StoreResult<()> {
         save_return(connection, &record)?;
     }
     connection.execute(
+        // A send interrupted by a restart may have been posted.
         "UPDATE outbox SET state = 'pending',
-             record_json = json_set(record_json, '$.state', 'pending')
+             record_json = json_set(record_json, '$.state', 'pending',
+                 '$.uncertain_attempts',
+                 coalesce(json_extract(record_json, '$.uncertain_attempts'), 0) + 1)
          WHERE state = 'delivering'",
         [],
     )?;
@@ -1452,6 +1455,7 @@ fn ingest_agent_events(
                 attempts: 0,
                 last_error: None,
                 external_receipt: None,
+                uncertain_attempts: 0,
             };
             for chunk in crate::domain::chunk_outbox(item) {
                 enqueue_outbox(&transaction, None, &chunk, now_ms)?;

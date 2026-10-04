@@ -32,6 +32,10 @@ pub enum ChannelDeliveryError {
     Timeout(ChannelKind),
     #[error("{0:?} transport failed")]
     Transport(ChannelKind),
+    #[error("{0:?} could not be reached")]
+    Unreachable(ChannelKind),
+    #[error("{kind:?} server failed: {detail}")]
+    ServerError { kind: ChannelKind, detail: String },
     #[error("{kind:?} rate limited delivery for {retry_after_secs} seconds")]
     RateLimited {
         kind: ChannelKind,
@@ -51,7 +55,21 @@ impl ChannelDeliveryError {
     pub fn retryable(&self) -> bool {
         matches!(
             self,
-            Self::Timeout(_) | Self::Transport(_) | Self::RateLimited { .. } | Self::Malformed(_)
+            Self::Timeout(_)
+                | Self::Transport(_)
+                | Self::Unreachable(_)
+                | Self::RateLimited { .. }
+                | Self::Malformed(_)
+                | Self::ServerError { .. }
+        )
+    }
+
+    /// Whether the channel may have posted the message despite the error.
+    /// Unreachable and rate-limited sends were never accepted.
+    pub fn may_have_delivered(&self) -> bool {
+        matches!(
+            self,
+            Self::Timeout(_) | Self::Transport(_) | Self::Malformed(_) | Self::ServerError { .. }
         )
     }
 }
@@ -195,7 +213,7 @@ impl SignalClient {
     async fn send_inner(&self, item: &OutboxItem) -> Result<DeliveryReceipt, ChannelDeliveryError> {
         let mut stream = UnixStream::connect(&self.socket)
             .await
-            .map_err(|_| ChannelDeliveryError::Transport(ChannelKind::Signal))?;
+            .map_err(|_| ChannelDeliveryError::Unreachable(ChannelKind::Signal))?;
         let request_id = item.id.to_string();
         let mut params = json!({
             "groupId": item.destination,
@@ -252,9 +270,15 @@ impl SignalClient {
                 continue;
             }
             if let Some(error) = response.error {
-                return Err(ChannelDeliveryError::Rejected {
-                    kind: ChannelKind::Signal,
-                    detail: safe_remote_detail(&error.to_string()),
+                let detail = safe_remote_detail(&error.to_string());
+                // signal-cli reports its own lost server connection this way.
+                return Err(if detail.contains("ChatServiceInactiveException") {
+                    ChannelDeliveryError::Transport(ChannelKind::Signal)
+                } else {
+                    ChannelDeliveryError::Rejected {
+                        kind: ChannelKind::Signal,
+                        detail,
+                    }
                 });
             }
             let result = response
@@ -501,6 +525,9 @@ async fn telegram_response(
             .as_deref()
             .unwrap_or("unknown Telegram error"),
     );
+    if status.is_server_error() || parsed.error_code.is_some_and(|code| code >= 500) {
+        return Err(ChannelDeliveryError::ServerError { kind, detail });
+    }
     let lowered = detail.to_ascii_lowercase();
     if lowered.contains("message thread not found")
         || lowered.contains("chat not found")
@@ -586,6 +613,8 @@ pub(super) fn http_client(
 fn map_http_error(kind: ChannelKind, error: &reqwest::Error) -> ChannelDeliveryError {
     if error.is_timeout() {
         ChannelDeliveryError::Timeout(kind)
+    } else if error.is_connect() {
+        ChannelDeliveryError::Unreachable(kind)
     } else {
         ChannelDeliveryError::Transport(kind)
     }

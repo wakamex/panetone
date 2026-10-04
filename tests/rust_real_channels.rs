@@ -129,6 +129,7 @@ fn item(kind: ChannelKind, destination: &str) -> OutboxItem {
         attempts: 1,
         last_error: None,
         external_receipt: None,
+        uncertain_attempts: 0,
     }
 }
 
@@ -349,6 +350,77 @@ async fn http_channels_classify_rate_limits_malformed_timeouts_and_disconnects()
     assert_eq!(error, ChannelDeliveryError::Timeout(ChannelKind::Telegram));
     assert!(!error.to_string().contains("secret"));
     let _ = request.await;
+}
+
+#[tokio::test]
+async fn channel_errors_say_whether_the_message_may_have_been_posted() {
+    let response = b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: 57\r\n\r\n{\"ok\":false,\"error_code\":502,\"description\":\"Bad Gateway\"}";
+    let (base, request) = http_server(response, Duration::ZERO).await;
+    let client = TelegramClient::new(&base, "secret", -1, Duration::from_secs(2)).unwrap();
+    let error = client
+        .send(&item(ChannelKind::Telegram, "1"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ChannelDeliveryError::ServerError { .. }));
+    assert!(error.retryable() && error.may_have_delivered());
+    request.await.unwrap();
+
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let client = TelegramClient::new(&base, "secret", -1, Duration::from_secs(2)).unwrap();
+    let error = client
+        .send(&item(ChannelKind::Telegram, "1"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        ChannelDeliveryError::Unreachable(ChannelKind::Telegram)
+    );
+    assert!(error.retryable() && !error.may_have_delivered());
+
+    let rate_limited = ChannelDeliveryError::RateLimited {
+        kind: ChannelKind::Telegram,
+        retry_after_secs: 1,
+    };
+    assert!(!rate_limited.may_have_delivered());
+    assert!(ChannelDeliveryError::Timeout(ChannelKind::Telegram).may_have_delivered());
+
+    let directory = tempdir().unwrap();
+    let signal = SignalClient::new(
+        directory.path().join("missing.sock"),
+        "+15550000",
+        Duration::from_secs(2),
+    );
+    let error = signal
+        .send(&item(ChannelKind::Signal, "group-one"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        ChannelDeliveryError::Unreachable(ChannelKind::Signal)
+    );
+    assert!(!error.may_have_delivered());
+
+    let socket = directory.path().join("inactive.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        stream.read_to_end(&mut request).await.unwrap();
+        stream
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"11111111-1111-4111-8111-111111111111\",\"error\":{\"code\":-32603,\"message\":\"Failed to send message: the connection was closed (ChatServiceInactiveException) (UnexpectedErrorException)\"}}\n")
+            .await
+            .unwrap();
+    });
+    let signal = SignalClient::new(&socket, "+15550000", Duration::from_secs(2));
+    let error = signal
+        .send(&item(ChannelKind::Signal, "group-one"))
+        .await
+        .unwrap_err();
+    assert_eq!(error, ChannelDeliveryError::Transport(ChannelKind::Signal));
+    assert!(error.retryable() && error.may_have_delivered());
+    server.await.unwrap();
 }
 
 #[tokio::test]
