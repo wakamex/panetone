@@ -187,3 +187,15 @@ The Python migration bundle is retained only as historical evidence. It is not
 accepted by the current CLI and is not a rollback target. After Rust processed
 real channel and Wakterm effects, restoring the Python snapshot would lose or
 duplicate post-cutover state.
+
+## Watch for silent failures
+
+`scripts/watch.py` runs every 5 minutes from the user units `panetone-watch.service` and `panetone-watch.timer` in `~/.config/systemd/user/`. It reads the store read-only and Wakterm's agent list, and sends one Panetone message to the `panetone` route listing problems it has not reported before:
+
+- channel posts that failed
+- inbound messages that are unconfirmed or still undelivered after 10 minutes
+- agent-to-agent sends and final returns that are unconfirmed
+- registered Claude or Codex agents with a plain PTY transport, whose output is not forwarded
+- detected Claude or Codex agents in a routed tab, which Panetone ignores until they are registered
+
+Agent problems are reported only after they persist across two runs, because a starting or restored agent is briefly unobserved. Reported problems are recorded in `~/.local/state/panetone-rust/watch.json` before the message is sent, so an unconfirmed report is never repeated, and the watcher ignores its own reports. Deleting that file makes the next run record a silent baseline. Run the tests with `python3 -m unittest test_watch` from `scripts/`.
