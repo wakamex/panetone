@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Report new Panetone delivery failures and unobservable Wakterm agents.
+"""Report new Panetone delivery failures and failing daemon workers.
 
-Each run reads Panetone's store read-only and Wakterm's agent list, then sends
-one Panetone message listing problems it has not reported before. The first run
-records existing problems as a baseline without reporting them. A Wakterm agent
-problem is reported only when it persists across two runs, because a freshly
-started or restored agent is briefly unobserved.
+Each run reads Panetone's store read-only and its status, then sends one
+Panetone message listing problems it has not reported before. The first run
+records existing problems as a baseline without reporting them. Panetone
+itself reports unregistered or unobserved agents in each route's channel.
 """
 
 import json
@@ -58,26 +57,6 @@ def store_problems(connection, now_ms):
     return problems
 
 
-def agent_problems(agents, routed_titles, pane_titles):
-    """Return {key: description} for agents Panetone cannot use fully."""
-    problems = {}
-    for agent in agents:
-        runtime = agent["runtime"]
-        if not runtime["alive"] or runtime["harness"] not in ("Claude", "Codex"):
-            continue
-        metadata = agent["metadata"]
-        title = pane_titles.get(agent["pane_id"], "")
-        # Agent IDs survive mux restarts, so a known problem is not re-reported.
-        identity = metadata["agent_id"]
-        where = f"{metadata['name']} (pane {agent['pane_id']}, tab {title or '?'})"
-        if agent["origin"] == "detected":
-            if title.lower() in routed_titles:
-                problems[f"detected:{identity}"] = f"{where} is detected but not registered, so Panetone ignores it"
-        elif runtime["transport"] == "PlainPty":
-            problems[f"unobserved:{identity}"] = f"{where} is registered but unobserved: its output is not forwarded and prompts come back unconfirmed"
-    return problems
-
-
 def task_problems(tasks):
     """Return {key: description} for daemon tasks that are not running."""
     return {
@@ -103,29 +82,18 @@ def main():
     connection.close()
 
     tasks = task_problems(run_json("panetone", "status", "--json")["result"]["tasks"])
-    routes = run_json("panetone", "route", "list")["result"]["routes"]
-    panes = run_json("wakterm", "cli", "list", "--format", "json")
-    agents = run_json("wakterm", "agent", "list", "--format", "json")
-    current_agents = agent_problems(
-        agents,
-        {route["title"].lower() for route in routes},
-        {pane["pane_id"]: pane.get("effective_title") or "" for pane in panes},
-    )
 
     first_run = not STATE.exists()
-    state = {"seen": [], "agent_candidates": []} if first_run else json.loads(STATE.read_text())
-    seen = set(state["seen"])
-    candidates = set(state["agent_candidates"])
+    seen = set() if first_run else set(json.loads(STATE.read_text())["seen"])
 
-    confirmed_agents = {key: text for key, text in current_agents.items() if key in candidates}
-    found = {**store, **confirmed_agents, **tasks}
+    found = {**store, **tasks}
     new = {key: text for key, text in found.items() if key not in seen}
     # A recovered task is forgotten, so its next failure is reported again.
     seen = {key for key in seen if not key.startswith("task:") or key in tasks}
 
     # Save before sending: an unconfirmed send may still have arrived, so a
     # failed send must not cause the same report on every later run.
-    state = {"seen": sorted(seen | found.keys()), "agent_candidates": sorted(current_agents)}
+    state = {"seen": sorted(seen | found.keys())}
     STATE.parent.mkdir(parents=True, exist_ok=True)
     STATE.write_text(json.dumps(state, indent=1) + "\n")
     print(f"{len(found)} known problems, {len(new)} new{' (baseline run, not reported)' if first_run else ''}")

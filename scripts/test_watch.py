@@ -1,32 +1,7 @@
 import sqlite3
 import unittest
 
-from watch import agent_problems, store_problems, task_problems
-
-
-def agent(name, pane, origin, transport, harness="Claude", alive=True):
-    return {
-        "pane_id": pane,
-        "origin": origin,
-        "metadata": {"agent_id": f"id-{name}", "name": name},
-        "runtime": {"alive": alive, "harness": harness, "transport": transport, "tty_name": f"/dev/pts/{pane}"},
-    }
-
-
-class AgentProblems(unittest.TestCase):
-    def test_reports_unobserved_registered_and_unregistered_routed_agents(self):
-        agents = [
-            agent("observed", 1, "adopted", "ObservedPty"),
-            agent("managed", 2, "managed", "CodexAppServerTui", "Codex"),
-            agent("plain", 3, "adopted", "PlainPty", "Codex"),
-            agent("detected", 4, "detected", "PlainPty"),
-            agent("stray", 5, "detected", "PlainPty"),
-            agent("exited", 6, "adopted", "PlainPty", alive=False),
-            agent("shell", 7, "adopted", "PlainPty", harness="Gemini"),
-        ]
-        titles = {1: "a", 2: "b", 3: "c", 4: "Routed", 5: "unrouted", 6: "c", 7: "c"}
-        problems = agent_problems(agents, {"routed"}, titles)
-        self.assertEqual(sorted(problems), ["detected:id-detected", "unobserved:id-plain"])
+from watch import store_problems, task_problems
 
 
 class TaskProblems(unittest.TestCase):
