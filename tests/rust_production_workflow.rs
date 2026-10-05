@@ -94,8 +94,10 @@ fn handle_http(
     let mut bytes = Vec::new();
     let header_end = loop {
         let mut chunk = [0_u8; 2048];
-        let read = stream.read(&mut chunk).unwrap();
-        assert!(read > 0);
+        let read = match stream.read(&mut chunk) {
+            Ok(read) if read > 0 => read,
+            _ => return,
+        };
         bytes.extend_from_slice(&chunk[..read]);
         if let Some(position) = bytes.windows(4).position(|value| value == b"\r\n\r\n") {
             break position + 4;
@@ -112,8 +114,10 @@ fn handle_http(
         .unwrap_or(0);
     while bytes.len() - header_end < content_length {
         let mut chunk = [0_u8; 2048];
-        let read = stream.read(&mut chunk).unwrap();
-        assert!(read > 0);
+        let read = match stream.read(&mut chunk) {
+            Ok(read) if read > 0 => read,
+            _ => return,
+        };
         bytes.extend_from_slice(&chunk[..read]);
     }
     let path = header
@@ -138,13 +142,13 @@ fn handle_http(
         let id = message_id.fetch_add(1, Ordering::Relaxed);
         format!(r#"{{"ok":true,"result":{{"message_id":{id}}}}}"#)
     };
-    write!(
+    // The daemon may stop mid-request at the end of a test.
+    let _ = write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         response.len(),
         response
-    )
-    .unwrap();
+    );
 }
 
 fn write_launcher_wakterm_fake(directory: &Path) -> (PathBuf, PathBuf) {
