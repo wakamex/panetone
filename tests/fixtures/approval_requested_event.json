@@ -1,0 +1,48 @@
+{
+ "sequence": 101,
+ "event_id": "23a1268c3ce776e813c0c9d87ca8ac85a55e04fdc15d97a0d98a2db4d1162470",
+ "kind": "approval_requested",
+ "agent_id": "cc82916a-8f9a-4963-b612-f903d19c7905",
+ "incarnation_id": "541f606ab0dcbadf52dd19359ce771a50cc8910a79847d31a2cd11b416e332d9",
+ "observed_at": "2026-10-05T03:48:29.668Z",
+ "turn_id": "e2a60aa9-31b2-4118-a930-93b53c0f86ef",
+ "lifecycle": null,
+ "reason": null,
+ "turn_state": null,
+ "text": null,
+ "outcome": null,
+ "recoverable": null,
+ "detail": null,
+ "approval": {
+  "schema": "wakterm.agent-approval.v1",
+  "kind": "user_question",
+  "request_id": "da8d878c272cbc287c325046",
+  "agent_id": "cc82916a-8f9a-4963-b612-f903d19c7905",
+  "incarnation_id": "541f606ab0dcbadf52dd19359ce771a50cc8910a79847d31a2cd11b416e332d9",
+  "turn_id": "e2a60aa9-31b2-4118-a930-93b53c0f86ef",
+  "item_id": "toolu_01DJEWTCHgrFbJ9TH7so2M1P",
+  "observed_at": "2026-10-05T03:48:29.668Z",
+  "prompt": "Which source should the tool use?",
+  "reason": "Source",
+  "command": null,
+  "cwd": null,
+  "choices": [
+   {
+    "id": "option_1",
+    "label": "Choice 1",
+    "description": "Description of choice 1."
+   },
+   {
+    "id": "option_2",
+    "label": "Choice 2",
+    "description": "Description of choice 2."
+   },
+   {
+    "id": "option_3",
+    "label": "Choice 3",
+    "description": "Description of choice 3."
+   }
+  ]
+ },
+ "input_sha256": null
+}

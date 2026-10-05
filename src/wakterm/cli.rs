@@ -884,6 +884,7 @@ fn validate_live_events(
             || !matches!(
                 event.kind.as_str(),
                 "agent_lifecycle"
+                    | "approval_requested"
                     | "turn_started"
                     | "turn_state_changed"
                     | "plan"

@@ -391,3 +391,44 @@ async fn configured_development_mux_matches_the_current_contract() {
     let catalog = cli.catalog().await.unwrap();
     assert_eq!(catalog.schema, "wakterm.agent-api.v1");
 }
+
+#[tokio::test]
+async fn event_pages_accept_approval_requests() {
+    // A live Wakterm approval_requested event, with its question text replaced.
+    let event = fs::read_to_string("tests/fixtures/approval_requested_event.json").unwrap();
+    let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+    let page = serde_json::json!({
+        "schema": "wakterm.agent-events.v1",
+        "status": "ok",
+        "requested_after_sequence": 100,
+        "oldest_available_sequence": 1,
+        "latest_sequence": 101,
+        "next_after_sequence": 101,
+        "events": [event],
+    });
+    let directory = tempdir().unwrap();
+    let page_file = directory.path().join("page.json");
+    fs::write(&page_file, format!("{page}\n")).unwrap();
+    let (_script_directory, binary) = fake_cli(&format!(
+        r#"
+if [[ "$*" == *"agent capabilities"* ]]; then
+  printf '%s\n' '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1","approval_control.v1"]}}'
+elif [[ "$*" == *"agent events"* ]]; then
+  cat '{}'
+else
+  exit 9
+fi
+"#,
+        page_file.display()
+    ));
+    let cli = WaktermCli::new(binary, "/tmp/non-production.sock", Duration::from_secs(2));
+
+    match cli.event_page(100, 100).await.unwrap() {
+        EventRead::Events { events, .. } => {
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].kind, "approval_requested");
+            assert!(events[0].approval().unwrap().is_some());
+        }
+        other => panic!("unexpected event read: {other:?}"),
+    }
+}
