@@ -1380,7 +1380,7 @@ fn ingest_agent_events(
             };
             let (body, attachments, actions) = match approval {
                 Some(approval) => {
-                    let mut body = if approval.kind == "user_question" {
+                    let mut body = if approval.kind.starts_with("user_question") {
                         "Input needed".to_string()
                     } else {
                         "Approval needed".to_string()
@@ -1396,6 +1396,11 @@ fn ingest_agent_events(
                     if let Some(reason) = approval.reason.as_deref() {
                         body.push_str("\n\nReason: ");
                         body.push_str(reason);
+                    }
+                    if approval.kind == "user_question_form" {
+                        body.push_str(
+                            "\n\nThis form has several questions, so answer it in the agent's pane.",
+                        );
                     }
                     if approval.kind == "user_question" {
                         for (index, choice) in approval.choices.iter().enumerate() {

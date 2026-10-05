@@ -93,7 +93,9 @@ impl EventRecord {
         if approval.schema != "wakterm.agent-approval.v1"
             || approval.agent_id != self.agent_id
             || approval.incarnation_id != self.incarnation_id
-            || approval.choices.is_empty()
+            // A question form lists its questions in the prompt and is
+            // answered in the agent's pane, so it has no choices.
+            || approval.choices.is_empty() != (approval.kind == "user_question_form")
         {
             return Err("approval event identity or choices are invalid");
         }

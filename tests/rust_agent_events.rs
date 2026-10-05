@@ -126,6 +126,51 @@ async fn question_event_routes_buttons_and_preserves_exact_identity() {
 }
 
 #[tokio::test]
+async fn question_form_is_posted_as_text_for_the_agent_pane() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let route = route();
+    store.save_route(route.clone(), 1).await.unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+    // The shape Wakterm emits for a Claude form with several questions.
+    let prompt = "1. Browser: Which Browser?\n- A: first\n- B\n\n2. Lifetime: Which Lifetime?\n- A: first\n- B";
+    let event: EventRecord = serde_json::from_value(serde_json::json!({
+        "sequence": 101,
+        "event_id": "approval-event-101",
+        "kind": "approval_requested",
+        "agent_id": "agent-zola",
+        "incarnation_id": "incarnation-zola-7",
+        "turn_id": "turn-1",
+        "approval": {
+            "schema": "wakterm.agent-approval.v1",
+            "kind": "user_question_form",
+            "request_id": "0123456789abcdef01234567",
+            "agent_id": "agent-zola",
+            "incarnation_id": "incarnation-zola-7",
+            "turn_id": "turn-1",
+            "item_id": "item-1",
+            "observed_at": "2026-10-05T04:44:00Z",
+            "prompt": prompt,
+            "reason": null,
+            "choices": []
+        }
+    }))
+    .unwrap();
+    store
+        .ingest_agent_events(100, 101, vec![event], live_agents(&route), 3)
+        .await
+        .unwrap();
+    let pending = store.pending_outbox().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].body.starts_with("Input needed"));
+    assert!(pending[0].body.contains(prompt));
+    assert!(pending[0].body.contains("answer it in the agent's pane"));
+    assert!(pending[0].actions.is_empty());
+    assert_eq!(store.status().await.unwrap().event_cursor, Some(101));
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn event_page_recording_output_projection_and_cursor_advance_are_atomic() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("state.sqlite3");
