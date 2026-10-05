@@ -103,6 +103,8 @@ Assistant messages and plans are forwarded to the route's selected output channe
 
 Wakterm `approval_requested` events are projected to the route's Telegram topic through the durable outbox. These cover managed Codex command approvals and single-choice questions, plus observer-backed Claude single-choice questions. The primary Telegram bot sends all interactive messages because it owns the inbound update cursor. A callback is accepted only from `WAK_TG_OWNER`, in the topic bound to the stored route, for the exact stored request, agent, incarnation, and advertised choice. Wakterm performs the final live-state check. It answers Codex through its app-server protocol and submits Claude selections only while the exact question remains pending in the exact session. A failure is shown as stale or unavailable.
 
+A Claude question form whose event carries structured `questions` is posted as one message with a button per option plus Submit, "Chat about this" and Cancel. Answers are stored as `form:<request_id>` metadata as they arrive, so they survive restarts, and the message is edited to show them. An owner reply to the form message that starts with a question number records a typed answer and is not delivered to the agent. Submit resolves the form with `wakterm agent approval --choice submit --answers`; if Wakterm stops before submitting, the form stays open and the reason is shown on the tapped button.
+
 ## Launcher contract
 
 An external launcher must use the control CLI rather than the database or the

@@ -10,7 +10,8 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use crate::domain::{ChannelKind, EffectId};
+use crate::domain::{ChannelKind, EffectId, OutboxAction};
+use crate::wakterm::form::{self, FormAction};
 
 use super::real::{ChannelDeliveryError, http_client, response_body};
 
@@ -45,6 +46,7 @@ impl InboundMessage {
 pub struct InboundBatch {
     pub messages: Vec<InboundMessage>,
     pub approvals: Vec<TelegramApprovalResponse>,
+    pub form_taps: Vec<TelegramFormTap>,
     pub next_offset: i64,
 }
 
@@ -55,6 +57,17 @@ pub struct TelegramApprovalResponse {
     pub sender_id: String,
     pub request_id: String,
     pub choice_id: String,
+}
+
+/// A button tap on a Claude question form message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TelegramFormTap {
+    pub query_id: String,
+    pub destination: String,
+    pub sender_id: String,
+    pub message_id: i64,
+    pub request_id: String,
+    pub action: FormAction,
 }
 
 #[derive(Clone)]
@@ -156,21 +169,32 @@ impl TelegramPoller {
         let mut next_offset = offset;
         let mut messages = Vec::new();
         let mut approvals = Vec::new();
+        let mut form_taps = Vec::new();
         for update in response.result {
             next_offset = next_offset.max(update.update_id.saturating_add(1));
             if let Some(callback) = update.callback_query
                 && let Some(message) = callback.message
                 && message.chat.id == self.chat_id
                 && let Some(topic) = message.message_thread_id
-                && let Some((request_id, choice_id)) = parse_approval_callback(&callback.data)
             {
-                approvals.push(TelegramApprovalResponse {
-                    query_id: callback.id,
-                    destination: topic.to_string(),
-                    sender_id: callback.from.id.to_string(),
-                    request_id,
-                    choice_id,
-                });
+                if let Some((request_id, choice_id)) = parse_approval_callback(&callback.data) {
+                    approvals.push(TelegramApprovalResponse {
+                        query_id: callback.id,
+                        destination: topic.to_string(),
+                        sender_id: callback.from.id.to_string(),
+                        request_id,
+                        choice_id,
+                    });
+                } else if let Some((request_id, action)) = form::parse_callback(&callback.data) {
+                    form_taps.push(TelegramFormTap {
+                        query_id: callback.id,
+                        destination: topic.to_string(),
+                        sender_id: callback.from.id.to_string(),
+                        message_id: message.message_id,
+                        request_id,
+                        action,
+                    });
+                }
             }
             let Some(message) = update.message else {
                 continue;
@@ -236,8 +260,61 @@ impl TelegramPoller {
         Ok(InboundBatch {
             messages,
             approvals,
+            form_taps,
             next_offset,
         })
+    }
+
+    /// Replaces a posted message's text and buttons, such as a form after an
+    /// answer. Telegram refuses an edit that changes nothing, which is ignored.
+    pub async fn edit_message(
+        &self,
+        message_id: i64,
+        text: &str,
+        actions: &[OutboxAction],
+    ) -> Result<(), ChannelDeliveryError> {
+        let keyboard = actions
+            .iter()
+            .map(|action| vec![json!({"text": action.label, "callback_data": action.id})])
+            .collect::<Vec<_>>();
+        let response = self
+            .http
+            .post(format!(
+                "{}/bot{}/editMessageText",
+                self.api_base, self.token
+            ))
+            .json(&json!({
+                "chat_id": self.chat_id,
+                "message_id": message_id,
+                "text": text,
+                "link_preview_options": {"is_disabled": true},
+                "reply_markup": {"inline_keyboard": keyboard},
+            }))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    ChannelDeliveryError::Timeout(self.kind)
+                } else {
+                    ChannelDeliveryError::Transport(self.kind)
+                }
+            })?;
+        let status = response.status();
+        let body = response_body(response, self.kind).await?;
+        let response: TelegramCallbackAnswer = serde_json::from_slice(&body)
+            .map_err(|_| ChannelDeliveryError::Malformed(self.kind))?;
+        let unchanged = response
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains("message is not modified"));
+        if (status.is_success() && response.ok) || unchanged {
+            Ok(())
+        } else {
+            Err(ChannelDeliveryError::Rejected {
+                kind: self.kind,
+                detail: safe_detail(response.description.as_deref().unwrap_or("edit rejected")),
+            })
+        }
     }
 
     pub async fn answer_callback(
@@ -607,6 +684,8 @@ struct TelegramCallbackQuery {
 
 #[derive(Deserialize)]
 struct TelegramMessage {
+    #[serde(default)]
+    message_id: i64,
     chat: TelegramChat,
     message_thread_id: Option<i64>,
     from: Option<TelegramUser>,

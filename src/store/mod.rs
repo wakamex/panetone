@@ -264,11 +264,11 @@ enum Command {
     PendingOutbox {
         reply: oneshot::Sender<StoreResult<Vec<OutboxItem>>>,
     },
-    FindOutboxAgent {
+    FindDeliveredOutbox {
         channel: ChannelKind,
         destination: String,
         external_receipt: String,
-        reply: oneshot::Sender<StoreResult<Option<AgentBinding>>>,
+        reply: oneshot::Sender<StoreResult<Option<OutboxItem>>>,
     },
     AcceptInbox {
         item: InboxItem,
@@ -497,7 +497,20 @@ impl StoreHandle {
         destination: String,
         external_receipt: String,
     ) -> StoreResult<Option<AgentBinding>> {
-        self.request(|reply| Command::FindOutboxAgent {
+        Ok(self
+            .find_delivered_outbox(channel, destination, external_receipt)
+            .await?
+            .and_then(|item| item.source_agent))
+    }
+
+    /// The delivered outbox item whose channel message has this receipt.
+    pub async fn find_delivered_outbox(
+        &self,
+        channel: ChannelKind,
+        destination: String,
+        external_receipt: String,
+    ) -> StoreResult<Option<OutboxItem>> {
+        self.request(|reply| Command::FindDeliveredOutbox {
             channel,
             destination,
             external_receipt,
@@ -698,14 +711,14 @@ fn handle_command(connection: &mut Connection, command: Command) {
             reply,
         } => send_reply(reply, save_outbox(connection, &item, now_ms)),
         Command::PendingOutbox { reply } => send_reply(reply, pending_outbox(connection)),
-        Command::FindOutboxAgent {
+        Command::FindDeliveredOutbox {
             channel,
             destination,
             external_receipt,
             reply,
         } => send_reply(
             reply,
-            find_outbox_agent(connection, channel, &destination, &external_receipt),
+            find_delivered_outbox(connection, channel, &destination, &external_receipt),
         ),
         Command::AcceptInbox { item, reply } => send_reply(reply, accept_inbox(connection, &item)),
         Command::PendingInbox { reply } => send_reply(reply, pending_inbox(connection)),
@@ -1379,6 +1392,14 @@ fn ingest_agent_events(
                 continue;
             };
             let (body, attachments, actions) = match approval {
+                Some(approval) if crate::wakterm::form::answerable(&approval) => {
+                    let state = crate::wakterm::form::FormState::default();
+                    (
+                        crate::wakterm::form::text(&approval, &state),
+                        Vec::new(),
+                        crate::wakterm::form::actions(&approval, &state),
+                    )
+                }
                 Some(approval) => {
                     let mut body = if approval.kind.starts_with("user_question") {
                         "Input needed".to_string()
@@ -1980,12 +2001,12 @@ fn rebaseline_event_cursor(connection: &Connection, sequence: u64) -> StoreResul
     set_metadata(connection, "wakterm_event_cursor", &sequence.to_string())
 }
 
-fn find_outbox_agent(
+fn find_delivered_outbox(
     connection: &Connection,
     channel: ChannelKind,
     destination: &str,
     external_receipt: &str,
-) -> StoreResult<Option<AgentBinding>> {
+) -> StoreResult<Option<OutboxItem>> {
     let json = connection
         .query_row(
             "SELECT record_json FROM outbox
@@ -1996,13 +2017,8 @@ fn find_outbox_agent(
             |row| row.get::<_, String>(0),
         )
         .optional()?;
-    json.map(|value| {
-        serde_json::from_str::<OutboxItem>(&value)
-            .map(|item| item.source_agent)
-            .map_err(StoreError::from)
-    })
-    .transpose()
-    .map(Option::flatten)
+    json.map(|value| serde_json::from_str::<OutboxItem>(&value).map_err(StoreError::from))
+        .transpose()
 }
 
 fn accept_inbox(connection: &Connection, item: &InboxItem) -> StoreResult<bool> {

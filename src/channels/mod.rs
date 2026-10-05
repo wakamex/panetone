@@ -4,6 +4,7 @@ mod real;
 
 pub use fake::{ChannelCall, ChannelError, RecordingChannels};
 pub use inbound::{
-    InboundBatch, InboundMessage, SignalSubscriber, TelegramApprovalResponse, TelegramPoller,
+    InboundBatch, InboundMessage, SignalSubscriber, TelegramApprovalResponse, TelegramFormTap,
+    TelegramPoller,
 };
 pub use real::{ChannelDeliveryError, DeliveryReceipt, RealChannels, SignalClient, TelegramClient};

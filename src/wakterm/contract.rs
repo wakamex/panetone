@@ -72,6 +72,19 @@ pub struct ApprovalRequest {
     pub command: Option<String>,
     pub cwd: Option<String>,
     pub choices: Vec<ApprovalChoice>,
+    /// The structured questions of a Claude question form, in asking order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<ApprovalQuestion>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ApprovalQuestion {
+    pub index: usize,
+    pub header: String,
+    pub question: String,
+    #[serde(default)]
+    pub multi_select: bool,
+    pub options: Vec<ApprovalChoice>,
 }
 
 fn command_approval_kind() -> String {

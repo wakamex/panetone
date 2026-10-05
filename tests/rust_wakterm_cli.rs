@@ -188,6 +188,7 @@ fi
             "agent-zola",
             "incarnation-zola-7",
             "allow_once",
+            None,
         )
         .await
         .unwrap();

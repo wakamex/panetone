@@ -75,6 +75,8 @@ Passive agent output produced while Panetone is stopped is skipped on the next s
 
 Managed Codex command approvals and blocking single-choice questions, plus observer-backed Claude single-choice questions, appear in the route's Telegram topic with Wakterm's advertised choices as inline buttons. Only `WAK_TG_OWNER` can resolve them. Panetone recovers the exact agent and incarnation from the durable event and delegates resolution to Wakterm. Codex is answered through its native app-server request. Wakterm validates a Claude question against the exact live transcript and submits the selected label to that pane's native question UI. Repeated buttons, replaced agents, and provider-resolved prompts are rejected as stale. The primary Telegram bot owns these interactive messages so the same bot also receives their callback updates.
 
+A Claude question form with several questions or multi-select answers appears as one message listing every question, with a button per option. Tapping records an answer and updates the message, and a reply to the message such as `1: your answer` records a typed answer. Submit sends all answers through Wakterm, which checks Claude's review screen before submitting; "Chat about this" and Cancel close the form the other ways. This needs Wakterm's `question_form_answers.v1`; without it, a form is posted as text to answer in the agent's pane.
+
 Signal is optional. All three variables are required when it is enabled:
 
 ```text

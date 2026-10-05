@@ -664,28 +664,36 @@ impl WaktermCli {
         agent_id: &str,
         incarnation_id: &str,
         choice_id: &str,
+        answers: Option<&str>,
     ) -> Result<ApprovalResolution, WaktermCliError> {
         let capabilities = self.capabilities().await?;
         if !capabilities.capabilities.contains("approval_control.v1") {
             return Err(WaktermCliError::MissingCapability("approval_control.v1"));
         }
-        let resolution: ApprovalResolution = self
-            .run_json(
-                &[
-                    "agent",
-                    "approval",
-                    "--request-id",
-                    request_id,
-                    "--agent-id",
-                    agent_id,
-                    "--incarnation",
-                    incarnation_id,
-                    "--choice",
-                    choice_id,
-                ],
-                None,
-            )
-            .await?;
+        let mut args = vec![
+            "agent",
+            "approval",
+            "--request-id",
+            request_id,
+            "--agent-id",
+            agent_id,
+            "--incarnation",
+            incarnation_id,
+            "--choice",
+            choice_id,
+        ];
+        if let Some(answers) = answers {
+            if !capabilities
+                .capabilities
+                .contains("question_form_answers.v1")
+            {
+                return Err(WaktermCliError::MissingCapability(
+                    "question_form_answers.v1",
+                ));
+            }
+            args.extend(["--answers", answers]);
+        }
+        let resolution: ApprovalResolution = self.run_json(&args, None).await?;
         if resolution.schema != "wakterm.agent-approval.v1"
             || resolution.request_id != request_id
             || resolution.agent_id != agent_id

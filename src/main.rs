@@ -12,7 +12,7 @@ use panetone::control::{
     CONTROL_SCHEMA, ControlRequest, ControlServer, OutputDispositionParams, RouteEnsureParams,
     RouteInspectParams, SendParams, SourceAgent, request,
 };
-use panetone::service::{InboundIngestor, ProductionService};
+use panetone::service::{FormUpdate, InboundIngestor, ProductionService};
 use panetone::store::StoreHandle;
 use panetone::supervisor::{Supervisor, TaskPolicy, run_periodic};
 use panetone::wakterm::{EventRead, EventRecord, WaktermCli, resume_cursor};
@@ -493,6 +493,25 @@ async fn offline_events(wakterm: &WaktermCli, cursor: u64, head: u64) -> Result<
     Ok(events)
 }
 
+/// Shows a form's current answers. A failed edit leaves the earlier text,
+/// so it is logged rather than failing the inbound worker.
+async fn edit_form_message(poller: &TelegramPoller, update: &FormUpdate) {
+    if let Err(error) = poller
+        .edit_message(update.message_id, &update.text, &update.actions)
+        .await
+    {
+        tracing::warn!(message_id = update.message_id, error = %error, "question form edit failed");
+    }
+}
+
+/// Telegram limits callback answers to 200 characters.
+fn callback_text(text: &str) -> String {
+    match text.char_indices().nth(199) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_string(),
+    }
+}
+
 async fn run_production_worker(
     service: &ProductionService,
     worker: ProductionWorker,
@@ -589,9 +608,42 @@ async fn telegram_loop(
                 .await
                 .map_err(|error| error.to_string())?;
         }
+        for tap in std::mem::take(&mut batch.form_taps) {
+            let result = if tap.sender_id == owner {
+                service.answer_form_tap(&tap).await
+            } else {
+                Err("Only the configured owner can answer questions".into())
+            };
+            let toast = match result {
+                Ok(update) => {
+                    edit_form_message(&poller, &update).await;
+                    update.toast
+                }
+                Err(error) => {
+                    tracing::warn!(request_id = %tap.request_id, error = %error, "question form tap was rejected");
+                    error
+                }
+            };
+            poller
+                .answer_callback(&tap.query_id, &callback_text(&toast))
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         batch
             .messages
             .retain(|message| message.sender_id.as_deref() == Some(owner.as_str()));
+        // A reply to a question form message is a typed answer, not a prompt.
+        let mut prompts = Vec::with_capacity(batch.messages.len());
+        for message in std::mem::take(&mut batch.messages) {
+            match service.answer_form_reply(&message).await {
+                Ok(None) => prompts.push(message),
+                Ok(Some(update)) => edit_form_message(&poller, &update).await,
+                Err(error) => {
+                    tracing::warn!(error = %error, "question form reply was rejected");
+                }
+            }
+        }
+        batch.messages = prompts;
         ingestor
             .persist_telegram_batch("telegram_update_offset", batch, wall_now_ms())
             .await

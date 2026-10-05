@@ -7,17 +7,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::channels::{InboundMessage, TelegramFormTap};
 use crate::channels::{RealChannels, TelegramApprovalResponse};
 use crate::control::{
     CONTROL_SCHEMA, ControlHandler, ControlRequest, ControlResponse, OutputDispositionParams,
     RouteEnsureParams, RouteInspectParams, SendParams, error_response, success_response,
 };
 use crate::domain::{
-    AdmissionStatus, AgentBinding, ChannelBinding, ChannelKind, EffectId, OutboxItem, OutboxState,
-    Route, RouteId, WorkflowId, WorkflowState,
+    AdmissionStatus, AgentBinding, ChannelBinding, ChannelKind, EffectId, OutboxAction, OutboxItem,
+    OutboxState, Route, RouteId, WorkflowId, WorkflowState,
 };
-use crate::store::{EventCursorGap, InboxItem, RouteAgent, StoreHandle};
+use crate::store::{EventCursorGap, InboxItem, RouteAgent, StoreHandle, StoredApproval};
 use crate::supervisor::SupervisorHandle;
+use crate::wakterm::form::{self, FormAction, FormState};
 use crate::wakterm::{EventRead, LiveRouteSnapshot, TerminalResult, WaktermCli, WaktermCliError};
 
 use super::offline::channel_destination;
@@ -42,6 +44,16 @@ pub struct ProductionService {
     /// reported only when it persists across two passes, because a starting or
     /// restored agent is briefly unregistered or unobserved.
     health_candidates: tokio::sync::Mutex<BTreeSet<String>>,
+}
+
+/// A question form message to update after an answer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FormUpdate {
+    /// The short confirmation shown to the user.
+    pub toast: String,
+    pub message_id: i64,
+    pub text: String,
+    pub actions: Vec<OutboxAction>,
 }
 
 /// Route health metadata key: reported agent problems by problem key.
@@ -89,10 +101,178 @@ impl ProductionService {
                 &stored.request.agent_id,
                 &stored.request.incarnation_id,
                 &choice.id,
+                None,
             )
             .await
             .map_err(error_string)?;
         Ok(choice.label.clone())
+    }
+
+    /// Applies a tap on a question form message and returns the confirmation
+    /// to show, with the form's updated text and buttons.
+    pub async fn answer_form_tap(&self, tap: &TelegramFormTap) -> Result<FormUpdate, String> {
+        let stored = self.form_request(&tap.request_id, &tap.destination).await?;
+        let mut state = self.form_state(&tap.request_id).await?;
+        if state.closed.is_some() {
+            return Err("this form was already answered".into());
+        }
+        let toast = match tap.action {
+            FormAction::Option { question, option } => {
+                form::tap(&stored.request, &mut state, question, option)?
+            }
+            FormAction::Submit => {
+                let answers = form::answers_json(&state);
+                self.close_form(&stored, &mut state, "submit", Some(&answers), "Submitted.")
+                    .await?
+            }
+            FormAction::Chat => {
+                self.close_form(
+                    &stored,
+                    &mut state,
+                    "chat",
+                    None,
+                    "Sent back to the agent to chat about.",
+                )
+                .await?
+            }
+            FormAction::Cancel => {
+                self.close_form(&stored, &mut state, "cancel", None, "Cancelled.")
+                    .await?
+            }
+        };
+        self.save_form_state(&tap.request_id, &state).await?;
+        Ok(FormUpdate {
+            toast,
+            message_id: tap.message_id,
+            text: form::text(&stored.request, &state),
+            actions: form::actions(&stored.request, &state),
+        })
+    }
+
+    /// Records a reply to a question form message as a typed answer. Returns
+    /// `None` when the message does not reply to an open form.
+    pub async fn answer_form_reply(
+        &self,
+        message: &InboundMessage,
+    ) -> Result<Option<FormUpdate>, String> {
+        let Some(reply_to) = message.reply_to_external_id.clone() else {
+            return Ok(None);
+        };
+        let Some(posted) = self
+            .store
+            .find_delivered_outbox(
+                message.channel,
+                message.destination.clone(),
+                reply_to.clone(),
+            )
+            .await
+            .map_err(error_string)?
+        else {
+            return Ok(None);
+        };
+        let Some((request_id, _)) = posted
+            .actions
+            .first()
+            .and_then(|action| form::parse_callback(&action.id))
+        else {
+            return Ok(None);
+        };
+        let message_id = reply_to
+            .parse()
+            .map_err(|_| "the form message id is invalid".to_string())?;
+        let stored = self.form_request(&request_id, &message.destination).await?;
+        let mut state = self.form_state(&request_id).await?;
+        if state.closed.is_some() {
+            return Err("this form was already answered".into());
+        }
+        let toast = match form::parse_reply(&message.body) {
+            Some((question, text)) => {
+                form::type_answer(&stored.request, &mut state, question, text)?
+            }
+            None => {
+                "Start a typed answer with its question number, for example \"1: your answer\"."
+                    .into()
+            }
+        };
+        self.save_form_state(&request_id, &state).await?;
+        Ok(Some(FormUpdate {
+            toast,
+            message_id,
+            text: form::text(&stored.request, &state),
+            actions: form::actions(&stored.request, &state),
+        }))
+    }
+
+    async fn form_request(
+        &self,
+        request_id: &str,
+        destination: &str,
+    ) -> Result<StoredApproval, String> {
+        let stored = self
+            .store
+            .get_approval(request_id.to_string())
+            .await
+            .map_err(error_string)?
+            .ok_or_else(|| "this form is unknown or expired".to_string())?;
+        let route = self
+            .store
+            .get_route(stored.route_id)
+            .await
+            .map_err(error_string)?
+            .ok_or_else(|| "this form's route no longer exists".to_string())?;
+        let in_topic = route.channels.iter().any(|binding| {
+            matches!(binding, ChannelBinding::Telegram { topic_id } if topic_id.to_string() == destination)
+        });
+        if !in_topic || !form::answerable(&stored.request) {
+            return Err("this form does not belong to this topic".into());
+        }
+        Ok(stored)
+    }
+
+    async fn form_state(&self, request_id: &str) -> Result<FormState, String> {
+        match self
+            .store
+            .get_metadata(format!("form:{request_id}"))
+            .await
+            .map_err(error_string)?
+        {
+            Some(json) => serde_json::from_str(&json).map_err(error_string),
+            None => Ok(FormState::default()),
+        }
+    }
+
+    async fn save_form_state(&self, request_id: &str, state: &FormState) -> Result<(), String> {
+        self.store
+            .set_metadata(
+                format!("form:{request_id}"),
+                serde_json::to_string(state).map_err(error_string)?,
+            )
+            .await
+            .map_err(error_string)
+    }
+
+    /// Resolves the form through Wakterm. A refusal, such as Wakterm stopping
+    /// before submitting, leaves the form open and is shown to the user.
+    async fn close_form(
+        &self,
+        stored: &StoredApproval,
+        state: &mut FormState,
+        choice: &str,
+        answers: Option<&str>,
+        closed: &str,
+    ) -> Result<String, String> {
+        self.wakterm
+            .resolve_approval(
+                &stored.request.request_id,
+                &stored.request.agent_id,
+                &stored.request.incarnation_id,
+                choice,
+                answers,
+            )
+            .await
+            .map_err(error_string)?;
+        state.closed = Some(closed.to_string());
+        Ok(closed.to_string())
     }
 
     pub fn new(
@@ -1797,6 +1977,185 @@ fi
                 .starts_with("[Resolved] Wakterm cannot read")
         );
         assert!(service.reported_problems().await.unwrap().is_empty());
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_question_form_is_answered_by_taps_and_a_reply_then_submitted() {
+        let directory = tempdir().unwrap();
+        let calls = directory.path().join("approval-args.log");
+        let binary = directory.path().join("wakterm-fake");
+        fs::write(
+            &binary,
+            format!(
+                r#"#!/bin/bash
+set -euo pipefail
+operation="$*"
+if [[ "$operation" == *"agent capabilities"* ]]; then
+  echo '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1","approval_control.v1","question_form_answers.v1"]}}'
+elif [[ "$operation" == *"agent approval"* ]]; then
+  printf '%s\n' "$@" > '{}'
+  choice=""; previous=""
+  for argument in "$@"; do
+    if [[ "$previous" == "--choice" ]]; then choice="$argument"; fi
+    previous="$argument"
+  done
+  echo '{{"schema":"wakterm.agent-approval.v1","request_id":"0123456789abcdef01234567","agent_id":"agent-route","incarnation_id":"inc-route","choice_id":"'"$choice"'","resolved":true}}'
+else
+  echo "unexpected fake invocation: $operation" >&2
+  exit 9
+fi
+"#,
+                calls.display()
+            ),
+        )
+        .unwrap();
+        crate::test_support::seal_executable(&binary);
+        let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        let route = Route {
+            id: RouteId::new(Uuid::new_v4()),
+            title: "route".into(),
+            channels: vec![ChannelBinding::Telegram { topic_id: 10 }],
+            agent: None,
+        };
+        store.save_route(route.clone(), 1).await.unwrap();
+        store.initialize_event_cursor(100).await.unwrap();
+        // A form in the shape Wakterm documents for question_form_answers.v1.
+        let event: crate::wakterm::EventRecord = serde_json::from_value(json!({
+            "sequence": 101,
+            "event_id": "form-event-101",
+            "kind": "approval_requested",
+            "agent_id": "agent-route",
+            "incarnation_id": "inc-route",
+            "observed_at": "2026-10-05T04:44:00Z",
+            "approval": {
+                "schema": "wakterm.agent-approval.v1",
+                "kind": "user_question_form",
+                "request_id": "0123456789abcdef01234567",
+                "agent_id": "agent-route",
+                "incarnation_id": "inc-route",
+                "turn_id": "turn-1",
+                "item_id": "item-1",
+                "observed_at": "2026-10-05T04:44:00Z",
+                "prompt": "1. Browser: Which browser?\n- Chrome\n- Edge\n\n2. Lifetime: How to start?\n- Browser\n- Worker",
+                "reason": null,
+                "command": null,
+                "cwd": null,
+                "choices": [],
+                "questions": [
+                    {"index": 0, "header": "Browser", "question": "Which browser?", "multi_select": false,
+                     "options": [{"id": "option_1", "label": "Chrome"}, {"id": "option_2", "label": "Edge"}]},
+                    {"index": 1, "header": "Lifetime", "question": "How to start?", "multi_select": false,
+                     "options": [{"id": "option_1", "label": "Browser"}, {"id": "option_2", "label": "Worker"}]}
+                ]
+            }
+        }))
+        .unwrap();
+        let agent = AgentBinding {
+            agent_id: "agent-route".into(),
+            incarnation_id: "inc-route".into(),
+            harness: "claude".into(),
+            pane_id: Some(1),
+        };
+        store
+            .ingest_agent_events(
+                100,
+                101,
+                vec![event],
+                vec![RouteAgent {
+                    route_id: route.id,
+                    agent,
+                    working_directory: None,
+                }],
+                2,
+            )
+            .await
+            .unwrap();
+        let mut posted = store.pending_outbox().await.unwrap().remove(0);
+        assert!(
+            posted.body.contains(
+                "1. Browser: Which browser?\n1) Chrome\n2) Edge\nAnswer: not answered yet"
+            )
+        );
+        assert_eq!(posted.actions.len(), 7);
+        posted.state = OutboxState::Delivered;
+        posted.external_receipt = Some("555".into());
+        store.save_outbox(posted, 3).await.unwrap();
+
+        let service = ProductionService::new(
+            store.clone(),
+            WaktermCli::new(
+                binary,
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            RealChannels::default(),
+            SupervisorHandle::default(),
+            Vec::new(),
+            directory.path().join("control.sock"),
+        );
+        let tap = |action| TelegramFormTap {
+            query_id: "query".into(),
+            destination: "10".into(),
+            sender_id: "42".into(),
+            message_id: 555,
+            request_id: "0123456789abcdef01234567".into(),
+            action,
+        };
+        let update = service
+            .answer_form_tap(&tap(FormAction::Option {
+                question: 1,
+                option: 1,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(update.toast, "Lifetime: Browser");
+        assert_eq!(update.message_id, 555);
+        assert!(update.text.contains("Answer: Browser"));
+
+        let reply = |body: &str, reply_to: &str| InboundMessage {
+            channel: ChannelKind::Telegram,
+            external_id: "update-1".into(),
+            destination: "10".into(),
+            sender_id: Some("42".into()),
+            sender: None,
+            reply_to_external_id: Some(reply_to.into()),
+            body: body.into(),
+        };
+        // A reply to anything else is an ordinary prompt.
+        assert!(
+            service
+                .answer_form_reply(&reply("hello", "10"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let update = service
+            .answer_form_reply(&reply("1: new chrome profile", "555"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(update.text.contains("Answer: \"new chrome profile\""));
+
+        let update = service
+            .answer_form_tap(&tap(FormAction::Submit))
+            .await
+            .unwrap();
+        assert_eq!(update.toast, "Submitted.");
+        assert!(update.actions.is_empty());
+        let args = fs::read_to_string(&calls).unwrap();
+        assert!(args.contains("--choice\nsubmit\n--answers\n"));
+        assert!(args.contains(
+            r#"[{"question":0,"text":"new chrome profile"},{"choices":["option_1"],"question":1}]"#
+        ));
+        assert_eq!(
+            service
+                .answer_form_tap(&tap(FormAction::Cancel))
+                .await
+                .unwrap_err(),
+            "this form was already answered"
+        );
         drop(service);
         store.shutdown().await.unwrap();
     }
