@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -39,9 +40,90 @@ impl SupervisorHandle {
             .lock()
             .expect("supervisor health lock is healthy")
             .values()
-            .any(|health| health.state == "failed")
+            .any(|health| health.state == "failed" || health.state == "retrying")
+    }
+
+    /// Records a running task's state, such as `retrying`, without ending it.
+    pub fn report(&self, name: &str, state: &str, last_error: Option<String>) {
+        if let Some(health) = self
+            .tasks
+            .lock()
+            .expect("supervisor health lock is healthy")
+            .get_mut(name)
+        {
+            health.state = state.into();
+            health.last_error = last_error;
+        }
     }
 }
+
+/// Runs `step` every `period` until shutdown. A failed step is reported as
+/// `retrying` and retried after a backoff that starts at `first_backoff` and
+/// doubles up to `MAX_RETRY_BACKOFF`, so one failing dependency cannot stop
+/// the daemon's other tasks.
+pub async fn run_periodic<F, Fut>(
+    name: &str,
+    health: SupervisorHandle,
+    period: Duration,
+    first_backoff: Duration,
+    mut shutdown: watch::Receiver<bool>,
+    mut step: F,
+) -> Result<(), String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut backoff = first_backoff;
+    let mut failing = false;
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+                continue;
+            }
+            _ = interval.tick() => {}
+        }
+        let result = tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+                continue;
+            }
+            result = step() => result,
+        };
+        match result {
+            Ok(()) => {
+                if failing {
+                    tracing::info!(task = name, "task recovered");
+                    health.report(name, "running", None);
+                    failing = false;
+                    backoff = first_backoff;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(task = name, %error, ?backoff, "task failed; retrying");
+                health.report(name, "retrying", Some(error));
+                failing = true;
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            return Ok(());
+                        }
+                    }
+                    () = tokio::time::sleep(backoff) => {}
+                }
+                backoff = (backoff * 2).min(MAX_RETRY_BACKOFF);
+            }
+        }
+    }
+}
+
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 struct TaskExit {
     name: String,

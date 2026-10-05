@@ -14,7 +14,7 @@ use panetone::control::{
 };
 use panetone::service::{InboundIngestor, ProductionService};
 use panetone::store::StoreHandle;
-use panetone::supervisor::{Supervisor, TaskPolicy};
+use panetone::supervisor::{Supervisor, TaskPolicy, run_periodic};
 use panetone::wakterm::WaktermCli;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -339,8 +339,17 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
     ] {
         let service = handler.clone();
         let shutdown = supervisor.shutdown_receiver();
+        let health = supervisor.handle();
         supervisor.spawn(name, TaskPolicy::Critical, async move {
-            production_worker_loop(service, worker, worker_period, shutdown).await
+            run_periodic(
+                name,
+                health,
+                worker_period,
+                Duration::from_secs(1),
+                shutdown,
+                || run_production_worker(&service, worker),
+            )
+            .await
         });
     }
     if let Some((poller, owner)) = telegram {
@@ -435,35 +444,6 @@ fn production_channels(args: &ProductionArgs, deadline: Duration) -> Result<Prod
     };
 
     Ok((channels, telegram, signal))
-}
-
-async fn production_worker_loop(
-    service: Arc<ProductionService>,
-    worker: ProductionWorker,
-    period: Duration,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) -> Result<(), String> {
-    let mut interval = tokio::time::interval(period);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return Ok(());
-                }
-            }
-            _ = interval.tick() => {
-                tokio::select! {
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            return Ok(());
-                        }
-                    }
-                    result = run_production_worker(&service, worker) => result?,
-                }
-            }
-        }
-    }
 }
 
 async fn run_production_worker(

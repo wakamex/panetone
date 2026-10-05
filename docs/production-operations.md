@@ -173,6 +173,8 @@ terminate the critical worker and fail the daemon.
 
 Signal inbound reconnects after subscription timeouts and transport disconnects with the same one-to-30-second bounded backoff. A signal-cli restart therefore does not restart Panetone or interrupt its other workers.
 
+The event, outbox, inbox, busy-target and return workers retry a failed pass in place with the same one-to-30-second backoff instead of stopping the daemon, so a broken Wakterm event stream leaves channel input, agent sends and channel output running. While a worker fails, `panetone status` shows it as `retrying` with its last error, and it returns to `running` after a successful pass.
+
 ## Durable failure rules
 
 - Never replay an indeterminate prompt merely because the daemon restarted.
