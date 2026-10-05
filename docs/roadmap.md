@@ -2,12 +2,6 @@
 
 Open work, in priority order. Finished work is recorded in git history, so delete an item when it lands.
 
-## Final callbacks from every harness
-
-`--return-final` only works when the target runs on Codex, so a caller that needs a reply from a Claude Code session uses Claude Code's own messaging instead of Panetone. Wakterm now confirms that an admitted prompt started a turn. If that confirmation names the turn, Panetone can bind the prompt to it and return the turn's final response for any harness.
-
-Depends on: Wakterm reporting the started turn's ID with the admission receipt.
-
 ## One lifecycle for every inbound message
 
 Telegram and Signal input goes through a separate inbox path with its own string states, processed one item at a time, while local sends use the durable workflow. Moving channel input onto the workflow gives it the same busy queue, steering, final binding and unconfirmed-delivery handling, and lets one slow admission stop blocking messages to other agents.
