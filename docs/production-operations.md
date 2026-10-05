@@ -148,7 +148,7 @@ before the real prompt, not remote delivery confirmation.
 
 ## Offline output and Telegram pacing
 
-Normal startup preserves already captured outbox effects and advances the Wakterm event cursor to the current catalog head, skipping only agent output first observed while Panetone was stopped. It also preserves accepted Telegram or Signal input, explicit workflow effects, busy work, and pending final returns.
+Normal startup preserves already captured outbox effects and skips stale agent output first observed while Panetone was stopped. It resumes the Wakterm event cursor just before the first offline event observed in the last 10 minutes or the first question an agent is still waiting on, so a restart for a deploy or crash loses nothing and an unanswered question still reaches its channel. Older offline output is skipped. It also preserves accepted Telegram or Signal input, explicit workflow effects, busy work, and pending final returns.
 
 For a deliberate catch-up start, set
 `PANETONE_REPLAY_OFFLINE_OUTPUT=true` in `/code/panetone/.env`, restart the

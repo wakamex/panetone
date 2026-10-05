@@ -368,3 +368,108 @@ fn validate_events(events: &[EventRecord]) -> Result<(), ContractError> {
     }
     Ok(())
 }
+
+/// Output observed this recently before a restart is still delivered.
+pub const RECENT_OUTPUT_MS: i64 = 10 * 60 * 1000;
+
+/// The event cursor to resume from after a restart, given the events produced
+/// while Panetone was stopped. Older output is skipped so a long outage does not
+/// flood the channels, but recent output and questions an agent is still waiting
+/// on are delivered: resumption starts just before the first such event, or at
+/// `head` when there is none.
+pub fn resume_cursor(events: &[EventRecord], head: u64, now_ms: i64) -> u64 {
+    events
+        .iter()
+        .enumerate()
+        .find(|(index, event)| {
+            let recent = event
+                .fields
+                .get("observed_at")
+                .and_then(Value::as_str)
+                .and_then(utc_millis)
+                .is_none_or(|observed| observed >= now_ms - RECENT_OUTPUT_MS);
+            recent
+                || (event.kind == "approval_requested" && unanswered(event, &events[index + 1..]))
+        })
+        .map_or(head, |(_, event)| event.sequence - 1)
+}
+
+/// A question is unanswered while its agent incarnation has made no progress
+/// after asking it.
+fn unanswered(question: &EventRecord, later: &[EventRecord]) -> bool {
+    !later.iter().any(|event| {
+        event.agent_id == question.agent_id
+            && event.incarnation_id == question.incarnation_id
+            && matches!(
+                event.kind.as_str(),
+                "turn_started" | "plan" | "assistant_message" | "turn_final" | "agent_lifecycle"
+            )
+    })
+}
+
+/// Milliseconds since the Unix epoch for an RFC 3339 timestamp such as
+/// `2026-10-05T03:48:29.668Z`.
+fn utc_millis(timestamp: &str) -> Option<i64> {
+    let parsed =
+        time::OffsetDateTime::parse(timestamp, &time::format_description::well_known::Rfc3339)
+            .ok()?;
+    i64::try_from(parsed.unix_timestamp_nanos() / 1_000_000).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: i64 = 1_791_172_109_668; // 2026-10-05T03:48:29.668Z
+
+    fn event(sequence: u64, agent: &str, kind: &str, observed_at: &str) -> EventRecord {
+        EventRecord {
+            sequence,
+            event_id: format!("event-{sequence}"),
+            kind: kind.into(),
+            agent_id: agent.into(),
+            incarnation_id: format!("{agent}-1"),
+            fields: serde_json::Map::from_iter([("observed_at".into(), observed_at.into())]),
+        }
+    }
+
+    const OLD: &str = "2026-10-05T03:30:00Z";
+    const RECENT: &str = "2026-10-05T03:45:00.5Z";
+
+    #[test]
+    fn utc_timestamps_convert_to_epoch_milliseconds() {
+        assert_eq!(utc_millis("2026-10-05T03:48:29.668Z"), Some(NOW));
+        assert_eq!(
+            utc_millis("2024-02-29T23:59:59.005123Z"),
+            Some(1_709_251_199_005)
+        );
+        assert_eq!(utc_millis("2026-10-05 03:48:29"), None);
+    }
+
+    #[test]
+    fn stale_output_is_skipped_and_recent_output_is_replayed() {
+        let events = [
+            event(11, "a", "assistant_message", OLD),
+            event(12, "a", "assistant_message", RECENT),
+        ];
+        assert_eq!(resume_cursor(&events[..1], 20, NOW), 20);
+        assert_eq!(resume_cursor(&events, 20, NOW), 11);
+    }
+
+    #[test]
+    fn an_unanswered_question_is_replayed_however_old() {
+        let events = [
+            event(11, "a", "assistant_message", OLD),
+            event(12, "a", "approval_requested", OLD),
+            event(13, "b", "assistant_message", OLD),
+            event(14, "a", "turn_state_changed", OLD),
+        ];
+        assert_eq!(resume_cursor(&events, 20, NOW), 11);
+
+        let answered = [
+            event(12, "a", "approval_requested", OLD),
+            event(13, "a", "assistant_message", OLD),
+        ];
+        assert_eq!(resume_cursor(&answered, 20, NOW), 20);
+    }
+}

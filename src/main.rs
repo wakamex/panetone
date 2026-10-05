@@ -15,7 +15,7 @@ use panetone::control::{
 use panetone::service::{InboundIngestor, ProductionService};
 use panetone::store::StoreHandle;
 use panetone::supervisor::{Supervisor, TaskPolicy, run_periodic};
-use panetone::wakterm::WaktermCli;
+use panetone::wakterm::{EventRead, EventRecord, WaktermCli, resume_cursor};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -272,11 +272,25 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
             .await
             .context("initialize Wakterm event cursor")?
     } else {
-        store
-            .rebaseline_event_cursor(catalog.as_of_event_sequence)
+        let head = catalog.as_of_event_sequence;
+        let resume = match store
+            .status()
             .await
-            .context("skip offline Wakterm output")?;
-        catalog.as_of_event_sequence
+            .context("read event cursor")?
+            .event_cursor
+        {
+            Some(cursor) if cursor < head => resume_cursor(
+                &offline_events(&wakterm, cursor, head).await?,
+                head,
+                wall_now_ms(),
+            ),
+            _ => head,
+        };
+        store
+            .rebaseline_event_cursor(resume)
+            .await
+            .context("skip stale offline Wakterm output")?;
+        resume
     };
     if let Some((poller, _)) = telegram.as_ref()
         && store
@@ -444,6 +458,31 @@ fn production_channels(args: &ProductionArgs, deadline: Duration) -> Result<Prod
     };
 
     Ok((channels, telegram, signal))
+}
+
+/// The Wakterm events after `cursor` up to `head`, produced while Panetone was
+/// stopped. A cursor older than Wakterm retains yields none.
+async fn offline_events(wakterm: &WaktermCli, cursor: u64, head: u64) -> Result<Vec<EventRecord>> {
+    let mut events = Vec::new();
+    let mut after = cursor;
+    while after < head {
+        match wakterm
+            .event_page(after, 1000)
+            .await
+            .context("read offline Wakterm events")?
+        {
+            EventRead::Events {
+                events: page,
+                next_after_sequence,
+                ..
+            } if next_after_sequence > after => {
+                events.extend(page.into_iter().filter(|event| event.sequence <= head));
+                after = next_after_sequence;
+            }
+            _ => break,
+        }
+    }
+    Ok(events)
 }
 
 async fn run_production_worker(
