@@ -192,6 +192,10 @@ accepted by the current CLI and is not a rollback target. After Rust processed
 real channel and Wakterm effects, restoring the Python snapshot would lose or
 duplicate post-cutover state.
 
+## Route health
+
+The `route-health` worker checks every 60 seconds for live Claude or Codex agents in a routed tab that Panetone cannot fully use: an agent Wakterm detected but did not register, so messages in that route's channel are not delivered to it, and a registered agent whose output Wakterm cannot read, so its replies are not forwarded. A problem that persists across two checks is posted once in that route's channel as `[Agent problem]`, and as `[Resolved]` when it clears. Reported problems survive restarts in store metadata, and `panetone status` lists them under `degraded_routes`.
+
 ## Watch for silent failures
 
 `scripts/watch.py` runs every 5 minutes from the user units `panetone-watch.service` and `panetone-watch.timer` in `~/.config/systemd/user/`. It reads the store read-only and Wakterm's agent list, and sends one Panetone message to the `panetone` route listing problems it has not reported before:
@@ -200,7 +204,4 @@ duplicate post-cutover state.
 - inbound messages that are unconfirmed or still undelivered after 10 minutes
 - agent-to-agent sends and final returns that are unconfirmed
 - Panetone workers that are not running, once per failure
-- registered Claude or Codex agents with a plain PTY transport, whose output is not forwarded
-- detected Claude or Codex agents in a routed tab, which Panetone ignores until they are registered
-
-Agent problems are reported only after they persist across two runs, because a starting or restored agent is briefly unobserved. Reported problems are recorded in `~/.local/state/panetone-rust/watch.json` before the message is sent, so an unconfirmed report is never repeated, and the watcher ignores its own reports. Deleting that file makes the next run record a silent baseline. Run the tests with `python3 -m unittest test_watch` from `scripts/`.
+Reported problems are recorded in `~/.local/state/panetone-rust/watch.json` before the message is sent, so an unconfirmed report is never repeated, and the watcher ignores its own reports. Deleting that file makes the next run record a silent baseline. Run the tests with `python3 -m unittest test_watch` from `scripts/`.

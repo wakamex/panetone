@@ -196,6 +196,99 @@ struct AgentPaneMetadata {
     declared_cwd: Option<PathBuf>,
 }
 
+/// One entry of `wakterm agent list`, as far as agent health needs it.
+#[derive(Deserialize)]
+struct ListedAgent {
+    pane_id: u64,
+    origin: String,
+    metadata: ListedAgentMetadata,
+    runtime: ListedAgentRuntime,
+}
+
+#[derive(Deserialize)]
+struct ListedAgentMetadata {
+    agent_id: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct ListedAgentRuntime {
+    harness: String,
+    transport: String,
+    alive: bool,
+}
+
+/// A live Claude or Codex agent that Panetone cannot fully use, in the tab
+/// whose effective title is `title`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentProblem {
+    pub title: String,
+    pub agent_id: String,
+    pub agent_name: String,
+    pub pane_id: u64,
+    pub kind: AgentProblemKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentProblemKind {
+    /// Wakterm detected the agent but has not registered it, so Panetone
+    /// cannot deliver to it.
+    Unregistered,
+    /// The agent is registered but Wakterm cannot read its output, so its
+    /// replies are not forwarded and prompts to it come back unconfirmed.
+    Unobserved,
+}
+
+impl AgentProblem {
+    /// Identifies the problem across checks and restarts.
+    pub fn key(&self) -> String {
+        format!("{}:{:?}", self.agent_id, self.kind)
+    }
+
+    pub fn description(&self) -> String {
+        match self.kind {
+            AgentProblemKind::Unregistered => format!(
+                "{} (pane {}) is running in this tab but is not registered with Wakterm, so messages here are not delivered to it.",
+                self.agent_name, self.pane_id
+            ),
+            AgentProblemKind::Unobserved => format!(
+                "Wakterm cannot read the output of {} (pane {}), so its replies do not appear here and messages to it come back unconfirmed.",
+                self.agent_name, self.pane_id
+            ),
+        }
+    }
+}
+
+fn agent_problems(panes: &[LivePane], agents: &[ListedAgent]) -> Vec<AgentProblem> {
+    agents
+        .iter()
+        .filter(|agent| {
+            agent.runtime.alive && matches!(agent.runtime.harness.as_str(), "Claude" | "Codex")
+        })
+        .filter_map(|agent| {
+            let kind = if agent.origin == "detected" {
+                AgentProblemKind::Unregistered
+            } else if agent.runtime.transport == "PlainPty" {
+                AgentProblemKind::Unobserved
+            } else {
+                return None;
+            };
+            let title = panes
+                .iter()
+                .find(|pane| pane.pane_id == agent.pane_id)?
+                .effective_title
+                .clone();
+            Some(AgentProblem {
+                title,
+                agent_id: agent.metadata.agent_id.clone(),
+                agent_name: agent.metadata.name.clone(),
+                pane_id: agent.pane_id,
+                kind,
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LiveRoute {
     pub title: String,
@@ -475,6 +568,15 @@ impl WaktermCli {
             .map(|agent| (agent.agent_id.clone(), agent.name.clone()))
             .collect();
         Ok(LiveRouteSnapshot { routes, names })
+    }
+
+    /// Live agents Panetone cannot fully use, with their tab titles.
+    pub async fn agent_problems(&self) -> Result<Vec<AgentProblem>, WaktermCliError> {
+        let panes: Vec<LivePane> = self.run_json(&["list", "--format", "json"], None).await?;
+        let agents: Vec<ListedAgent> = self
+            .run_json(&["agent", "list", "--format", "json"], None)
+            .await?;
+        Ok(agent_problems(&panes, &agents))
     }
 
     pub async fn resolve_route_binding(
@@ -945,5 +1047,42 @@ fn safe_detail(stderr: &[u8]) -> String {
         "Wakterm exited unsuccessfully without diagnostic output".into()
     } else {
         detail.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_problems_cover_unregistered_and_unobserved_live_agents() {
+        // Real `wakterm agent list` entries, with problem variants derived
+        // from a readable Claude agent.
+        let agents: Vec<ListedAgent> =
+            serde_json::from_str(include_str!("../../tests/fixtures/agent_list.json")).unwrap();
+        let panes = [1, 2, 3, 4, 5].map(|pane_id| LivePane {
+            pane_id,
+            effective_title: format!("tab-{pane_id}"),
+            cwd: None,
+        });
+
+        let problems = agent_problems(&panes, &agents);
+
+        assert_eq!(
+            problems
+                .iter()
+                .map(|problem| (
+                    problem.title.as_str(),
+                    problem.agent_name.as_str(),
+                    problem.kind
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("tab-3", "plain_claude", AgentProblemKind::Unobserved),
+                ("tab-4", "detected_claude", AgentProblemKind::Unregistered),
+            ]
+        );
+        assert_eq!(problems[0].key(), "agent-plain_claude:Unobserved");
+        assert!(problems[1].description().contains("not registered"));
     }
 }

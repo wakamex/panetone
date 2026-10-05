@@ -995,7 +995,7 @@ fn available_agent(route: &Route) -> Result<AgentBinding, ServiceError> {
         .ok_or_else(|| ServiceError::RouteUnavailable(route.title.clone()))
 }
 
-fn channel_destination(route: &Route) -> Result<(ChannelKind, String), ServiceError> {
+pub(crate) fn channel_destination(route: &Route) -> Result<(ChannelKind, String), ServiceError> {
     route
         .channels
         .first()

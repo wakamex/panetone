@@ -242,6 +242,7 @@ enum ProductionWorker {
     ReturnTerminals,
     PendingReturns,
     Inbox,
+    RouteHealth,
 }
 
 async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
@@ -350,15 +351,22 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
         ("return-terminals", ProductionWorker::ReturnTerminals),
         ("pending-returns", ProductionWorker::PendingReturns),
         ("inbox", ProductionWorker::Inbox),
+        ("route-health", ProductionWorker::RouteHealth),
     ] {
         let service = handler.clone();
         let shutdown = supervisor.shutdown_receiver();
         let health = supervisor.handle();
+        // Agent registration changes slowly, and each check reads two Wakterm lists.
+        let period = if matches!(worker, ProductionWorker::RouteHealth) {
+            Duration::from_secs(60)
+        } else {
+            worker_period
+        };
         supervisor.spawn(name, TaskPolicy::Critical, async move {
             run_periodic(
                 name,
                 health,
-                worker_period,
+                period,
                 Duration::from_secs(1),
                 shutdown,
                 || run_production_worker(&service, worker),
@@ -496,6 +504,7 @@ async fn run_production_worker(
         ProductionWorker::ReturnTerminals => service.terminal_once().await?,
         ProductionWorker::PendingReturns => service.pending_return_once().await?,
         ProductionWorker::Inbox => service.inbox_once().await?,
+        ProductionWorker::RouteHealth => service.route_health_once().await?,
     };
     Ok(())
 }

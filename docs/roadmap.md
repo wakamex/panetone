@@ -2,10 +2,6 @@
 
 Open work, in priority order. Finished work is recorded in git history, so delete an item when it lands.
 
-## Route health inside Panetone
-
-`scripts/watch.py` reports failed posts, unconfirmed deliveries, unregistered agents in routed tabs, and registered agents whose output is not forwarded, but only to the `panetone` route. A route whose agents degrade should say so in its own channel, and `panetone status` should list degraded routes.
-
 ## Callbacks to the exact caller
 
 A final callback whose original caller has exited falls back to the source route's current agent, which may be a different agent than the one that asked. The callback should go to the exact caller, or be posted to the source route's channel marked as having no caller.

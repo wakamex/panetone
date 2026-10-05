@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -19,6 +20,7 @@ use crate::store::{EventCursorGap, InboxItem, RouteAgent, StoreHandle};
 use crate::supervisor::SupervisorHandle;
 use crate::wakterm::{EventRead, LiveRouteSnapshot, TerminalResult, WaktermCli, WaktermCliError};
 
+use super::offline::channel_destination;
 use super::{OfflineService, ServiceError};
 
 /// Uncertain attempts after which an outbox item is left indeterminate
@@ -36,6 +38,20 @@ pub struct ProductionService {
     started_at: Instant,
     last_agents: tokio::sync::RwLock<HashMap<RouteId, AgentBinding>>,
     route_changes: tokio::sync::Mutex<()>,
+    /// Agent problems seen on the previous route health pass. A problem is
+    /// reported only when it persists across two passes, because a starting or
+    /// restored agent is briefly unregistered or unobserved.
+    health_candidates: tokio::sync::Mutex<BTreeSet<String>>,
+}
+
+/// Route health metadata key: reported agent problems by problem key.
+const ROUTE_HEALTH_KEY: &str = "route_health";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ReportedProblem {
+    route_id: RouteId,
+    route_title: String,
+    description: String,
 }
 
 impl ProductionService {
@@ -103,6 +119,7 @@ impl ProductionService {
             started_at: Instant::now(),
             last_agents: tokio::sync::RwLock::new(HashMap::new()),
             route_changes: tokio::sync::Mutex::new(()),
+            health_candidates: tokio::sync::Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -637,6 +654,129 @@ impl ProductionService {
             .map_err(error_string)
     }
 
+    /// Posts a notice in a route's channel when one of its agents becomes
+    /// unusable for Panetone, and again when that problem clears.
+    pub async fn route_health_once(&self) -> Result<usize, String> {
+        let problems = self.wakterm.agent_problems().await.map_err(error_string)?;
+        let routes = self.store.list_routes().await.map_err(error_string)?;
+        let current = problems
+            .into_iter()
+            .filter_map(|problem| {
+                let route = routes
+                    .iter()
+                    .find(|route| route.title.eq_ignore_ascii_case(&problem.title))?;
+                Some((
+                    problem.key(),
+                    ReportedProblem {
+                        route_id: route.id,
+                        route_title: route.title.clone(),
+                        description: problem.description(),
+                    },
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let confirmed = {
+            let mut candidates = self.health_candidates.lock().await;
+            let confirmed = current
+                .iter()
+                .filter(|(key, _)| candidates.contains(*key))
+                .map(|(key, problem)| (key.clone(), problem.clone()))
+                .collect::<BTreeMap<_, _>>();
+            *candidates = current.keys().cloned().collect();
+            confirmed
+        };
+        let mut reported = self.reported_problems().await?;
+        let mut posted = 0;
+        for (key, problem) in &confirmed {
+            if !reported.contains_key(key) {
+                self.post_route_health(key, problem, "Agent problem", now_ms())
+                    .await?;
+                reported.insert(key.clone(), problem.clone());
+                posted += 1;
+            }
+        }
+        let cleared = reported
+            .keys()
+            .filter(|key| !current.contains_key(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in cleared {
+            if let Some(problem) = reported.remove(&key) {
+                self.post_route_health(&key, &problem, "Resolved", now_ms())
+                    .await?;
+                posted += 1;
+            }
+        }
+        self.store
+            .set_metadata(
+                ROUTE_HEALTH_KEY.into(),
+                serde_json::to_string(&reported).map_err(error_string)?,
+            )
+            .await
+            .map_err(error_string)?;
+        Ok(posted)
+    }
+
+    async fn reported_problems(&self) -> Result<BTreeMap<String, ReportedProblem>, String> {
+        match self
+            .store
+            .get_metadata(ROUTE_HEALTH_KEY.into())
+            .await
+            .map_err(error_string)?
+        {
+            Some(json) => serde_json::from_str(&json).map_err(error_string),
+            None => Ok(BTreeMap::new()),
+        }
+    }
+
+    async fn post_route_health(
+        &self,
+        key: &str,
+        problem: &ReportedProblem,
+        label: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        let Some(route) = self
+            .store
+            .get_route(problem.route_id)
+            .await
+            .map_err(error_string)?
+        else {
+            return Ok(());
+        };
+        let Ok((kind, destination)) = channel_destination(&route) else {
+            return Ok(());
+        };
+        let namespace = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            b"https://panetone.dev/route-health/v1",
+        );
+        let notice = OutboxItem {
+            id: EffectId::new(Uuid::new_v5(
+                &namespace,
+                format!("{key}\0{label}\0{now_ms}").as_bytes(),
+            )),
+            route_id: Some(route.id),
+            sender_harness: None,
+            source_agent: None,
+            kind,
+            destination,
+            body: format!("[{label}] {}", problem.description),
+            attachments: Vec::new(),
+            actions: Vec::new(),
+            state: OutboxState::Pending,
+            attempts: 0,
+            last_error: None,
+            external_receipt: None,
+            uncertain_attempts: 0,
+        };
+        self.store
+            .enqueue_outbox(None, notice, now_ms)
+            .await
+            .map(|_| ())
+            .map_err(error_string)
+    }
+
     async fn handle_send(&self, request: ControlRequest, params: SendParams) -> ControlResponse {
         let id = request.id;
         if params.steer && params.return_final {
@@ -830,6 +970,15 @@ impl ProductionService {
     }
 
     async fn status_response(&self, id: Uuid) -> ControlResponse {
+        let degraded_routes = match self.reported_problems().await {
+            Ok(reported) => reported
+                .into_values()
+                .map(
+                    |problem| json!({"route": problem.route_title, "problem": problem.description}),
+                )
+                .collect::<Vec<_>>(),
+            Err(error) => return internal(id, error),
+        };
         match self.store.status().await {
             Ok(status) => success_response(
                 id,
@@ -849,6 +998,7 @@ impl ProductionService {
                     },
                     "control": {"path": self.control_socket},
                     "tasks": self.health.snapshot(),
+                    "degraded_routes": degraded_routes,
                 }),
             ),
             Err(error) => internal(id, error),
@@ -1568,6 +1718,89 @@ mod tests {
         reopened.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn route_health_reports_a_persistent_agent_problem_once_and_its_resolution() {
+        let directory = tempdir().unwrap();
+        let agents = directory.path().join("agents.json");
+        fs::copy("tests/fixtures/agent_list.json", &agents).unwrap();
+        let binary = directory.path().join("wakterm-fake");
+        fs::write(
+            &binary,
+            format!(
+                r#"#!/bin/bash
+set -euo pipefail
+operation="$*"
+if [[ "$operation" == *"agent list --format json"* ]]; then
+  cat '{}'
+elif [[ "$operation" == *"list --format json"* ]]; then
+  echo '[{{"pane_id":1,"tab_id":1,"window_id":1,"effective_title":"other"}},{{"pane_id":3,"tab_id":2,"window_id":1,"effective_title":"route"}}]'
+else
+  echo "unexpected fake invocation: $operation" >&2
+  exit 9
+fi
+"#,
+                agents.display()
+            ),
+        )
+        .unwrap();
+        crate::test_support::seal_executable(&binary);
+        let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        store
+            .save_route(
+                Route {
+                    id: RouteId::new(Uuid::new_v4()),
+                    title: "route".into(),
+                    channels: vec![ChannelBinding::Telegram { topic_id: 10 }],
+                    agent: None,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let service = ProductionService::new(
+            store.clone(),
+            WaktermCli::new(
+                binary,
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            RealChannels::default(),
+            SupervisorHandle::default(),
+            Vec::new(),
+            directory.path().join("control.sock"),
+        );
+
+        // plain_claude in pane 3 is unobserved; the first sighting is only a candidate.
+        assert_eq!(service.route_health_once().await.unwrap(), 0);
+        assert_eq!(service.route_health_once().await.unwrap(), 1);
+        assert_eq!(service.route_health_once().await.unwrap(), 0);
+        let notices = store.pending_outbox().await.unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].destination, "10");
+        assert!(
+            notices[0]
+                .body
+                .starts_with("[Agent problem] Wakterm cannot read the output of plain_claude")
+        );
+        assert_eq!(service.reported_problems().await.unwrap().len(), 1);
+
+        // The agent becomes readable.
+        let healthy = fs::read_to_string(&agents)
+            .unwrap()
+            .replace("\"PlainPty\"", "\"ObservedPty\"");
+        fs::write(&agents, healthy).unwrap();
+        assert_eq!(service.route_health_once().await.unwrap(), 1);
+        let notices = store.pending_outbox().await.unwrap();
+        assert!(
+            notices[1]
+                .body
+                .starts_with("[Resolved] Wakterm cannot read")
+        );
+        assert!(service.reported_problems().await.unwrap().is_empty());
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
     #[test]
     fn signal_binding_member_policy_is_explicit_and_monotonic() {
         let mut route = telegram_route("inquisition".into(), 42);
@@ -2031,6 +2264,7 @@ fi
             started_at: Instant::now(),
             last_agents: tokio::sync::RwLock::new(HashMap::new()),
             route_changes: tokio::sync::Mutex::new(()),
+            health_candidates: tokio::sync::Mutex::new(BTreeSet::new()),
         };
 
         assert_eq!(service.busy_once().await.unwrap(), 2);
