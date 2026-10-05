@@ -199,6 +199,7 @@ duplicate post-cutover state.
 - channel posts that failed, or that stopped retrying after attempts that may have posted
 - inbound messages that are unconfirmed or still undelivered after 10 minutes
 - agent-to-agent sends and final returns that are unconfirmed
+- Panetone workers that are not running, once per failure
 - registered Claude or Codex agents with a plain PTY transport, whose output is not forwarded
 - detected Claude or Codex agents in a routed tab, which Panetone ignores until they are registered
 

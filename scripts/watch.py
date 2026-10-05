@@ -78,6 +78,15 @@ def agent_problems(agents, routed_titles, pane_titles):
     return problems
 
 
+def task_problems(tasks):
+    """Return {key: description} for daemon tasks that are not running."""
+    return {
+        f"task:{name}": f"Panetone task {name} is {health['state']}: {snippet(health.get('last_error'))}"
+        for name, health in tasks.items()
+        if health["state"] != "running"
+    }
+
+
 def snippet(text, limit=80):
     text = " ".join((text or "").split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -93,6 +102,7 @@ def main():
     store = store_problems(connection, now_ms)
     connection.close()
 
+    tasks = task_problems(run_json("panetone", "status", "--json")["result"]["tasks"])
     routes = run_json("panetone", "route", "list")["result"]["routes"]
     panes = run_json("wakterm", "cli", "list", "--format", "json")
     agents = run_json("wakterm", "agent", "list", "--format", "json")
@@ -108,8 +118,10 @@ def main():
     candidates = set(state["agent_candidates"])
 
     confirmed_agents = {key: text for key, text in current_agents.items() if key in candidates}
-    found = {**store, **confirmed_agents}
+    found = {**store, **confirmed_agents, **tasks}
     new = {key: text for key, text in found.items() if key not in seen}
+    # A recovered task is forgotten, so its next failure is reported again.
+    seen = {key for key in seen if not key.startswith("task:") or key in tasks}
 
     # Save before sending: an unconfirmed send may still have arrived, so a
     # failed send must not cause the same report on every later run.

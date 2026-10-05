@@ -1,7 +1,7 @@
 import sqlite3
 import unittest
 
-from watch import agent_problems, store_problems
+from watch import agent_problems, store_problems, task_problems
 
 
 def agent(name, pane, origin, transport, harness="Claude", alive=True):
@@ -27,6 +27,17 @@ class AgentProblems(unittest.TestCase):
         titles = {1: "a", 2: "b", 3: "c", 4: "Routed", 5: "unrouted", 6: "c", 7: "c"}
         problems = agent_problems(agents, {"routed"}, titles)
         self.assertEqual(sorted(problems), ["detected:id-detected", "unobserved:id-plain"])
+
+
+class TaskProblems(unittest.TestCase):
+    def test_reports_tasks_that_are_not_running(self):
+        tasks = {
+            "outbox": {"state": "running", "last_error": None},
+            "wakterm-events": {"state": "retrying", "last_error": "event follower exited"},
+        }
+        problems = task_problems(tasks)
+        self.assertEqual(sorted(problems), ["task:wakterm-events"])
+        self.assertIn("retrying: event follower exited", problems["task:wakterm-events"])
 
 
 class StoreProblems(unittest.TestCase):
