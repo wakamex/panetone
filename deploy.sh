@@ -41,7 +41,7 @@ echo ""
 if $CHECKS; then
     echo "=== Checks ==="
     if ! TEST_OUTPUT="$(cargo test --locked 2>&1)"; then
-        grep -E 'FAILED|panicked' <<<"$TEST_OUTPUT"
+        grep -E 'FAILED|panicked|error' <<<"$TEST_OUTPUT" || tail -5 <<<"$TEST_OUTPUT"
         echo "Tests failed; not deploying."
         exit 1
     fi
