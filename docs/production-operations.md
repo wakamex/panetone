@@ -194,6 +194,10 @@ accepted by the current CLI and is not a rollback target. After Rust processed
 real channel and Wakterm effects, restoring the Python snapshot would lose or
 duplicate post-cutover state.
 
+## Chat archives
+
+`PANETONE_CHAT_ARCHIVES` lists routes whose Signal messages are appended to a chat archive, as comma-separated `TITLE=PATH_STEM` pairs, such as `debate=/code/debate/archive/debate`. Each message is appended to `STEM.jsonl` as one JSON object and to `STEM.txt` as one `YYYY-MM-DD HH:MM Sender: text` line, in the formats of the debate archive's `build_archive.py`. Inbound messages are appended once when first stored, with the sender's Signal name and attachment file names. An agent's post is appended as `Clod` once Signal confirms it, with the text actually sent; Panetone's own notices and suppressed no-reply responses are not. Each line is written in one write under an exclusive file lock, and a failed append is logged without affecting delivery. Rewriting the archive files while Panetone runs can drop lines appended during the rewrite.
+
 ## Route health
 
 The `route-health` worker checks every 60 seconds for live Claude or Codex agents in a routed tab that Panetone cannot fully use: an agent Wakterm detected but did not register, so messages in that route's channel are not delivered to it, and a registered agent whose output Wakterm cannot read, so its replies are not forwarded. A problem that persists across two checks is posted once in that route's channel as `[Agent problem]`, and as `[Resolved]` when it clears. Reported problems survive restarts in store metadata, and `panetone status` lists them under `degraded_routes`.

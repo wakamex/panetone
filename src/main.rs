@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use panetone::archive::ChatArchives;
 use panetone::channels::{
     ChannelDeliveryError, RealChannels, SignalClient, SignalSubscriber, TelegramClient,
     TelegramPoller,
@@ -80,6 +81,10 @@ struct ProductionArgs {
     worker_poll_ms: u64,
     #[arg(long, env = "PANETONE_REPLAY_OFFLINE_OUTPUT", default_value_t = false)]
     replay_offline_output: bool,
+    /// Routes whose Signal messages are appended to a chat archive, as
+    /// comma-separated TITLE=PATH_STEM pairs.
+    #[arg(long, env = "PANETONE_CHAT_ARCHIVES", default_value = "")]
+    chat_archives: String,
 }
 
 #[derive(Args)]
@@ -321,14 +326,19 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
         .await
         .context("bind Panetone control socket")?;
     let mut supervisor = Supervisor::new();
-    let handler = Arc::new(ProductionService::new(
-        store.clone(),
-        wakterm,
-        channels,
-        supervisor.handle(),
-        capabilities.capabilities.iter().cloned().collect(),
-        args.socket.clone(),
-    ));
+    let archives = ChatArchives::parse(&args.chat_archives)
+        .map_err(|error| anyhow::anyhow!("PANETONE_CHAT_ARCHIVES: {error}"))?;
+    let handler = Arc::new(
+        ProductionService::new(
+            store.clone(),
+            wakterm,
+            channels,
+            supervisor.handle(),
+            capabilities.capabilities.iter().cloned().collect(),
+            args.socket.clone(),
+        )
+        .with_chat_archives(archives.clone()),
+    );
     let created_routes = handler
         .reconcile_live_routes(&live_routes)
         .await
@@ -375,7 +385,7 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
         });
     }
     if let Some((poller, owner)) = telegram {
-        let ingestor = InboundIngestor::new(store.clone());
+        let ingestor = InboundIngestor::new(store.clone()).with_chat_archives(archives.clone());
         let channel_store = store.clone();
         let channel_service = handler.clone();
         let shutdown = supervisor.shutdown_receiver();
@@ -392,7 +402,7 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
         });
     }
     if let Some((socket, account, owner)) = signal {
-        let ingestor = InboundIngestor::new(store.clone());
+        let ingestor = InboundIngestor::new(store.clone()).with_chat_archives(archives.clone());
         let shutdown = supervisor.shutdown_receiver();
         supervisor.spawn("signal-inbound", TaskPolicy::Critical, async move {
             signal_loop(socket, account, owner, ingestor, shutdown).await
@@ -1108,6 +1118,7 @@ mod tests {
             signal_owner: None,
             worker_poll_ms: 1000,
             replay_offline_output: false,
+            chat_archives: String::new(),
         }
     }
 

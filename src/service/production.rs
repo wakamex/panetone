@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::archive::{ArchiveEntry, ChatArchives};
 use crate::channels::{InboundMessage, TelegramFormTap};
 use crate::channels::{RealChannels, TelegramApprovalResponse};
 use crate::control::{
@@ -44,6 +45,7 @@ pub struct ProductionService {
     /// reported only when it persists across two passes, because a starting or
     /// restored agent is briefly unregistered or unobserved.
     health_candidates: tokio::sync::Mutex<BTreeSet<String>>,
+    archives: ChatArchives,
 }
 
 /// A question form message to update after an answer.
@@ -300,7 +302,46 @@ impl ProductionService {
             last_agents: tokio::sync::RwLock::new(HashMap::new()),
             route_changes: tokio::sync::Mutex::new(()),
             health_candidates: tokio::sync::Mutex::new(BTreeSet::new()),
+            archives: ChatArchives::default(),
         }
+    }
+
+    pub fn with_chat_archives(mut self, archives: ChatArchives) -> Self {
+        self.archives = archives;
+        self
+    }
+
+    /// Archives an agent's post once Signal confirms it, with the text that
+    /// was actually sent. Panetone's own notices are not agent posts.
+    async fn archive_delivered(&self, item: &OutboxItem, receipt: &str) {
+        if self.archives.is_empty()
+            || item.kind != ChannelKind::Signal
+            || item.sender_harness.is_none()
+        {
+            return;
+        }
+        let Some(route_id) = item.route_id else {
+            return;
+        };
+        let route = match self.store.get_route(route_id).await {
+            Ok(Some(route)) => route,
+            _ => return,
+        };
+        self.archives.append(
+            &route.title,
+            &ArchiveEntry {
+                // Signal's receipt is the message timestamp in milliseconds.
+                sent_ms: receipt.parse().unwrap_or_else(|_| now_ms()),
+                sender: "Clod".into(),
+                text: item.attempt_body(),
+                attachments: item
+                    .attachments
+                    .iter()
+                    .map(|attachment| attachment.file_name.clone())
+                    .collect(),
+                group: item.destination.clone(),
+            },
+        );
     }
 
     pub async fn event_once(&self) -> Result<usize, String> {
@@ -469,6 +510,7 @@ impl ProductionService {
         };
         match self.channels.send(&attempt).await {
             Ok(receipt) => {
+                self.archive_delivered(&item, &receipt.external_id).await;
                 item.state = OutboxState::Delivered;
                 item.external_receipt = Some(receipt.external_id);
                 item.last_error = None;
@@ -1897,6 +1939,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delivered_agent_posts_are_archived_and_notices_are_not() {
+        let directory = tempdir().unwrap();
+        let socket = directory.path().join("signal.sock");
+        let (store, service, id) = signal_outbox_service(directory.path(), &socket).await;
+        let route = Route {
+            id: RouteId::new(Uuid::new_v4()),
+            title: "debate".into(),
+            channels: vec![ChannelBinding::Signal {
+                group_id: "group-one".into(),
+                allow_members: true,
+            }],
+            agent: None,
+        };
+        store.save_route(route.clone(), 1).await.unwrap();
+        // The item from signal_outbox_service has no harness: a Panetone notice.
+        let mut agent_post = store.pending_outbox().await.unwrap().remove(0);
+        assert_eq!(agent_post.id, id);
+        let mut notice = agent_post.clone();
+        notice.route_id = Some(route.id);
+        store.save_outbox(notice, 2).await.unwrap();
+        agent_post.id = EffectId::new(Uuid::from_u128(78));
+        agent_post.route_id = Some(route.id);
+        agent_post.sender_harness = Some("claude".into());
+        agent_post.body = "the answer".into();
+        store.enqueue_outbox(None, agent_post, 3).await.unwrap();
+        let stem = directory.path().join("debate");
+        let service = service.with_chat_archives(
+            crate::archive::ChatArchives::parse(&format!("debate={}", stem.display())).unwrap(),
+        );
+
+        let server = scripted_signal(&socket, vec![SignalReply::Posted, SignalReply::Posted]);
+        assert_eq!(service.outbox_once().await.unwrap(), 1);
+        assert_eq!(service.outbox_once().await.unwrap(), 1);
+        assert_eq!(server.await.unwrap(), ["reply", "the answer"]);
+        let txt = fs::read_to_string(stem.with_extension("txt")).unwrap();
+        assert_eq!(txt.lines().count(), 1);
+        assert!(txt.trim_end().ends_with(" Clod: the answer"));
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn outbox_stops_retrying_after_three_attempts_that_may_have_posted() {
         let directory = tempdir().unwrap();
         let socket = directory.path().join("signal.sock");
@@ -2659,6 +2743,7 @@ fi
             last_agents: tokio::sync::RwLock::new(HashMap::new()),
             route_changes: tokio::sync::Mutex::new(()),
             health_candidates: tokio::sync::Mutex::new(BTreeSet::new()),
+            archives: ChatArchives::default(),
         };
 
         assert_eq!(service.busy_once().await.unwrap(), 2);

@@ -705,3 +705,59 @@ async fn signal_receive_deadlines_are_idle_polls() {
     assert_eq!(message.body, "after idle");
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn archived_routes_record_each_inbound_signal_message_once() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    store
+        .save_route(
+            Route {
+                id: RouteId::new(Uuid::new_v4()),
+                title: "debate".into(),
+                channels: vec![ChannelBinding::Signal {
+                    group_id: "GRTI+oGi/1wgJAbKEUMGNR3o1tP8o8igPibVb/xAo8k".into(),
+                    allow_members: true,
+                }],
+                agent: None,
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    let stem = directory.path().join("debate");
+    let archives =
+        panetone::archive::ChatArchives::parse(&format!("debate={}", stem.display())).unwrap();
+    let ingestor = InboundIngestor::new(store.clone()).with_chat_archives(archives);
+    let message = InboundMessage {
+        channel: ChannelKind::Signal,
+        external_id: "+15550000000:1791300636000".into(),
+        destination: "GRTI+oGi/1wgJAbKEUMGNR3o1tP8o8igPibVb/xAo8k".into(),
+        sender_id: Some("friend".into()),
+        sender: Some("Andrew RM".into()),
+        reply_to_external_id: None,
+        body: "Occums razor\n[attached image/png: /tmp/attachments/abc123.png]".into(),
+    };
+    assert!(
+        ingestor
+            .persist_signal(message.clone(), "owner", 10)
+            .await
+            .unwrap()
+    );
+    // The same Signal message delivered again is neither stored nor archived twice.
+    assert!(!ingestor.persist_signal(message, "owner", 11).await.unwrap());
+
+    let jsonl = std::fs::read_to_string(stem.with_extension("jsonl")).unwrap();
+    assert_eq!(jsonl.lines().count(), 1);
+    let line: serde_json::Value = serde_json::from_str(&jsonl).unwrap();
+    assert_eq!(line["sender"], "Andrew RM");
+    assert_eq!(line["text"], "Occums razor");
+    assert_eq!(line["attachments"], serde_json::json!(["abc123.png"]));
+    assert_eq!(line["group"], "GRTI-oGi_1wgJAbKEUMGNR3o1tP8o8igPibVb_xAo8k");
+    let txt = std::fs::read_to_string(stem.with_extension("txt")).unwrap();
+    assert!(
+        txt.trim_end()
+            .ends_with(" Andrew RM: Occums razor [attachment: abc123.png]")
+    );
+    store.shutdown().await.unwrap();
+}

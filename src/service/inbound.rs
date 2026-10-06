@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+use crate::archive::{ArchiveEntry, ChatArchives, split_signal_attachments};
 use crate::channels::{ChannelDeliveryError, InboundBatch, InboundMessage, SignalSubscriber};
 use crate::domain::ChannelBinding;
 use crate::store::{InboxItem, StoreError, StoreHandle};
@@ -15,11 +16,20 @@ pub enum InboundIngestError {
 #[derive(Clone)]
 pub struct InboundIngestor {
     store: StoreHandle,
+    archives: ChatArchives,
 }
 
 impl InboundIngestor {
     pub fn new(store: StoreHandle) -> Self {
-        Self { store }
+        Self {
+            store,
+            archives: ChatArchives::default(),
+        }
+    }
+
+    pub fn with_chat_archives(mut self, archives: ChatArchives) -> Self {
+        self.archives = archives;
+        self
     }
 
     pub async fn persist(
@@ -83,12 +93,27 @@ impl InboundIngestor {
                 })
             })
             .collect::<Vec<_>>();
-        let [(_route, allow_members)] = matching.as_slice() else {
+        let [(route, allow_members)] = matching.as_slice() else {
             return Ok(false);
         };
         if message.sender_id.as_deref() != Some(owner) && !allow_members {
             return Ok(false);
         }
+        let route_title = route.title.clone();
+        let (text, attachments) = split_signal_attachments(&message.body);
+        let entry = ArchiveEntry {
+            // Signal external IDs are `SENDER:TIMESTAMP_MS`.
+            sent_ms: message
+                .external_id
+                .rsplit(':')
+                .next()
+                .and_then(|timestamp| timestamp.parse().ok())
+                .unwrap_or(now_ms),
+            sender: message.sender.clone().unwrap_or_else(|| "Unknown".into()),
+            text,
+            attachments,
+            group: message.destination.clone(),
+        };
         if *allow_members {
             let sender = message
                 .sender
@@ -98,7 +123,12 @@ impl InboundIngestor {
                 .unwrap_or("Unknown");
             message.body = format!("{sender} says: {}", message.body);
         }
-        self.persist(message, now_ms).await
+        let inserted = self.persist(message, now_ms).await?;
+        // A redelivered message is already archived.
+        if inserted {
+            self.archives.append(&route_title, &entry);
+        }
+        Ok(inserted)
     }
 
     pub async fn ingest_signal_once(

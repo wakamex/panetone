@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod channels;
 pub mod control;
 pub mod domain;

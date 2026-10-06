@@ -13,7 +13,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 mime_guess = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
-nix = { version = "0.31", features = ["poll", "socket"] }
+nix = { version = "0.31", features = ["fs", "poll", "socket"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -23,6 +23,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["serde", "v4", "v5"] }
 time = { version = "0.3.45", features = ["parsing"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 tempfile = "3"
