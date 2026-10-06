@@ -23,6 +23,10 @@ const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 /// How long Wakterm waits for the target to start a turn before it answers a
 /// one-way admission (Wakterm `docs/agent-api/v1/index.md`).
 const ADMISSION_CONFIRMATION_WINDOW: Duration = Duration::from_secs(15);
+/// How long Wakterm waits for the target to acknowledge a steer. Claude can
+/// take several seconds to record queued input on a loaded host, beyond
+/// Wakterm's 2-second default.
+const STEER_ACK_WINDOW: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct AgentApiCapabilities {
@@ -642,12 +646,22 @@ impl WaktermCli {
             return Err(WaktermCliError::InputTooLarge(MAX_PROMPT_BYTES));
         }
         self.capabilities().await?;
-        let receipt: SteeringReceipt = self
-            .run_json(
-                &["agent", "send", binding.agent_id.as_str()],
+        let ack_timeout_ms = STEER_ACK_WINDOW.as_millis().to_string();
+        let output = self
+            .run_command(
+                &[
+                    "agent",
+                    "send",
+                    binding.agent_id.as_str(),
+                    "--ack-timeout-ms",
+                    &ack_timeout_ms,
+                ],
                 Some(prompt.as_bytes()),
+                true,
+                self.deadline + STEER_ACK_WINDOW,
             )
             .await?;
+        let receipt: SteeringReceipt = serde_json::from_slice(&output)?;
         if let Some(refusal) = receipt.refusal {
             return Err(WaktermCliError::TargetBlocked(format!(
                 "{}: {}",

@@ -123,6 +123,7 @@ elif [[ "$operation" == *"agent admit"* ]]; then
   done
   printf '{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"accepted","definitive":true,"prompt_written":true,"agent_id":"agent-zola","incarnation_id":"incarnation-zola-7","return_final":true,"request":null,"detail":null}\n' "$request_id"
 elif [[ "$operation" == *"agent send agent-zola"* ]]; then
+  [[ "$operation" == *"--ack-timeout-ms 8000"* ]]
   [[ "$(cat)" == "steer this turn" ]]
   printf '%s\n' '{"agent_id":"agent-zola","agent_name":"renamed display","pane_id":9,"transport":"observed_pty","submitted":true,"acknowledgement":{"kind":"session_observer","acknowledged":true,"latency_ms":10,"session_path":"/tmp/session","detail":null}}'
 elif [[ "$operation" == *"agent approval"* ]]; then
