@@ -166,7 +166,7 @@ or Signal's text limit. Every chunk has a deterministic effect ID and is
 committed with the source event cursor, so restart resumes at the first unsent
 chunk.
 
-Outbound posts are retried according to whether the failed attempt may have reached the chat. Neither Telegram nor Signal lets Panetone check whether a post appeared, so a retry after such an attempt starts with `[resent] ` and a duplicate is recognizable. Unreachable endpoints and rate limits mean nothing was posted, so those retries are unlabeled and unlimited. Timeouts, dropped connections, malformed responses, Telegram 5xx responses, and signal-cli's `ChatServiceInactiveException` may have posted; after three such attempts the item becomes indeterminate instead of risking further duplicates. Other rejections fail the item at once.
+Outbound posts are retried according to whether the failed attempt may have reached the chat. Neither Telegram nor Signal lets Panetone check whether a post appeared, so a retry after such an attempt starts with `[resent] ` and a duplicate is recognizable. Unreachable endpoints, rate limits, and signal-cli's `ChatServiceInactiveException`, which it reports when its own connection to the Signal server is already closed, mean nothing was posted, so those retries are unlabeled and unlimited. Every failed attempt is logged with whether it may have posted. Timeouts, dropped connections, malformed responses, and Telegram 5xx responses may have posted; after three such attempts the item becomes indeterminate instead of risking further duplicates. Other rejections fail the item at once.
 
 Telegram inbound polling retries timeouts, transport failures, rate limits, and
 upstream 5xx responses in place. Backoff starts at one second, caps at 30

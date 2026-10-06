@@ -271,9 +271,10 @@ impl SignalClient {
             }
             if let Some(error) = response.error {
                 let detail = safe_remote_detail(&error.to_string());
-                // signal-cli reports its own lost server connection this way.
+                // signal-cli reports this when its connection to the Signal
+                // server was already closed, so nothing was transmitted.
                 return Err(if detail.contains("ChatServiceInactiveException") {
-                    ChannelDeliveryError::Transport(ChannelKind::Signal)
+                    ChannelDeliveryError::Unreachable(ChannelKind::Signal)
                 } else {
                     ChannelDeliveryError::Rejected {
                         kind: ChannelKind::Signal,

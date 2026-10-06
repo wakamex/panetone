@@ -477,6 +477,14 @@ impl ProductionService {
                 if error.may_have_delivered() {
                     item.uncertain_attempts += 1;
                 }
+                tracing::warn!(
+                    effect_id = %item.id,
+                    channel = ?item.kind,
+                    attempts = item.attempts,
+                    may_have_posted = error.may_have_delivered(),
+                    error = %error,
+                    "channel post failed"
+                );
                 item.state = if !error.retryable() {
                     OutboxState::Failed
                 } else if item.uncertain_attempts >= MAX_UNCERTAIN_ATTEMPTS {
@@ -1748,11 +1756,21 @@ mod tests {
         .unwrap()
     }
 
-    /// Serves signal-cli JSON-RPC sends from a script of responses: `None`
-    /// succeeds, `Some(message)` returns that error. Records each posted body.
+    /// How the fake signal-cli answers one send.
+    #[derive(Clone, Copy)]
+    enum SignalReply {
+        Posted,
+        Error(&'static str),
+        /// Closes the connection after reading the request, as if signal-cli
+        /// failed after it may have posted.
+        HangUp,
+    }
+
+    /// Serves signal-cli JSON-RPC sends from a script of replies. Records
+    /// each posted body.
     fn scripted_signal(
         socket: &std::path::Path,
-        script: Vec<Option<&'static str>>,
+        script: Vec<SignalReply>,
     ) -> tokio::task::JoinHandle<Vec<String>> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let listener = tokio::net::UnixListener::bind(socket).unwrap();
@@ -1766,11 +1784,12 @@ mod tests {
                 let request: serde_json::Value = serde_json::from_str(&line).unwrap();
                 posted.push(request["params"]["message"].as_str().unwrap().to_owned());
                 let reply = match response {
-                    None => {
+                    SignalReply::Posted => {
                         json!({"jsonrpc": "2.0", "id": request["id"], "result": {"timestamp": 1}})
                     }
-                    Some(message) => json!({"jsonrpc": "2.0", "id": request["id"],
+                    SignalReply::Error(message) => json!({"jsonrpc": "2.0", "id": request["id"],
                         "error": {"code": -32603, "message": message}}),
+                    SignalReply::HangUp => continue,
                 };
                 reader
                     .get_mut()
@@ -1844,7 +1863,7 @@ mod tests {
         // Unreachable first: nothing can have been posted, so no label yet.
         let (store, service, id) = signal_outbox_service(directory.path(), &socket).await;
         assert_eq!(service.outbox_once().await.unwrap(), 1);
-        let server = scripted_signal(&socket, vec![Some(INACTIVE), None]);
+        let server = scripted_signal(&socket, vec![SignalReply::HangUp, SignalReply::Posted]);
         assert_eq!(service.outbox_once().await.unwrap(), 1);
         assert_eq!(service.outbox_once().await.unwrap(), 1);
         assert_eq!(server.await.unwrap(), ["reply", "[resent] reply"]);
@@ -1862,11 +1881,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_retry_after_signals_closed_server_connection_is_unlabeled() {
+        let directory = tempdir().unwrap();
+        let socket = directory.path().join("signal.sock");
+        let (store, service, _) = signal_outbox_service(directory.path(), &socket).await;
+        let server = scripted_signal(
+            &socket,
+            vec![SignalReply::Error(INACTIVE), SignalReply::Posted],
+        );
+        assert_eq!(service.outbox_once().await.unwrap(), 1);
+        assert_eq!(service.outbox_once().await.unwrap(), 1);
+        assert_eq!(server.await.unwrap(), ["reply", "reply"]);
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn outbox_stops_retrying_after_three_attempts_that_may_have_posted() {
         let directory = tempdir().unwrap();
         let socket = directory.path().join("signal.sock");
         let (store, service, _) = signal_outbox_service(directory.path(), &socket).await;
-        let server = scripted_signal(&socket, vec![Some(INACTIVE); 3]);
+        let server = scripted_signal(&socket, vec![SignalReply::HangUp; 3]);
         for _ in 0..3 {
             assert_eq!(service.outbox_once().await.unwrap(), 1);
         }

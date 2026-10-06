@@ -418,8 +418,11 @@ async fn channel_errors_say_whether_the_message_may_have_been_posted() {
         .send(&item(ChannelKind::Signal, "group-one"))
         .await
         .unwrap_err();
-    assert_eq!(error, ChannelDeliveryError::Transport(ChannelKind::Signal));
-    assert!(error.retryable() && error.may_have_delivered());
+    assert_eq!(
+        error,
+        ChannelDeliveryError::Unreachable(ChannelKind::Signal)
+    );
+    assert!(error.retryable() && !error.may_have_delivered());
     server.await.unwrap();
 }
 
