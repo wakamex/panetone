@@ -27,6 +27,27 @@ pub struct InboundMessage {
     pub sender: Option<String>,
     pub reply_to_external_id: Option<String>,
     pub body: String,
+    /// The earlier message this one replies to, when the sender quoted one.
+    pub quoted: Option<QuotedMessage>,
+}
+
+impl QuotedMessage {
+    /// Whether there is an author or text to show the agent.
+    fn identifiable(&self) -> bool {
+        !self.author_ids.is_empty() || !self.text.is_empty()
+    }
+}
+
+/// The message an inbound message replies to.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QuotedMessage {
+    /// Channel identifiers of the quoted message's author.
+    pub author_ids: Vec<String>,
+    /// The author's display name, when the channel provides it.
+    pub author_name: Option<String>,
+    /// Whether Panetone's own account posted it, so it is the agent's message.
+    pub own: bool,
+    pub text: String,
 }
 
 impl InboundMessage {
@@ -253,7 +274,24 @@ impl TelegramPoller {
                 sender: message.from.and_then(TelegramUser::display_name),
                 reply_to_external_id: message
                     .reply_to_message
+                    .as_ref()
                     .map(|reply| reply.message_id.to_string()),
+                quoted: message
+                    .reply_to_message
+                    .filter(|reply| {
+                        reply.forum_topic_created.is_none() && Some(reply.message_id) != Some(topic)
+                    })
+                    .map(|reply| QuotedMessage {
+                        author_ids: reply
+                            .from
+                            .as_ref()
+                            .map(|user| vec![user.id.to_string()])
+                            .unwrap_or_default(),
+                        own: reply.from.as_ref().is_some_and(|user| user.is_bot),
+                        author_name: reply.from.and_then(TelegramUser::display_name),
+                        text: reply.text.or(reply.caption).unwrap_or_default(),
+                    })
+                    .filter(QuotedMessage::identifiable),
                 body,
             });
         }
@@ -517,6 +555,8 @@ pub struct SignalSubscriber {
     reader: BufReader<UnixStream>,
     deadline: Duration,
     attachment_directory: PathBuf,
+    /// Panetone's own Signal account, which posts the agents' messages.
+    account: String,
 }
 
 impl SignalSubscriber {
@@ -567,6 +607,7 @@ impl SignalSubscriber {
             reader,
             deadline,
             attachment_directory: signal_attachment_directory(),
+            account: account.to_owned(),
         })
     }
 
@@ -608,10 +649,40 @@ impl SignalSubscriber {
                     .or_else(|| envelope["sourceNumber"].as_str())
                     .map(str::to_owned),
                 reply_to_external_id: scalar_id(&data["quote"]["id"]),
+                quoted: signal_quote(&data["quote"], &self.account),
                 body,
             });
         }
     }
+}
+
+/// The quoted message of a Signal `dataMessage.quote`, which names its author
+/// only by number or UUID.
+fn signal_quote(quote: &Value, account: &str) -> Option<QuotedMessage> {
+    if !quote.is_object() {
+        return None;
+    }
+    let author_ids = ["authorNumber", "authorUuid", "author"]
+        .into_iter()
+        .filter_map(|field| quote[field].as_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mut text = quote["text"].as_str().unwrap_or_default().to_owned();
+    if text.is_empty()
+        && quote["attachments"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    {
+        text = "[attachment]".into();
+    }
+    Some(QuotedMessage {
+        own: author_ids.iter().any(|id| id == account),
+        author_ids,
+        author_name: None,
+        text,
+    })
+    .filter(QuotedMessage::identifiable)
 }
 
 fn signal_attachment_directory() -> PathBuf {
@@ -739,6 +810,12 @@ struct TelegramFile {
 #[derive(Deserialize)]
 struct TelegramReply {
     message_id: i64,
+    from: Option<TelegramUser>,
+    text: Option<String>,
+    caption: Option<String>,
+    /// Set on a forum topic's first message, which Telegram reports as the
+    /// reply target of every message in the topic.
+    forum_topic_created: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -749,6 +826,8 @@ struct TelegramChat {
 #[derive(Deserialize)]
 struct TelegramUser {
     id: i64,
+    #[serde(default)]
+    is_bot: bool,
     first_name: Option<String>,
     last_name: Option<String>,
     username: Option<String>,
@@ -866,7 +945,35 @@ fn safe_detail(detail: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_approval_callback;
+    use serde_json::{Value, json};
+
+    use super::{parse_approval_callback, signal_quote};
+
+    #[test]
+    fn signal_quotes_name_their_author_and_recognize_the_agents_own_posts() {
+        // The JsonQuote fields signal-cli 0.14.8 sends.
+        let quote = json!({
+            "id": 1791125650208_u64,
+            "author": "+17622516723",
+            "authorNumber": "+17622516723",
+            "authorUuid": "b1e3c0de-0000-4000-8000-000000000001",
+            "text": "Fine, I'll accept the premise",
+            "mentions": [],
+            "attachments": [],
+            "textStyles": []
+        });
+        let own = signal_quote(&quote, "+17622516723").unwrap();
+        assert!(own.own);
+        assert_eq!(own.text, "Fine, I'll accept the premise");
+        assert_eq!(own.author_ids[0], "+17622516723");
+        assert!(!signal_quote(&quote, "+15550000").unwrap().own);
+
+        let picture = json!({"id": 1, "authorUuid": "x", "text": null,
+                             "attachments": [{"contentType": "image/jpeg"}]});
+        assert_eq!(signal_quote(&picture, "me").unwrap().text, "[attachment]");
+        assert!(signal_quote(&json!({"id": 8001}), "me").is_none());
+        assert!(signal_quote(&Value::Null, "me").is_none());
+    }
 
     #[test]
     fn approval_callback_is_strict_and_compact() {

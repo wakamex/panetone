@@ -34,9 +34,28 @@ impl InboundIngestor {
 
     pub async fn persist(
         &self,
-        message: InboundMessage,
+        mut message: InboundMessage,
         now_ms: i64,
     ) -> Result<bool, InboundIngestError> {
+        if let Some(quoted) = message.quoted.take() {
+            let author = if quoted.own {
+                Some("you".to_owned())
+            } else {
+                match quoted.author_name {
+                    Some(name) => Some(name),
+                    None => {
+                        self.store
+                            .latest_sender_name(message.channel, quoted.author_ids)
+                            .await?
+                    }
+                }
+            };
+            message.body = format!(
+                "{}\n{}",
+                reply_context(author.as_deref().unwrap_or("someone"), &quoted.text),
+                message.body
+            );
+        }
         let item = InboxItem {
             id: message.effect_id(),
             channel: message.channel,
@@ -140,4 +159,20 @@ impl InboundIngestor {
         let message = subscriber.next().await?;
         self.persist_signal(message, owner, now_ms).await
     }
+}
+
+/// The line that tells the agent which message an inbound message replies to,
+/// quoting the first line of the replied-to text.
+fn reply_context(author: &str, text: &str) -> String {
+    const MAX_CHARS: usize = 100;
+    let first_line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    let quoted = match first_line.char_indices().nth(MAX_CHARS) {
+        Some((end, _)) => format!("{}…", &first_line[..end]),
+        None => first_line.to_owned(),
+    };
+    format!("[replying to {author}: \"{quoted}\"]")
 }

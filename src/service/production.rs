@@ -2241,6 +2241,7 @@ fi
             sender: None,
             reply_to_external_id: Some(reply_to.into()),
             body: body.into(),
+            quoted: None,
         };
         // A reply to anything else is an ordinary prompt.
         assert!(

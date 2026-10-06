@@ -264,6 +264,11 @@ enum Command {
     PendingOutbox {
         reply: oneshot::Sender<StoreResult<Vec<OutboxItem>>>,
     },
+    LatestSenderName {
+        channel: ChannelKind,
+        sender_ids: Vec<String>,
+        reply: oneshot::Sender<StoreResult<Option<String>>>,
+    },
     FindDeliveredOutbox {
         channel: ChannelKind,
         destination: String,
@@ -503,6 +508,21 @@ impl StoreHandle {
             .and_then(|item| item.source_agent))
     }
 
+    /// The display name of the latest inbound message from any of these
+    /// sender IDs, which a Signal quote names its author by.
+    pub async fn latest_sender_name(
+        &self,
+        channel: ChannelKind,
+        sender_ids: Vec<String>,
+    ) -> StoreResult<Option<String>> {
+        self.request(|reply| Command::LatestSenderName {
+            channel,
+            sender_ids,
+            reply,
+        })
+        .await
+    }
+
     /// The delivered outbox item whose channel message has this receipt.
     pub async fn find_delivered_outbox(
         &self,
@@ -711,6 +731,11 @@ fn handle_command(connection: &mut Connection, command: Command) {
             reply,
         } => send_reply(reply, save_outbox(connection, &item, now_ms)),
         Command::PendingOutbox { reply } => send_reply(reply, pending_outbox(connection)),
+        Command::LatestSenderName {
+            channel,
+            sender_ids,
+            reply,
+        } => send_reply(reply, latest_sender_name(connection, channel, &sender_ids)),
         Command::FindDeliveredOutbox {
             channel,
             destination,
@@ -2062,6 +2087,30 @@ fn pending_outbox(connection: &Connection) -> StoreResult<Vec<OutboxItem>> {
 
 fn rebaseline_event_cursor(connection: &Connection, sequence: u64) -> StoreResult<()> {
     set_metadata(connection, "wakterm_event_cursor", &sequence.to_string())
+}
+
+fn latest_sender_name(
+    connection: &Connection,
+    channel: ChannelKind,
+    sender_ids: &[String],
+) -> StoreResult<Option<String>> {
+    let mut statement = connection.prepare(
+        "SELECT json_extract(record_json, '$.sender') FROM inbox
+         WHERE channel = ?1 AND json_extract(record_json, '$.sender_id') = ?2
+           AND json_extract(record_json, '$.sender') IS NOT NULL
+         ORDER BY created_at_ms DESC LIMIT 1",
+    )?;
+    for sender_id in sender_ids {
+        if let Some(name) = statement
+            .query_row(params![channel_name(channel), sender_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+        {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
 }
 
 fn find_delivered_outbox(

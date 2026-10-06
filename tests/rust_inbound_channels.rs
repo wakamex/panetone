@@ -554,6 +554,7 @@ async fn configured_signal_group_accepts_members_and_adds_first_name_only() {
             sender: Some(sender.into()),
             reply_to_external_id: None,
             body: "hello".into(),
+            quoted: None,
         };
 
     assert!(
@@ -737,6 +738,7 @@ async fn archived_routes_record_each_inbound_signal_message_once() {
         sender: Some("Andrew RM".into()),
         reply_to_external_id: None,
         body: "Occums razor\n[attached image/png: /tmp/attachments/abc123.png]".into(),
+        quoted: None,
     };
     assert!(
         ingestor
@@ -758,6 +760,137 @@ async fn archived_routes_record_each_inbound_signal_message_once() {
     assert!(
         txt.trim_end()
             .ends_with(" Andrew RM: Occums razor [attachment: abc123.png]")
+    );
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn replies_tell_the_agent_which_message_they_answer() {
+    // Telegram: a reply to Melissa, a reply to the bot, and a plain message
+    // in a forum topic, which Telegram reports as a reply to the topic root.
+    let response = serde_json::json!({
+        "ok": true,
+        "result": [
+            {"update_id": 20, "message": {
+                "message_id": 600, "chat": {"id": -1001}, "message_thread_id": 77,
+                "from": {"id": 42, "first_name": "Mihai"},
+                "reply_to_message": {"message_id": 590, "from": {"id": 7, "first_name": "Melissa"},
+                                     "text": "If it attracts me I will read the paper\nsecond line"},
+                "text": "but WHAT ATTRACTS YOU"}},
+            {"update_id": 21, "message": {
+                "message_id": 601, "chat": {"id": -1001}, "message_thread_id": 77,
+                "from": {"id": 42, "first_name": "Mihai"},
+                "reply_to_message": {"message_id": 595, "from": {"id": 9, "is_bot": true, "first_name": "Clod"},
+                                     "text": "Here is my answer"},
+                "text": "explain"}},
+            {"update_id": 22, "message": {
+                "message_id": 602, "chat": {"id": -1001}, "message_thread_id": 77,
+                "from": {"id": 42, "first_name": "Mihai"},
+                "reply_to_message": {"message_id": 77, "forum_topic_created": {"name": "inquisition"}},
+                "text": "plain"}}
+        ]
+    })
+    .to_string();
+    let (base, request) = telegram_server(&response).await;
+    let directory = tempdir().unwrap();
+    let poller = TelegramPoller::telegram(
+        &base,
+        "fake-token",
+        -1001,
+        directory.path(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let batch = poller.poll(20, 0).await.unwrap();
+    request.await.unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let ingestor = InboundIngestor::new(store.clone());
+    ingestor
+        .persist_telegram_batch("telegram_offset", batch, 100)
+        .await
+        .unwrap();
+    let bodies = store
+        .pending_inbox()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|item| item.body)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bodies,
+        [
+            "[replying to Melissa: \"If it attracts me I will read the paper\"]\nbut WHAT ATTRACTS YOU",
+            "[replying to you: \"Here is my answer\"]\nexplain",
+            "plain",
+        ]
+    );
+
+    // Signal names a quote's author only by number or UUID, resolved from the
+    // author's own earlier messages.
+    store
+        .save_route(
+            Route {
+                id: RouteId::new(Uuid::new_v4()),
+                title: "inquisition".into(),
+                channels: vec![ChannelBinding::Signal {
+                    group_id: "group-one".into(),
+                    allow_members: true,
+                }],
+                agent: None,
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    let signal =
+        |external_id: &str, sender_id: &str, sender: &str, body: &str, quoted| InboundMessage {
+            channel: ChannelKind::Signal,
+            external_id: external_id.into(),
+            destination: "group-one".into(),
+            sender_id: Some(sender_id.into()),
+            sender: Some(sender.into()),
+            reply_to_external_id: None,
+            body: body.into(),
+            quoted,
+        };
+    ingestor
+        .persist_signal(
+            signal(
+                "+1555:1",
+                "+1555",
+                "Melissa Young",
+                "If it attracts me I will read the paper",
+                None,
+            ),
+            "owner",
+            200,
+        )
+        .await
+        .unwrap();
+    let quoted = panetone::channels::QuotedMessage {
+        author_ids: vec!["+1555".into(), "uuid-melissa".into()],
+        author_name: None,
+        own: false,
+        text: "If it attracts me I will read the paper".into(),
+    };
+    ingestor
+        .persist_signal(
+            signal(
+                "owner:2",
+                "owner",
+                "Mihai Cosma",
+                "but WHAT ATTRACTS YOU",
+                Some(quoted),
+            ),
+            "owner",
+            201,
+        )
+        .await
+        .unwrap();
+    let last = store.pending_inbox().await.unwrap().pop().unwrap();
+    assert_eq!(
+        last.body,
+        "[replying to Melissa Young: \"If it attracts me I will read the paper\"]\nMihai says: but WHAT ATTRACTS YOU"
     );
     store.shutdown().await.unwrap();
 }
