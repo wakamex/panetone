@@ -1334,7 +1334,9 @@ fn ingest_agent_events(
             .map_err(|detail| StoreError::Conflict(detail.into()))?;
         let visible_body = event
             .visible_output_body()
-            .map_err(|detail| StoreError::Conflict(detail.into()))?;
+            .map_err(|detail| StoreError::Conflict(detail.into()))?
+            .map(|body| strip_memory_citations(&body))
+            .filter(|body| !body.trim().is_empty());
         if approval.is_some() || visible_body.is_some() {
             let Some(route) = route else {
                 state = "unrouted";
@@ -1615,6 +1617,67 @@ fn output_destination(route: &Route, preference: Option<&str>) -> Option<(Channe
         ChannelKind::Telegram => telegram_topic.map(|topic_id| (selected, topic_id.to_string())),
         ChannelKind::Signal => signal_group.map(|group_id| (selected, group_id.into())),
     }
+}
+
+/// Removes `<memory-used>...</memory-used>` blocks, which agents add to cite
+/// the memories they used and which belong only in their own transcripts. A
+/// block may span lines; blocks inside fenced code are kept, and an
+/// unterminated block is removed to the end of the message.
+fn strip_memory_citations(body: &str) -> String {
+    const OPEN: &str = "<memory-used>";
+    const CLOSE: &str = "</memory-used>";
+    if !body.contains(OPEN) {
+        return body.to_owned();
+    }
+    let mut retained = Vec::new();
+    let mut fence = None;
+    let mut in_block = false;
+    for line in body.split('\n') {
+        if !in_block {
+            if let Some((marker, length)) = fence {
+                retained.push(line.to_owned());
+                if closes_markdown_fence(line, marker, length) {
+                    fence = None;
+                }
+                continue;
+            }
+            if let Some(opened) = opens_markdown_fence(line) {
+                fence = Some(opened);
+                retained.push(line.to_owned());
+                continue;
+            }
+        }
+        let mut kept = String::new();
+        let mut rest = line;
+        loop {
+            if in_block {
+                match rest.find(CLOSE) {
+                    Some(end) => {
+                        rest = &rest[end + CLOSE.len()..];
+                        in_block = false;
+                    }
+                    None => break,
+                }
+            } else {
+                match rest.find(OPEN) {
+                    Some(start) => {
+                        kept.push_str(&rest[..start]);
+                        rest = &rest[start + OPEN.len()..];
+                        in_block = true;
+                    }
+                    None => {
+                        kept.push_str(rest);
+                        break;
+                    }
+                }
+            }
+        }
+        // Drop a line that held nothing but citations.
+        if !(kept.trim().is_empty() && !line.trim().is_empty()) {
+            retained.push(kept.trim_end().to_owned());
+        }
+    }
+    retained.join("\n").trim_end().to_owned()
 }
 
 fn visible_attachments(

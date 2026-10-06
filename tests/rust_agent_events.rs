@@ -770,3 +770,74 @@ async fn cursor_gap_takes_a_fresh_catalog_baseline_and_remains_visible() {
     );
     store.shutdown().await.unwrap();
 }
+
+/// Projects one assistant message with `text` to `route` and returns the
+/// posted bodies.
+async fn project_assistant_text(route: Route, text: &str) -> Vec<String> {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    store.save_route(route.clone(), 1).await.unwrap();
+    let mut event = fixture_events()
+        .into_iter()
+        .find(|event| event.kind == "assistant_message")
+        .unwrap();
+    event.fields.insert("text".into(), text.into());
+    store
+        .initialize_event_cursor(event.sequence - 1)
+        .await
+        .unwrap();
+    store
+        .ingest_agent_events(
+            event.sequence - 1,
+            event.sequence,
+            vec![event],
+            live_agents(&route),
+            3,
+        )
+        .await
+        .unwrap();
+    let bodies = store
+        .pending_outbox()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|item| item.body)
+        .collect();
+    store.shutdown().await.unwrap();
+    bodies
+}
+
+#[tokio::test]
+async fn memory_citation_blocks_are_removed_before_posting() {
+    assert_eq!(
+        project_assistant_text(
+            route(),
+            "Here is the answer. <memory-used>a.md ^m-7f3a, b.md</memory-used>\n\nSecond paragraph.\n<memory-used>c.md\n^m-1\n</memory-used>"
+        )
+        .await,
+        ["Here is the answer.\n\nSecond paragraph."]
+    );
+    // A citation inside fenced code is shown as written.
+    let fenced = "Example:\n```\n<memory-used>a.md</memory-used>\n```";
+    assert_eq!(project_assistant_text(route(), fenced).await, [fenced]);
+    // An unterminated block hides the rest of the message.
+    assert_eq!(
+        project_assistant_text(route(), "Visible.\n<memory-used>a.md\nhidden").await,
+        ["Visible."]
+    );
+    // A message of nothing but citations is not posted.
+    assert!(
+        project_assistant_text(route(), "<memory-used>a.md</memory-used>")
+            .await
+            .is_empty()
+    );
+    // The debate no-reply token still suppresses a reply that also cites memories.
+    assert!(
+        project_assistant_text(
+            debate_route(),
+            "<panetone:no-reply>\n<memory-used>a.md</memory-used>"
+        )
+        .await
+        .is_empty()
+    );
+}
