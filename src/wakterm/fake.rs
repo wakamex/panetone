@@ -135,6 +135,9 @@ impl FakeWakterm {
     pub fn envelope(command: &SendCommand, source_harness: &str, target_harness: &str) -> String {
         let reply = if command.return_final {
             "asynchronous final callback"
+        } else if source_harness == "external" {
+            // The sender is outside Wakterm and cannot be messaged back.
+            "one-way from outside Wakterm; answer in your final response, which the sender reads, and do not send it a message"
         } else {
             "one-way"
         };

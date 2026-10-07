@@ -980,7 +980,9 @@ async fn a_sender_outside_wakterm_sends_one_way_under_its_own_name() {
     assert!(!refused.status.success());
     let prompt = fs::read_to_string(&admitted_prompt).unwrap();
     assert!(prompt.contains("From: orch (external)"), "{prompt}");
-    assert!(prompt.contains("Reply mode: one-way"));
+    assert!(prompt.contains(
+        "Reply mode: one-way from outside Wakterm; answer in your final response, which the sender reads, and do not send it a message"
+    ));
     assert!(prompt.ends_with("hello from outside"));
 }
 
