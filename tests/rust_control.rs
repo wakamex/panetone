@@ -245,7 +245,7 @@ async fn send_identifies_the_exact_calling_agent_through_wakterm_without_from() 
     assert!(!unidentified.status.success());
     assert!(unidentified.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&unidentified.stderr);
-    assert!(stderr.contains("--from ROUTE"), "{stderr}");
+    assert!(stderr.contains("--as NAME"), "{stderr}");
     assert!(
         stderr.contains("neither WAKTERM_PANE nor CODEX_THREAD_ID"),
         "{stderr}"
