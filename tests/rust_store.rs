@@ -6,7 +6,8 @@ use panetone::domain::{
     WorkflowState,
 };
 use panetone::store::{
-    ClaimResult, DestinationDelivery, InboxItem, ReturnDelivery, StoreError, StoreHandle,
+    ClaimResult, DeliveryProof, DestinationDelivery, InboxItem, ReturnDelivery, StoreError,
+    StoreHandle,
 };
 use rusqlite::Connection;
 use serde_json::json;
@@ -482,6 +483,7 @@ async fn routes_outbox_inbox_and_metadata_are_durable_and_deduplicated() {
         created_at_ms: 100,
         receipt: None,
         steering_acknowledged: None,
+        proof: None,
     };
     assert!(store.accept_inbox(inbox.clone()).await.unwrap());
     assert!(!store.accept_inbox(inbox).await.unwrap());
@@ -512,6 +514,64 @@ async fn routes_outbox_inbox_and_metadata_are_durable_and_deduplicated() {
     assert_eq!(status.pending_outbox, 1);
     assert_eq!(status.pending_inbox, 1);
     reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_admission_interrupted_by_a_restart_waits_for_proof_when_it_has_one() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("state.sqlite3");
+    let store = StoreHandle::open(&path).unwrap();
+    for (id, proof) in [
+        (1, None),
+        (
+            2,
+            Some(DeliveryProof {
+                agent_id: "agent".into(),
+                incarnation_id: "inc".into(),
+                after_sequence: 0,
+                input_sha256: DeliveryProof::input_sha256("hello"),
+                deadline_ms: 1,
+                detail: "Panetone restarted while delivering it".into(),
+            }),
+        ),
+    ] {
+        let mut item = InboxItem {
+            id: EffectId::new(Uuid::from_u128(id)),
+            channel: ChannelKind::Telegram,
+            external_id: format!("update-{id}"),
+            destination: "10".into(),
+            sender_id: None,
+            sender: None,
+            reply_to_external_id: None,
+            body: "hello".into(),
+            state: "pending".into(),
+            created_at_ms: 100,
+            receipt: None,
+            steering_acknowledged: None,
+            proof: None,
+        };
+        store.accept_inbox(item.clone()).await.unwrap();
+        item.state = "admission_prepared".into();
+        item.proof = proof;
+        store.save_inbox(item, "pending", None).await.unwrap();
+    }
+    store.shutdown().await.unwrap();
+
+    let reopened = StoreHandle::open(&path).unwrap();
+    let awaiting = reopened.awaiting_inbox().await.unwrap();
+    assert_eq!(awaiting.len(), 1);
+    assert_eq!(awaiting[0].id, EffectId::new(Uuid::from_u128(2)));
+    assert_eq!(awaiting[0].state, "awaiting_proof");
+    reopened.shutdown().await.unwrap();
+    let states = Connection::open(&path)
+        .unwrap()
+        .prepare("SELECT state FROM inbox ORDER BY effect_id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(states, ["indeterminate", "awaiting_proof"]);
 }
 
 #[tokio::test]

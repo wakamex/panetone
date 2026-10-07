@@ -69,6 +69,7 @@ impl InboundIngestor {
             created_at_ms: now_ms,
             receipt: None,
             steering_acknowledged: None,
+            proof: None,
         };
         Ok(self.store.accept_inbox(item).await?)
     }

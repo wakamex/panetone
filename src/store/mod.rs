@@ -110,6 +110,30 @@ pub struct InboxItem {
     pub receipt: Option<AdmissionReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steering_acknowledged: Option<bool>,
+    /// What proves the message reached its agent if Wakterm cannot confirm
+    /// the delivery itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<DeliveryProof>,
+}
+
+/// Wakterm recording input with the message's hash for the target agent
+/// after the delivery began proves the agent received it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeliveryProof {
+    pub agent_id: String,
+    pub incarnation_id: String,
+    pub after_sequence: u64,
+    /// The SHA-256 of the trimmed message, as Wakterm's `input_sha256`.
+    pub input_sha256: String,
+    pub deadline_ms: i64,
+    /// Why delivery was unconfirmed, for the sender's notice if no proof comes.
+    pub detail: String,
+}
+
+impl DeliveryProof {
+    pub fn input_sha256(text: &str) -> String {
+        format!("{:x}", Sha256::digest(text.trim().as_bytes()))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -278,8 +302,13 @@ enum Command {
         item: InboxItem,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
-    PendingInbox {
+    InboxInState {
+        state: &'static str,
         reply: oneshot::Sender<StoreResult<Vec<InboxItem>>>,
+    },
+    InputRecorded {
+        proof: DeliveryProof,
+        reply: oneshot::Sender<StoreResult<bool>>,
     },
     SaveInbox {
         item: InboxItem,
@@ -544,7 +573,25 @@ impl StoreHandle {
     }
 
     pub async fn pending_inbox(&self) -> StoreResult<Vec<InboxItem>> {
-        self.request(|reply| Command::PendingInbox { reply }).await
+        self.request(|reply| Command::InboxInState {
+            state: "pending",
+            reply,
+        })
+        .await
+    }
+
+    /// Inbound messages waiting for proof that their agent received them.
+    pub async fn awaiting_inbox(&self) -> StoreResult<Vec<InboxItem>> {
+        self.request(|reply| Command::InboxInState {
+            state: "awaiting_proof",
+            reply,
+        })
+        .await
+    }
+
+    pub async fn input_recorded(&self, proof: DeliveryProof) -> StoreResult<bool> {
+        self.request(|reply| Command::InputRecorded { proof, reply })
+            .await
     }
 
     pub async fn save_inbox(
@@ -745,7 +792,12 @@ fn handle_command(connection: &mut Connection, command: Command) {
             find_delivered_outbox(connection, channel, &destination, &external_receipt),
         ),
         Command::AcceptInbox { item, reply } => send_reply(reply, accept_inbox(connection, &item)),
-        Command::PendingInbox { reply } => send_reply(reply, pending_inbox(connection)),
+        Command::InboxInState { state, reply } => {
+            send_reply(reply, inbox_in_state(connection, state))
+        }
+        Command::InputRecorded { proof, reply } => {
+            send_reply(reply, input_recorded(connection, &proof))
+        }
         Command::SaveInbox {
             item,
             expected_state,
@@ -973,8 +1025,13 @@ fn recover(connection: &mut Connection) -> StoreResult<()> {
         [],
     )?;
     connection.execute(
-        "UPDATE inbox SET state = 'indeterminate',
-             record_json = json_set(record_json, '$.state', 'indeterminate')
+        // An admission interrupted by a restart may have been typed, so it
+        // waits for proof like any other unconfirmed delivery.
+        "UPDATE inbox SET state = CASE WHEN json_extract(record_json, '$.proof') IS NULL
+                 THEN 'indeterminate' ELSE 'awaiting_proof' END,
+             record_json = json_set(record_json, '$.state',
+                 CASE WHEN json_extract(record_json, '$.proof') IS NULL
+                 THEN 'indeterminate' ELSE 'awaiting_proof' END)
          WHERE state = 'admission_prepared'",
         [],
     )?;
@@ -2132,16 +2189,36 @@ fn accept_inbox(connection: &Connection, item: &InboxItem) -> StoreResult<bool> 
     Ok(changed == 1)
 }
 
-fn pending_inbox(connection: &Connection) -> StoreResult<Vec<InboxItem>> {
+fn inbox_in_state(connection: &Connection, state: &str) -> StoreResult<Vec<InboxItem>> {
     let mut statement = connection
-        .prepare("SELECT record_json FROM inbox WHERE state = 'pending' ORDER BY created_at_ms")?;
+        .prepare("SELECT record_json FROM inbox WHERE state = ?1 ORDER BY created_at_ms")?;
     let records = statement
-        .query_map([], |row| row.get::<_, String>(0))?
+        .query_map([state], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     records
         .into_iter()
         .map(|record| serde_json::from_str(&record).map_err(StoreError::from))
         .collect()
+}
+
+fn input_recorded(connection: &Connection, proof: &DeliveryProof) -> StoreResult<bool> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM agent_events
+             WHERE agent_id = ?1 AND incarnation_id = ?2 AND sequence > ?3
+               AND kind IN ('input_accepted', 'turn_started')
+               AND json_extract(record_json, '$.input_sha256') = ?4
+             LIMIT 1",
+            params![
+                proof.agent_id,
+                proof.incarnation_id,
+                proof.after_sequence,
+                proof.input_sha256
+            ],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 fn save_inbox(

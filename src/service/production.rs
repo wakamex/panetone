@@ -18,7 +18,9 @@ use crate::domain::{
     AdmissionStatus, AgentBinding, ChannelBinding, ChannelKind, EffectId, OutboxAction, OutboxItem,
     OutboxState, Route, RouteId, WorkflowId, WorkflowState,
 };
-use crate::store::{EventCursorGap, InboxItem, RouteAgent, StoreHandle, StoredApproval};
+use crate::store::{
+    DeliveryProof, EventCursorGap, InboxItem, RouteAgent, StoreHandle, StoredApproval,
+};
 use crate::supervisor::SupervisorHandle;
 use crate::wakterm::form::{self, FormAction, FormState};
 use crate::wakterm::{EventRead, LiveRouteSnapshot, TerminalResult, WaktermCli, WaktermCliError};
@@ -29,6 +31,11 @@ use super::{OfflineService, ServiceError};
 /// Uncertain attempts after which an outbox item is left indeterminate
 /// instead of risking more duplicate posts.
 const MAX_UNCERTAIN_ATTEMPTS: u32 = 3;
+
+/// How long an unconfirmed inbound message waits for Wakterm to record it
+/// before its sender is told it may not have arrived. Codex records steering
+/// only when the running turn takes it, which can be after a long tool call.
+const INBOX_PROOF_WINDOW_MS: i64 = 120_000;
 
 pub struct ProductionService {
     store: StoreHandle,
@@ -727,10 +734,12 @@ impl ProductionService {
     }
 
     pub async fn inbox_once(&self) -> Result<usize, String> {
+        self.settle_awaiting_inbox(now_ms()).await?;
         let pending = self.store.pending_inbox().await.map_err(error_string)?;
         if pending.is_empty() {
             return Ok(0);
         }
+        let after_sequence = self.event_cursor().await?;
         let routes = self.store.list_routes().await.map_err(error_string)?;
         let live = self.wakterm.live_routes().await.map_err(error_string)?;
         let mut attempted = 0;
@@ -757,6 +766,14 @@ impl ProductionService {
             };
             attempted += 1;
             item.state = "admission_prepared".into();
+            item.proof = Some(DeliveryProof {
+                agent_id: binding.agent_id.clone(),
+                incarnation_id: binding.incarnation_id.clone(),
+                after_sequence,
+                input_sha256: DeliveryProof::input_sha256(&item.body),
+                deadline_ms: now_ms() + INBOX_PROOF_WINDOW_MS,
+                detail: "Panetone restarted while delivering it".into(),
+            });
             self.store
                 .save_inbox(item.clone(), "pending", None)
                 .await
@@ -768,9 +785,7 @@ impl ProductionService {
             {
                 Ok(receipt) => receipt,
                 Err(error) => {
-                    self.notify_unconfirmed(&item, route, &error.to_string())
-                        .await?;
-                    item.state = "indeterminate".into();
+                    await_proof(&mut item, &error.to_string());
                     self.store
                         .save_inbox(item, "admission_prepared", None)
                         .await
@@ -796,9 +811,7 @@ impl ProductionService {
                             continue;
                         }
                         Err(error) => {
-                            self.notify_unconfirmed(&item, route, &error.to_string())
-                                .await?;
-                            item.state = "indeterminate".into();
+                            await_proof(&mut item, &error.to_string());
                             self.store
                                 .save_inbox(item, "admission_prepared", None)
                                 .await
@@ -815,22 +828,21 @@ impl ProductionService {
                             pane_id = ?binding.pane_id,
                             "Wakterm submitted channel steering without observer acknowledgement"
                         );
-                        self.notify_unconfirmed(
-                            &item,
-                            route,
+                        await_proof(
+                            &mut item,
                             "the message was typed into the busy agent's turn, but the agent did not acknowledge it",
-                        )
-                        .await?;
-                        "indeterminate"
+                        );
+                        "awaiting_proof"
                     }
                 }
                 AdmissionStatus::Indeterminate => {
                     let detail = receipt
                         .detail
                         .as_deref()
-                        .unwrap_or("Wakterm could not confirm the agent received it");
-                    self.notify_unconfirmed(&item, route, detail).await?;
-                    "indeterminate"
+                        .unwrap_or("Wakterm could not confirm the agent received it")
+                        .to_string();
+                    await_proof(&mut item, &detail);
+                    "awaiting_proof"
                 }
                 _ => "pending",
             }
@@ -842,6 +854,58 @@ impl ProductionService {
                 .map_err(error_string)?;
         }
         Ok(attempted)
+    }
+
+    /// Settles inbound messages whose delivery Wakterm did not confirm. One is
+    /// delivered once Wakterm records input with its hash, and its sender is
+    /// told it may not have arrived if that proof has not come by the deadline.
+    async fn settle_awaiting_inbox(&self, now_ms: i64) -> Result<(), String> {
+        let awaiting = self.store.awaiting_inbox().await.map_err(error_string)?;
+        if awaiting.is_empty() {
+            return Ok(());
+        }
+        let routes = self.store.list_routes().await.map_err(error_string)?;
+        for mut item in awaiting {
+            let Some(proof) = item.proof.clone() else {
+                continue;
+            };
+            let route = routes
+                .iter()
+                .find(|route| route_matches_inbox(route, &item));
+            let preference = if self
+                .store
+                .input_recorded(proof.clone())
+                .await
+                .map_err(error_string)?
+            {
+                item.state = "delivered".into();
+                route.map(|route| (route.id, item.channel))
+            } else if now_ms >= proof.deadline_ms {
+                if let Some(route) = route {
+                    self.notify_unconfirmed(&item, route, &proof.detail).await?;
+                }
+                item.state = "indeterminate".into();
+                None
+            } else {
+                continue;
+            };
+            self.store
+                .save_inbox(item, "awaiting_proof", preference)
+                .await
+                .map_err(error_string)?;
+        }
+        Ok(())
+    }
+
+    async fn event_cursor(&self) -> Result<u64, String> {
+        self.store
+            .get_metadata("wakterm_event_cursor".into())
+            .await
+            .map_err(error_string)?
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .map_err(|_| "stored Wakterm event cursor is invalid".to_string())
+            .map(Option::unwrap_or_default)
     }
 
     /// Tells the sender's chat that an inbound message may not have reached the
@@ -1805,6 +1869,16 @@ fn error_string(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
+/// Leaves an unconfirmed inbound message waiting for proof of delivery from a
+/// full window from now, keeping why it was unconfirmed for the notice.
+fn await_proof(item: &mut InboxItem, detail: &str) {
+    item.state = "awaiting_proof".into();
+    if let Some(proof) = item.proof.as_mut() {
+        proof.deadline_ms = now_ms() + INBOX_PROOF_WINDOW_MS;
+        proof.detail = detail.to_string();
+    }
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2493,6 +2567,7 @@ fi
                 created_at_ms: 2,
                 receipt: None,
                 steering_acknowledged: None,
+                proof: None,
             })
             .await
             .unwrap();
@@ -2873,6 +2948,7 @@ fi
                 created_at_ms: 1,
                 receipt: None,
                 steering_acknowledged: None,
+                proof: None,
             })
             .await
             .unwrap();
@@ -2951,6 +3027,7 @@ fi
                 created_at_ms: 1,
                 receipt: None,
                 steering_acknowledged: None,
+                proof: None,
             })
             .await
             .unwrap();
@@ -2968,6 +3045,10 @@ fi
         );
 
         assert_eq!(service.inbox_once().await.unwrap(), 1);
+        // The agent may still record it, so the sender is not told yet.
+        assert!(store.pending_outbox().await.unwrap().is_empty());
+        assert_eq!(store.awaiting_inbox().await.unwrap().len(), 1);
+        service.settle_awaiting_inbox(i64::MAX).await.unwrap();
         let notices = store.pending_outbox().await.unwrap();
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].destination, "10");
@@ -2979,6 +3060,7 @@ fi
         assert!(notices[0].body.contains("did not start a turn within 15 s"));
         // The item is settled rather than retried, so no second notice follows.
         assert_eq!(store.status().await.unwrap().pending_inbox, 0);
+        assert!(store.awaiting_inbox().await.unwrap().is_empty());
         assert_eq!(service.inbox_once().await.unwrap(), 0);
         drop(service);
         store.shutdown().await.unwrap();
@@ -2991,6 +3073,103 @@ fi
         assert_eq!(record["state"], "indeterminate");
         assert_eq!(record["receipt"]["status"], "indeterminate");
         assert_eq!(record["receipt"]["prompt_written"], true);
+    }
+
+    #[tokio::test]
+    async fn recorded_input_with_the_message_hash_proves_delivery() {
+        let directory = tempdir().unwrap();
+        let store = StoreHandle::open(&directory.path().join("state.sqlite3")).unwrap();
+        store
+            .save_route(
+                Route {
+                    id: RouteId::new(Uuid::new_v4()),
+                    title: "route".into(),
+                    channels: vec![ChannelBinding::Telegram { topic_id: 10 }],
+                    agent: None,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        store.initialize_event_cursor(10).await.unwrap();
+        let body = "Melissa says: it hurts";
+        let mut item = InboxItem {
+            id: EffectId::new(Uuid::from_u128(127)),
+            channel: ChannelKind::Telegram,
+            external_id: "update-4".into(),
+            destination: "10".into(),
+            sender_id: Some("42".into()),
+            sender: Some("Melissa".into()),
+            reply_to_external_id: None,
+            body: body.into(),
+            state: "pending".into(),
+            created_at_ms: 1,
+            receipt: None,
+            steering_acknowledged: None,
+            proof: None,
+        };
+        store.accept_inbox(item.clone()).await.unwrap();
+        item.state = "awaiting_proof".into();
+        item.proof = Some(DeliveryProof {
+            agent_id: "agent-route".into(),
+            incarnation_id: "inc-route".into(),
+            after_sequence: 10,
+            input_sha256: DeliveryProof::input_sha256(body),
+            deadline_ms: i64::MAX,
+            detail: "prompt was written".into(),
+        });
+        store.save_inbox(item, "pending", None).await.unwrap();
+        let service = ProductionService::new(
+            store.clone(),
+            WaktermCli::new(
+                directory.path().join("wakterm-unused"),
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            RealChannels::default(),
+            SupervisorHandle::default(),
+            vec!["event_stream.v1".into()],
+            directory.path().join("control.sock"),
+        );
+        let event = |sequence: u64, agent: &str, text: &str| -> crate::wakterm::EventRecord {
+            serde_json::from_value(serde_json::json!({
+                "sequence": sequence,
+                "event_id": format!("event-{sequence}"),
+                "kind": "input_accepted",
+                "agent_id": agent,
+                "incarnation_id": "inc-route",
+                "observed_at": "2026-10-07T17:22:54Z",
+                "turn_id": "turn-1",
+                "reason": "queued",
+                // Wakterm hashes the input as the agent recorded it, trimmed.
+                "input_sha256": DeliveryProof::input_sha256(&format!("\n{text}\n")),
+            }))
+            .unwrap()
+        };
+        // Another agent recording the same text, or this agent recording
+        // other text, proves nothing.
+        store
+            .ingest_agent_events(
+                10,
+                12,
+                vec![event(11, "agent-other", body), event(12, "agent-route", "hi")],
+                Vec::new(),
+                1,
+            )
+            .await
+            .unwrap();
+        service.settle_awaiting_inbox(now_ms()).await.unwrap();
+        assert_eq!(store.awaiting_inbox().await.unwrap().len(), 1);
+
+        store
+            .ingest_agent_events(12, 13, vec![event(13, "agent-route", body)], Vec::new(), 1)
+            .await
+            .unwrap();
+        service.settle_awaiting_inbox(i64::MAX).await.unwrap();
+        assert!(store.awaiting_inbox().await.unwrap().is_empty());
+        assert!(store.pending_outbox().await.unwrap().is_empty());
+        drop(service);
+        store.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -3050,6 +3229,7 @@ fi
                 created_at_ms: 1,
                 receipt: None,
                 steering_acknowledged: None,
+                proof: None,
             })
             .await
             .unwrap();
@@ -3144,6 +3324,7 @@ fi
                 created_at_ms: 2,
                 receipt: None,
                 steering_acknowledged: None,
+                proof: None,
             })
             .await
             .unwrap();
