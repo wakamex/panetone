@@ -366,7 +366,7 @@ async fn completed_final_and_aborted_final_without_detail_are_not_projected() {
 }
 
 #[tokio::test]
-async fn only_debate_suppresses_the_exact_no_reply_disposition() {
+async fn the_exact_no_reply_token_is_suppressed_and_remembers_the_agent() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("state.sqlite3");
     let store = StoreHandle::open(&path).unwrap();
@@ -411,7 +411,7 @@ async fn only_debate_suppresses_the_exact_no_reply_disposition() {
 }
 
 #[tokio::test]
-async fn debate_forwards_normal_output_and_failures_and_other_routes_forward_the_token() {
+async fn normal_output_and_failures_are_forwarded_and_the_token_is_suppressed_on_every_route() {
     let directory = tempdir().unwrap();
     let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
     let debate = debate_route();
@@ -479,10 +479,7 @@ async fn debate_forwards_normal_output_and_failures_and_other_routes_forward_the
         )
         .await
         .unwrap();
-    assert_eq!(
-        other_store.pending_outbox().await.unwrap()[0].body,
-        "<panetone:no-reply>"
-    );
+    assert!(other_store.pending_outbox().await.unwrap().is_empty());
     other_store.shutdown().await.unwrap();
 }
 

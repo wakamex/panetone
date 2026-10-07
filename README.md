@@ -105,7 +105,7 @@ To attach files to an outbound response, the harness places one standalone line 
 Panetone removes attachment directives outside fenced or indented code blocks, captures the files into the durable outbox, and sends them through the route's already selected Signal or Telegram binding. The harness does not name or inspect the transport. Up to 10 attachment directives are accepted per assistant message. Any regular file the agent's user can read may be attached; each file may be at most 10 MiB, and the combined payload may be at most 50 MiB. Multiple JPEG, PNG, and WebP files become one Telegram media group; a single image uses Telegram's photo presentation; non-image files use its document presentation. Signal receives the files as native attachments on one message. A missing, unreadable, oversized, or out-of-workspace file makes the whole attachment set a visible `Attachment unavailable:` notice and does not stall later output.
 
 Signal routes are owner-only by default. A route bound with `panetone route ensure TITLE --signal-group-id ID --signal-allow-members` accepts every member of that exact Signal group and gives the harness the minimal sender context `<first name> says: <message>`. Unknown groups remain ignored.
-On the `debate` route only, an assistant response consisting exactly of `<panetone:no-reply>` after trimming whitespace is durably recorded as suppressed and is not sent to Signal or Telegram. Normal responses and failure notices remain visible.
+On every route, an assistant response consisting exactly of `<panetone:no-reply>` after trimming whitespace is durably recorded as suppressed and is not sent to Signal or Telegram. Normal responses and failure notices remain visible.
 
 ## Commands
 

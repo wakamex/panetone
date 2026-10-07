@@ -26,7 +26,8 @@ use crate::wakterm::{AgentCatalog, ApprovalRequest, EventRecord};
 
 pub const SCHEMA_VERSION: i64 = 7;
 const COMMAND_CAPACITY: usize = 128;
-const DEBATE_NO_REPLY: &str = "<panetone:no-reply>";
+/// An agent replies with only this token to stay silent in a group chat.
+const NO_REPLY: &str = "<panetone:no-reply>";
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -1368,11 +1369,10 @@ fn ingest_agent_events(
                 outcome.recorded += 1;
                 continue;
             };
-            if route.title.eq_ignore_ascii_case("debate")
-                && event.kind == "assistant_message"
+            if event.kind == "assistant_message"
                 && visible_body
                     .as_deref()
-                    .is_some_and(|body| body.trim() == DEBATE_NO_REPLY)
+                    .is_some_and(|body| body.trim() == NO_REPLY)
             {
                 state = "suppressed";
                 if let Some(candidate) = route_agent {
