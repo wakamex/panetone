@@ -933,6 +933,58 @@ async fn cli_steer_queues_when_the_target_cannot_take_input() {
 }
 
 #[tokio::test]
+async fn a_sender_outside_wakterm_sends_one_way_under_its_own_name() {
+    let directory = tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let database = directory.path().join("state.sqlite3");
+    let store = StoreHandle::open(&database).unwrap();
+    store
+        .save_route(unavailable_route(32, "target", 302), 1)
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+    let telegram = HttpCapture::start();
+    let (wakterm, admitted_prompt, _) = write_busy_steering_wakterm_fake(directory.path());
+    let daemon = Daemon::start(directory.path(), &database, &wakterm, &telegram.base);
+    let send = |extra: &[&str]| {
+        let mut args = vec![
+            "send",
+            "--socket",
+            daemon.socket.to_str().unwrap(),
+            "--to",
+            "target",
+            "--as",
+            "orch",
+        ];
+        args.extend_from_slice(extra);
+        args.push("hello from outside");
+        Command::new(env!("CARGO_BIN_EXE_panetone"))
+            .args(&args)
+            .env_remove("WAKTERM_PANE")
+            .env_remove("CODEX_THREAD_ID")
+            // No wakterm binary: an external sender must not look up a caller.
+            .env("WAKTERM_BIN", "/nonexistent/wakterm")
+            .output()
+            .unwrap()
+    };
+
+    let sent = send(&[]);
+    assert!(
+        sent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sent.stdout)
+    );
+    let refused = send(&["--return-final"]);
+    daemon.stop();
+
+    assert!(!refused.status.success());
+    let prompt = fs::read_to_string(&admitted_prompt).unwrap();
+    assert!(prompt.contains("From: orch (external)"), "{prompt}");
+    assert!(prompt.contains("Reply mode: one-way"));
+    assert!(prompt.ends_with("hello from outside"));
+}
+
+#[tokio::test]
 async fn launcher_can_ensure_a_route_and_wait_for_exact_durable_output() {
     let directory = tempdir().unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();

@@ -99,8 +99,15 @@ struct ControlSocketArgs {
 
 #[derive(Args)]
 struct SendArgs {
-    #[arg(long = "from")]
+    #[arg(long = "from", conflicts_with = "sender")]
     source: Option<String>,
+    #[arg(
+        long = "as",
+        value_name = "NAME",
+        conflicts_with_all = ["source_pane_id", "return_final"],
+        help = "Send one-way as a named sender outside Wakterm, such as a remote assistant"
+    )]
+    sender: Option<String>,
     #[arg(
         long = "to",
         help = "Target route title, or an agent's Wakterm name when the route has several agents"
@@ -796,9 +803,10 @@ async fn shutdown_signal() {
 async fn run_send(args: SendArgs) -> Result<()> {
     let socket = control_socket(args.control.socket)?;
     let source_agent = match (args.source_pane_id, &args.source) {
+        _ if args.sender.is_some() => None,
         (Some(_), _) => None,
         (None, None) => Some(wakterm_caller().await.context(
-            "cannot identify the calling Wakterm agent; pass --from ROUTE or --source-pane-id PANE",
+            "cannot identify the calling Wakterm agent; outside Wakterm, pass --as NAME",
         )?),
         (None, Some(_)) => wakterm_caller().await.ok(),
     };
@@ -808,6 +816,7 @@ async fn run_send(args: SendArgs) -> Result<()> {
         message: args.message,
         source_pane_id: args.source_pane_id,
         source_agent,
+        sender: args.sender,
         return_final: args.return_final,
         steer: args.steer,
         timeout_ms: 0,

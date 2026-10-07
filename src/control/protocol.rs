@@ -26,6 +26,10 @@ pub struct SendParams {
     pub source_pane_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_agent: Option<SourceAgent>,
+    /// The name of a sender outside Wakterm, such as a remote assistant with
+    /// shell access. Such a send is one-way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
     #[serde(default)]
     pub return_final: bool,
     #[serde(default)]

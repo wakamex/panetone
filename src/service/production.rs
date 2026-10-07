@@ -1033,14 +1033,36 @@ impl ProductionService {
             || params.message.is_empty()
             || (params.source.is_none()
                 && params.source_pane_id.is_none()
-                && params.source_agent.is_none())
+                && params.source_agent.is_none()
+                && params.sender.is_none())
         {
             return error_response(
                 id,
                 "invalid_request",
-                "send requires non-empty to and message fields plus from, a Wakterm source pane, or a source agent",
+                "send requires non-empty to and message fields plus from, a Wakterm source pane, a source agent, or an external sender",
                 None,
             );
+        }
+        if let Some(sender) = &params.sender {
+            let combined = params.source.is_some()
+                || params.source_pane_id.is_some()
+                || params.source_agent.is_some();
+            if sender.trim().is_empty() || combined {
+                return error_response(
+                    id,
+                    "invalid_request",
+                    "an external sender needs a non-empty name and no Wakterm source or from route",
+                    None,
+                );
+            }
+            if params.return_final {
+                return error_response(
+                    id,
+                    "invalid_params",
+                    "an external sender cannot receive a final callback; send one-way",
+                    None,
+                );
+            }
         }
         if params.source_pane_id.is_some() && params.source_agent.is_some() {
             return error_response(
@@ -1127,8 +1149,20 @@ impl ProductionService {
                 );
             }
         }
-        let (source, source_binding) = match source_agent {
-            Some((pane_route, binding)) => {
+        let (source, source_binding) = match (source_agent, &params.sender) {
+            // A sender outside Wakterm has no route or agent. It is recorded
+            // on the target's route, where the audit is posted, under a fixed
+            // external identity; one-way sends never call back to it.
+            (_, Some(sender)) => (
+                target,
+                AgentBinding {
+                    agent_id: format!("external:{}", sender.trim()),
+                    incarnation_id: "external".into(),
+                    harness: "external".into(),
+                    pane_id: None,
+                },
+            ),
+            (Some((pane_route, binding)), None) => {
                 let source_title = params.source.as_deref().unwrap_or(&pane_route.title);
                 let source = match exact_route(&routes, source_title) {
                     Ok(route) => route,
@@ -1136,7 +1170,7 @@ impl ProductionService {
                 };
                 (source, binding)
             }
-            None => {
+            (None, None) => {
                 let source_title = params
                     .source
                     .as_deref()
@@ -1164,7 +1198,11 @@ impl ProductionService {
             },
         };
         drop(last_agents);
-        let command_source = source.title.clone();
+        let command_source = params
+            .sender
+            .as_deref()
+            .map(str::trim)
+            .map_or_else(|| source.title.clone(), str::to_owned);
         let source = source.with_agent(source_binding);
         let target = target.with_agent(target_binding);
         match self

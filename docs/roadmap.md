@@ -8,7 +8,7 @@ A final callback whose original caller has exited falls back to the source route
 
 ## Remove `--source-pane-id`
 
-`wakterm agent caller` identifies every caller inside Wakterm. The `--source-pane-id` flag and the `source_pane_id` request field remain only as an older path and can be removed, leaving `--from` for callers outside Wakterm.
+`wakterm agent caller` identifies every caller inside Wakterm. The `--source-pane-id` flag and the `source_pane_id` request field remain only as an older path and can be removed, leaving `--as` for callers outside Wakterm.
 
 ## Filter `route list`
 
