@@ -430,3 +430,58 @@ fi
         other => panic!("unexpected event read: {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn event_pages_accept_input_accepted_events() {
+    // The shape Wakterm documents for input_accepted_events.v1.
+    let page = serde_json::json!({
+        "schema": "wakterm.agent-events.v1",
+        "status": "ok",
+        "requested_after_sequence": 100,
+        "oldest_available_sequence": 1,
+        "latest_sequence": 101,
+        "next_after_sequence": 101,
+        "events": [{
+            "sequence": 101,
+            "event_id": "input-101",
+            "kind": "input_accepted",
+            "agent_id": "agent-zola",
+            "incarnation_id": "incarnation-zola-7",
+            "observed_at": "2026-10-07T00:00:00Z",
+            "turn_id": null,
+            "lifecycle": null,
+            "reason": "queued",
+            "turn_state": null,
+            "text": null,
+            "outcome": null,
+            "recoverable": null,
+            "detail": null,
+            "approval": null,
+            "input_sha256": "0b5f6a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f90"
+        }],
+    });
+    let directory = tempdir().unwrap();
+    let page_file = directory.path().join("page.json");
+    fs::write(&page_file, format!("{page}\n")).unwrap();
+    let (_script_directory, binary) = fake_cli(&format!(
+        r#"
+if [[ "$*" == *"agent capabilities"* ]]; then
+  printf '%s\n' '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1","input_accepted_events.v1"]}}'
+elif [[ "$*" == *"agent events"* ]]; then
+  cat '{}'
+else
+  exit 9
+fi
+"#,
+        page_file.display()
+    ));
+    let cli = WaktermCli::new(binary, "/tmp/non-production.sock", Duration::from_secs(2));
+    match cli.event_page(100, 100).await.unwrap() {
+        EventRead::Events { events, .. } => {
+            assert_eq!(events[0].kind, "input_accepted");
+            assert_eq!(events[0].visible_output_body(), Ok(None));
+            assert_eq!(events[0].approval(), Ok(None));
+        }
+        other => panic!("unexpected event read: {other:?}"),
+    }
+}
