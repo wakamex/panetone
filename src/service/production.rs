@@ -3078,7 +3078,7 @@ fi
     #[tokio::test]
     async fn recorded_input_with_the_message_hash_proves_delivery() {
         let directory = tempdir().unwrap();
-        let store = StoreHandle::open(&directory.path().join("state.sqlite3")).unwrap();
+        let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
         store
             .save_route(
                 Route {
