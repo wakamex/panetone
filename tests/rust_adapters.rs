@@ -49,7 +49,7 @@ fn current_and_compatibility_alias_both_expose_live_event_behavior() {
 }
 
 #[test]
-fn incompatible_versions_and_unknown_future_events_fail_closed() {
+fn incompatible_versions_fail_and_unknown_event_kinds_are_skipped() {
     let mut fixture: Value = serde_json::from_str(&golden()).unwrap();
     fixture["current_capabilities"]["api_major"] = 2.into();
     assert!(matches!(
@@ -59,10 +59,9 @@ fn incompatible_versions_and_unknown_future_events_fail_closed() {
 
     let mut fixture: Value = serde_json::from_str(&golden()).unwrap();
     fixture["event_page"]["events"][0]["kind"] = "future_unknown".into();
-    assert!(matches!(
-        WaktermContract::from_golden_json(&fixture.to_string(), ProfileKind::FutureEvents),
-        Err(ContractError::Invalid("unknown event kind"))
-    ));
+    assert!(
+        WaktermContract::from_golden_json(&fixture.to_string(), ProfileKind::FutureEvents).is_ok()
+    );
 }
 
 #[test]

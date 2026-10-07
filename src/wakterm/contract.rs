@@ -366,19 +366,8 @@ fn validate_events(events: &[EventRecord]) -> Result<(), ContractError> {
         if previous.is_some_and(|sequence| sequence >= event.sequence) {
             return Err(ContractError::Invalid("event sequences are not increasing"));
         }
-        if !matches!(
-            event.kind.as_str(),
-            "agent_lifecycle"
-                | "approval_requested"
-                | "input_accepted"
-                | "turn_started"
-                | "turn_state_changed"
-                | "plan"
-                | "assistant_message"
-                | "observer_failure"
-                | "turn_final"
-        ) {
-            return Err(ContractError::Invalid("unknown event kind"));
+        if event.kind.is_empty() {
+            return Err(ContractError::Invalid("event has no kind"));
         }
         previous = Some(event.sequence);
     }

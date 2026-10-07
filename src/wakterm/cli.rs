@@ -956,18 +956,9 @@ fn validate_live_events(
             || event.event_id.is_empty()
             || event.agent_id.is_empty()
             || event.incarnation_id.is_empty()
-            || !matches!(
-                event.kind.as_str(),
-                "agent_lifecycle"
-                    | "approval_requested"
-                    | "input_accepted"
-                    | "turn_started"
-                    | "turn_state_changed"
-                    | "plan"
-                    | "assistant_message"
-                    | "observer_failure"
-                    | "turn_final"
-            )
+            // An unknown kind passes these checks and is then skipped: the
+            // v1 contract announces kinds a consumer must act on as capabilities.
+            || event.kind.is_empty()
         {
             return Err(WaktermCliError::InvalidEventPage(
                 "events are unordered or contain an invalid required field",
