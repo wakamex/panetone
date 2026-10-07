@@ -15,7 +15,7 @@ Wakterm is authoritative for live panes, agent and process incarnations, provide
 
 Panetone is authoritative for user-facing routes and aliases, messaging-channel bindings and Telegram topic creation, authorization, control-request idempotency, audit-before-prompt policy, workflow state, notification delivery, and its consumed Wakterm cursor.
 
-Transport metadata remains inside Panetone. Once an inbound sender is authorized and the destination route is resolved, Wakterm receives the exact message body. The harness does not need to distinguish the same user at a keyboard from the same user through Telegram or Signal. Outbound attachments use one transport-neutral annotation in normalized assistant output. Panetone may read the tagged file only after resolving it inside the emitting pane's Wakterm-reported working directory, then captures its bytes durably before either channel adapter runs.
+Transport metadata remains inside Panetone. Once an inbound sender is authorized and the destination route is resolved, Wakterm receives the exact message body. The harness does not need to distinguish the same user at a keyboard from the same user through Telegram or Signal. Outbound attachments use one transport-neutral annotation in normalized assistant output. Panetone reads any regular file the agent's user can read, since the agent can already read and send such files by other means, then captures its bytes durably before either channel adapter runs.
 
 The shared boundary is a versioned Wakterm Agent API. Its public identifiers are opaque agent, process-incarnation, provider-turn, request, and event identifiers. Provider paths, file cursors, parsers, TTY matching, and pane implementation details remain private to Wakterm.
 

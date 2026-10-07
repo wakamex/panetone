@@ -183,21 +183,6 @@ struct WireReceipt {
 struct LivePane {
     pane_id: u64,
     effective_title: String,
-    #[serde(default)]
-    cwd: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct AgentPane {
-    pane_id: u64,
-    #[serde(default)]
-    metadata: Option<AgentPaneMetadata>,
-}
-
-#[derive(Deserialize)]
-struct AgentPaneMetadata {
-    #[serde(default)]
-    declared_cwd: Option<PathBuf>,
 }
 
 /// One entry of `wakterm agent list`, as far as agent health needs it.
@@ -297,7 +282,6 @@ fn agent_problems(panes: &[LivePane], agents: &[ListedAgent]) -> Vec<AgentProble
 pub struct LiveRoute {
     pub title: String,
     pub agents: Vec<AgentBinding>,
-    working_directories: BTreeMap<u64, PathBuf>,
 }
 
 impl LiveRoute {
@@ -323,13 +307,6 @@ impl LiveRoute {
                 })
         });
         preferred.or_else(|| self.agents.first()).cloned()
-    }
-
-    pub fn working_directory(&self, agent: &AgentBinding) -> Option<&Path> {
-        agent
-            .pane_id
-            .and_then(|pane_id| self.working_directories.get(&pane_id))
-            .map(PathBuf::as_path)
     }
 }
 
@@ -509,18 +486,7 @@ impl WaktermCli {
     pub async fn live_routes(&self) -> Result<LiveRouteSnapshot, WaktermCliError> {
         let before = self.catalog().await?;
         let panes: Vec<LivePane> = self.run_json(&["list", "--format", "json"], None).await?;
-        let agent_panes: Vec<AgentPane> = self
-            .run_json(&["agent", "list", "--format", "json"], None)
-            .await?;
         let after = self.catalog().await?;
-        let declared_working_directories = agent_panes
-            .into_iter()
-            .filter_map(|pane| {
-                pane.metadata
-                    .and_then(|metadata| metadata.declared_cwd)
-                    .map(|cwd| (pane.pane_id, cwd))
-            })
-            .collect::<BTreeMap<_, _>>();
         let mut grouped = BTreeMap::<String, LiveRoute>::new();
         for pane in panes {
             if pane.effective_title.trim().is_empty() {
@@ -531,7 +497,6 @@ impl WaktermCli {
                 .or_insert_with(|| LiveRoute {
                     title: pane.effective_title,
                     agents: Vec::new(),
-                    working_directories: BTreeMap::new(),
                 });
             match join_catalog_binding(pane.pane_id, &before, &after) {
                 Ok(binding)
@@ -540,14 +505,6 @@ impl WaktermCli {
                             && agent.incarnation_id == binding.incarnation_id
                     }) =>
                 {
-                    if let Some(cwd) = pane
-                        .cwd
-                        .as_deref()
-                        .and_then(cwd_uri_to_path)
-                        .or_else(|| declared_working_directories.get(&pane.pane_id).cloned())
-                    {
-                        route.working_directories.insert(pane.pane_id, cwd);
-                    }
                     route.agents.push(binding);
                 }
                 Ok(_) => {}
@@ -930,12 +887,6 @@ impl WaktermCli {
     }
 }
 
-fn cwd_uri_to_path(value: &str) -> Option<PathBuf> {
-    let rest = value.strip_prefix("file://")?;
-    let path = rest.find('/').map(|index| &rest[index..])?;
-    Path::new(path).is_absolute().then(|| PathBuf::from(path))
-}
-
 fn parse_event_page(
     page: WireEventPage,
     after_sequence: u64,
@@ -1085,7 +1036,6 @@ mod tests {
         let panes = [1, 2, 3, 4, 5].map(|pane_id| LivePane {
             pane_id,
             effective_title: format!("tab-{pane_id}"),
-            cwd: None,
         });
 
         let problems = agent_problems(&panes, &agents);

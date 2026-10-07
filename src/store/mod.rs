@@ -169,8 +169,6 @@ impl EventIngestOutcome {
 pub struct RouteAgent {
     pub route_id: RouteId,
     pub agent: AgentBinding,
-    #[serde(default)]
-    pub working_directory: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1473,10 +1471,8 @@ fn ingest_agent_events(
                     (body, Vec::new(), actions)
                 }
                 None => {
-                    let (body, attachments) = visible_attachments(
-                        visible_body.expect("visible output was checked"),
-                        route_agent.and_then(|candidate| candidate.working_directory.as_deref()),
-                    );
+                    let (body, attachments) =
+                        visible_attachments(visible_body.expect("visible output was checked"));
                     (body, attachments, Vec::new())
                 }
             };
@@ -1705,10 +1701,7 @@ fn strip_memory_citations(body: &str) -> String {
     retained.join("\n").trim_end().to_owned()
 }
 
-fn visible_attachments(
-    body: String,
-    working_directory: Option<&Path>,
-) -> (String, Vec<ChannelAttachment>) {
+fn visible_attachments(body: String) -> (String, Vec<ChannelAttachment>) {
     let mut retained = Vec::new();
     let mut requested = Vec::new();
     let mut fence = None;
@@ -1742,7 +1735,7 @@ fn visible_attachments(
     }
     let clean_body = retained.join("\n").trim_end().to_owned();
     let result = if requested.len() <= MAX_CHANNEL_ATTACHMENTS {
-        capture_attachments(&requested, working_directory)
+        capture_attachments(&requested)
     } else {
         Err(format!(
             "at most {MAX_CHANNEL_ATTACHMENTS} attachment tags are supported per assistant message"
@@ -1785,14 +1778,11 @@ fn closes_markdown_fence(line: &str, marker: u8, minimum_length: usize) -> bool 
     length >= minimum_length && line[length..].trim().is_empty()
 }
 
-fn capture_attachments(
-    requested: &[String],
-    working_directory: Option<&Path>,
-) -> Result<Vec<ChannelAttachment>, String> {
+fn capture_attachments(requested: &[String]) -> Result<Vec<ChannelAttachment>, String> {
     let mut attachments = Vec::with_capacity(requested.len());
     let mut total = 0_u64;
     for path in requested {
-        let attachment = capture_attachment(path, working_directory)?;
+        let attachment = capture_attachment(path)?;
         total = total.saturating_add(attachment.size);
         if total > MAX_CHANNEL_ATTACHMENT_TOTAL_BYTES {
             return Err(format!(
@@ -1804,25 +1794,17 @@ fn capture_attachments(
     Ok(attachments)
 }
 
-fn capture_attachment(
-    requested: &str,
-    working_directory: Option<&Path>,
-) -> Result<ChannelAttachment, String> {
+/// Reads a file an agent tagged for posting. Any file the agent's user can
+/// read is allowed, since the agent can read and send it by other means.
+fn capture_attachment(requested: &str) -> Result<ChannelAttachment, String> {
     let requested = Path::new(requested);
     if !requested.is_absolute() {
         return Err("the tagged path must be absolute".into());
     }
-    let root = working_directory
-        .ok_or_else(|| "Wakterm did not report the harness working directory".to_string())?;
-    let root = fs::canonicalize(root)
-        .map_err(|_| "the harness working directory is unavailable".to_string())?;
     let mut file =
         File::open(requested).map_err(|_| "the tagged file does not exist".to_string())?;
     let path = opened_file_path(&file, requested)
         .map_err(|_| "the tagged file cannot be inspected".to_string())?;
-    if !path.starts_with(&root) {
-        return Err("the tagged file is outside the harness working directory".into());
-    }
     let metadata = file
         .metadata()
         .map_err(|_| "the tagged file cannot be inspected".to_string())?;

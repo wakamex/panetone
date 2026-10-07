@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -1707,7 +1707,6 @@ fn project_live_routes(
             projected.push(RouteAgent {
                 route_id: route.id,
                 agent: agent.clone(),
-                working_directory: live_route.working_directory(agent).map(Path::to_path_buf),
             });
         }
     }
@@ -2185,7 +2184,6 @@ fi
                 vec![RouteAgent {
                     route_id: route.id,
                     agent,
-                    working_directory: None,
                 }],
                 2,
             )

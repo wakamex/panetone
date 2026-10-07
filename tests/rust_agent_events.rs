@@ -44,7 +44,6 @@ fn live_agents(route: &Route) -> Vec<RouteAgent> {
     vec![RouteAgent {
         route_id: route.id,
         agent: route.agent.clone().unwrap(),
-        working_directory: None,
     }]
 }
 
@@ -575,8 +574,7 @@ async fn standalone_attachment_tags_are_captured_in_order_and_use_the_route_chan
         )
         .into(),
     );
-    let mut agents = live_agents(&route);
-    agents[0].working_directory = Some(workspace);
+    let agents = live_agents(&route);
     store.initialize_event_cursor(expected).await.unwrap();
 
     store
@@ -604,12 +602,13 @@ async fn standalone_attachment_tags_are_captured_in_order_and_use_the_route_chan
 }
 
 #[tokio::test]
-async fn attachment_tag_cannot_read_outside_the_harness_working_directory() {
+async fn attachment_tags_read_any_readable_file_and_report_missing_ones() {
     let directory = tempdir().unwrap();
-    let workspace = directory.path().join("workspace");
-    fs::create_dir(&workspace).unwrap();
-    let outside = directory.path().join("private.png");
-    fs::write(&outside, b"private").unwrap();
+    let elsewhere = directory.path().join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    let outside = elsewhere.join("report.png");
+    fs::write(&outside, b"png bytes").unwrap();
+    let missing = directory.path().join("missing.png");
     let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
     let route = route();
     store.save_route(route.clone(), 1).await.unwrap();
@@ -620,10 +619,14 @@ async fn attachment_tag_cannot_read_outside_the_harness_working_directory() {
     let expected = event.sequence - 1;
     event.fields.insert(
         "text".into(),
-        format!("[panetone:attach {}]", outside.display()).into(),
+        format!(
+            "[panetone:attach {}]\n[panetone:attach {}]",
+            outside.display(),
+            missing.display()
+        )
+        .into(),
     );
-    let mut agents = live_agents(&route);
-    agents[0].working_directory = Some(workspace);
+    let agents = live_agents(&route);
     store.initialize_event_cursor(expected).await.unwrap();
 
     store
@@ -636,8 +639,37 @@ async fn attachment_tag_cannot_read_outside_the_harness_working_directory() {
     assert!(output[0].attachments.is_empty());
     assert_eq!(
         output[0].body,
-        "Attachment unavailable: the tagged file is outside the harness working directory"
+        "Attachment unavailable: the tagged file does not exist"
     );
+    store.shutdown().await.unwrap();
+
+    // A file anywhere the agent's user can read is attached.
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    store.save_route(route.clone(), 1).await.unwrap();
+    let mut event = fixture_events()
+        .into_iter()
+        .find(|event| event.kind == "assistant_message")
+        .unwrap();
+    event.fields.insert(
+        "text".into(),
+        format!("Here.\n[panetone:attach {}]", outside.display()).into(),
+    );
+    store.initialize_event_cursor(expected).await.unwrap();
+    store
+        .ingest_agent_events(
+            expected,
+            event.sequence,
+            vec![event],
+            live_agents(&route),
+            3,
+        )
+        .await
+        .unwrap();
+    let output = store.pending_outbox().await.unwrap();
+    assert_eq!(output[0].body, "Here.");
+    assert_eq!(output[0].attachments.len(), 1);
+    assert_eq!(output[0].attachments[0].file_name, "report.png");
     store.shutdown().await.unwrap();
 }
 

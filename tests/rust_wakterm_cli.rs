@@ -225,10 +225,6 @@ fi
     let route = live.route("PANETONE").unwrap();
     assert_eq!(route.agents.len(), 2);
     assert_eq!(route.select(None).unwrap().pane_id, Some(4));
-    assert_eq!(
-        route.working_directory(&route.agents[0]),
-        Some(std::path::Path::new("/code/panetone-first"))
-    );
 
     let preferred = AgentBinding {
         agent_id: "agent-second".into(),
