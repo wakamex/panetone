@@ -527,7 +527,6 @@ async fn an_admission_interrupted_by_a_restart_waits_for_proof_when_it_has_one()
             2,
             Some(DeliveryProof {
                 agent_id: "agent".into(),
-                incarnation_id: "inc".into(),
                 after_sequence: 0,
                 input_sha256: DeliveryProof::input_sha256("hello"),
                 deadline_ms: 1,

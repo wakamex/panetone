@@ -768,7 +768,6 @@ impl ProductionService {
             item.state = "admission_prepared".into();
             item.proof = Some(DeliveryProof {
                 agent_id: binding.agent_id.clone(),
-                incarnation_id: binding.incarnation_id.clone(),
                 after_sequence,
                 input_sha256: DeliveryProof::input_sha256(&item.body),
                 deadline_ms: now_ms() + INBOX_PROOF_WINDOW_MS,
@@ -3112,7 +3111,6 @@ fi
         item.state = "awaiting_proof".into();
         item.proof = Some(DeliveryProof {
             agent_id: "agent-route".into(),
-            incarnation_id: "inc-route".into(),
             after_sequence: 10,
             input_sha256: DeliveryProof::input_sha256(body),
             deadline_ms: i64::MAX,
@@ -3137,7 +3135,8 @@ fi
                 "event_id": format!("event-{sequence}"),
                 "kind": "input_accepted",
                 "agent_id": agent,
-                "incarnation_id": "inc-route",
+                // A resumed process reports input under a new incarnation.
+                "incarnation_id": format!("inc-{sequence}"),
                 "observed_at": "2026-10-07T17:22:54Z",
                 "turn_id": "turn-1",
                 "reason": "queued",

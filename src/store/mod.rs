@@ -117,11 +117,12 @@ pub struct InboxItem {
 }
 
 /// Wakterm recording input with the message's hash for the target agent
-/// after the delivery began proves the agent received it.
+/// after the delivery began proves the agent received it. Any incarnation
+/// counts: input typed just before a resumed process is observed is reported
+/// under its new incarnation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeliveryProof {
     pub agent_id: String,
-    pub incarnation_id: String,
     pub after_sequence: u64,
     /// The SHA-256 of the trimmed message, as Wakterm's `input_sha256`.
     pub input_sha256: String,
@@ -2205,16 +2206,11 @@ fn input_recorded(connection: &Connection, proof: &DeliveryProof) -> StoreResult
     Ok(connection
         .query_row(
             "SELECT 1 FROM agent_events
-             WHERE agent_id = ?1 AND incarnation_id = ?2 AND sequence > ?3
+             WHERE agent_id = ?1 AND sequence > ?2
                AND kind IN ('input_accepted', 'turn_started')
-               AND json_extract(record_json, '$.input_sha256') = ?4
+               AND json_extract(record_json, '$.input_sha256') = ?3
              LIMIT 1",
-            params![
-                proof.agent_id,
-                proof.incarnation_id,
-                proof.after_sequence,
-                proof.input_sha256
-            ],
+            params![proof.agent_id, proof.after_sequence, proof.input_sha256],
             |_| Ok(()),
         )
         .optional()?
