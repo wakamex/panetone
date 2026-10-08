@@ -646,6 +646,12 @@ async fn telegram_loop(
                 .await
                 .map_err(|error| error.to_string())?;
         }
+        for query_id in std::mem::take(&mut batch.unknown_taps) {
+            poller
+                .answer_callback(&query_id, "This button is no longer valid")
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         batch
             .messages
             .retain(|message| message.sender_id.as_deref() == Some(owner.as_str()));

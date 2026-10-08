@@ -191,6 +191,22 @@ async fn telegram_polling_returns_structured_approval_callbacks() {
                 "message": {"chat": {"id": -1001}, "message_thread_id": 77},
                 "data": "wakap:0123456789abcdef01234567:allow_once"
             }
+        }, {
+            "update_id": 46,
+            "callback_query": {
+                "id": "callback-2",
+                "from": {"id": 1234},
+                "message": {"chat": {"id": -1001}, "message_thread_id": 77},
+                "data": "wakap:e036ee906fc029cc0aac07af:option_1"
+            }
+        }, {
+            "update_id": 47,
+            "callback_query": {
+                "id": "callback-3",
+                "from": {"id": 1234},
+                "message": {"chat": {"id": -1001}, "message_thread_id": 77},
+                "data": "retired-button"
+            }
         }]
     })
     .to_string();
@@ -205,9 +221,12 @@ async fn telegram_polling_returns_structured_approval_callbacks() {
     )
     .unwrap();
     let batch = poller.poll(40, 0).await.unwrap();
-    assert_eq!(batch.next_offset, 46);
+    assert_eq!(batch.next_offset, 48);
     assert!(batch.messages.is_empty());
-    assert_eq!(batch.approvals.len(), 1);
+    assert_eq!(batch.approvals.len(), 2);
+    assert_eq!(batch.approvals[1].choice_id, "option_1");
+    // An unrecognized tap is still answered, so its button stops spinning.
+    assert_eq!(batch.unknown_taps, ["callback-3"]);
     assert_eq!(batch.approvals[0].sender_id, "1234");
     assert_eq!(batch.approvals[0].destination, "77");
     assert_eq!(batch.approvals[0].request_id, "0123456789abcdef01234567");

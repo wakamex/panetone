@@ -68,6 +68,9 @@ pub struct InboundBatch {
     pub messages: Vec<InboundMessage>,
     pub approvals: Vec<TelegramApprovalResponse>,
     pub form_taps: Vec<TelegramFormTap>,
+    /// Callback query IDs of button taps Panetone does not recognize, which
+    /// are answered so the button does not keep spinning.
+    pub unknown_taps: Vec<String>,
     pub next_offset: i64,
 }
 
@@ -191,6 +194,7 @@ impl TelegramPoller {
         let mut messages = Vec::new();
         let mut approvals = Vec::new();
         let mut form_taps = Vec::new();
+        let mut unknown_taps = Vec::new();
         for update in response.result {
             next_offset = next_offset.max(update.update_id.saturating_add(1));
             if let Some(callback) = update.callback_query
@@ -215,6 +219,9 @@ impl TelegramPoller {
                         request_id,
                         action,
                     });
+                } else {
+                    tracing::warn!(data = %callback.data, "unrecognized Telegram button tap");
+                    unknown_taps.push(callback.id);
                 }
             }
             let Some(message) = update.message else {
@@ -299,6 +306,7 @@ impl TelegramPoller {
             messages,
             approvals,
             form_taps,
+            unknown_taps,
             next_offset,
         })
     }
@@ -848,6 +856,9 @@ impl TelegramUser {
     }
 }
 
+/// Parses `wakap:REQUEST:CHOICE`. Wakterm request and choice IDs are opaque,
+/// so only their presence is checked here; the tap is matched against the
+/// stored approval's advertised choices before it is applied.
 fn parse_approval_callback(data: &str) -> Option<(String, String)> {
     let mut parts = data.split(':');
     if parts.next()? != "wakap" {
@@ -855,13 +866,7 @@ fn parse_approval_callback(data: &str) -> Option<(String, String)> {
     }
     let request_id = parts.next()?;
     let choice_id = parts.next()?;
-    if parts.next().is_some()
-        || request_id.len() != 24
-        || !request_id.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || !choice_id
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
-    {
+    if parts.next().is_some() || request_id.is_empty() || choice_id.is_empty() {
         return None;
     }
     Some((request_id.to_string(), choice_id.to_string()))
@@ -981,8 +986,14 @@ mod tests {
             parse_approval_callback("wakap:0123456789abcdef01234567:allow_once"),
             Some(("0123456789abcdef01234567".into(), "allow_once".into()))
         );
-        assert!(parse_approval_callback("wakap:short:allow_once").is_none());
-        assert!(parse_approval_callback("wakap:0123456789abcdef01234567:Allow").is_none());
+        // Claude question choices are numbered.
+        assert_eq!(
+            parse_approval_callback("wakap:e036ee906fc029cc0aac07af:option_1"),
+            Some(("e036ee906fc029cc0aac07af".into(), "option_1".into()))
+        );
+        assert!(parse_approval_callback("wakap::allow_once").is_none());
+        assert!(parse_approval_callback("wakap:0123456789abcdef01234567:").is_none());
+        assert!(parse_approval_callback("wakap:a:b:c").is_none());
         assert!(parse_approval_callback("other:0123456789abcdef01234567:allow_once").is_none());
     }
 }
