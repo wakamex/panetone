@@ -16,6 +16,7 @@ use crate::wakterm::{
     ContractError, EventRead, FakeWakterm, TerminalResult, WaktermCli, WaktermCliError,
 };
 
+const QUEUED_DETAIL: &str = "The target is busy, so the message is queued and Panetone delivers it when the target is idle. Do not send it again.";
 const ASYNC_REPLY_DETAIL: &str = "This command does not wait for completion. Panetone mirrors the final to the source route's channel when it arrives and delivers the agent callback when the source agent is idle.";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -23,6 +24,10 @@ pub struct ServiceAck {
     pub accepted: bool,
     pub delivery_state: String,
     pub submitted: bool,
+    /// What a `queued` state means for the sender, so `submitted: false`
+    /// is not read as a failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_detail: Option<String>,
     pub reply_pending: bool,
     #[serde(default)]
     pub reply_mode: String,
@@ -46,6 +51,7 @@ impl ServiceAck {
             accepted: true,
             delivery_state: delivery_state.into(),
             submitted,
+            delivery_detail: (delivery_state == "queued").then(|| QUEUED_DETAIL.into()),
             reply_pending,
             reply_mode: if return_final {
                 "asynchronous_final_callback".into()
@@ -62,6 +68,7 @@ impl ServiceAck {
             accepted: true,
             delivery_state: "steered".into(),
             submitted: true,
+            delivery_detail: None,
             reply_pending: false,
             reply_mode: "none".into(),
             reply_detail: None,

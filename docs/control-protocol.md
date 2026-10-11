@@ -228,7 +228,9 @@ A successful acknowledgement is:
 ```
 
 A definitively busy target returns a successful durable registration with
-`delivery_state: "queued"`, `submitted: false`, and `reply_pending: false`.
+`delivery_state: "queued"`, `submitted: false`, and `reply_pending: false`,
+with a `delivery_detail` saying the message is delivered when the target is
+idle and must not be sent again.
 The busy worker resolves the workspace route again before admission. It does
 not steer an active turn.
 

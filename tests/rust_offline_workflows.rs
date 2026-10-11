@@ -249,6 +249,12 @@ async fn busy_target_queues_durably_and_re_resolves_the_same_route_before_retry(
         .await
         .unwrap();
     assert_eq!(queued.delivery_state, "queued");
+    assert!(
+        queued
+            .delivery_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("Do not send it again"))
+    );
     assert!(!queued.submitted);
     assert!(!queued.reply_pending);
     assert_eq!(queued.reply_mode, "asynchronous_final_callback");
