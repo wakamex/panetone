@@ -625,8 +625,12 @@ impl SignalSubscriber {
                 Ok(line) => line?,
                 Err(_) => continue,
             };
-            let notification: Value = serde_json::from_slice(&line)
-                .map_err(|_| ChannelDeliveryError::Malformed(ChannelKind::Signal))?;
+            // One notification Panetone cannot use must not end the
+            // subscription, so it is skipped.
+            let Ok(notification) = serde_json::from_slice::<Value>(&line) else {
+                tracing::warn!("skipped a Signal notification that is not JSON");
+                continue;
+            };
             if notification.get("method").is_none() {
                 continue;
             }
@@ -635,14 +639,18 @@ impl SignalSubscriber {
             let Some(body) = signal_body(data, &self.attachment_directory) else {
                 continue;
             };
-            let destination = data["groupInfo"]["groupId"]
-                .as_str()
-                .ok_or(ChannelDeliveryError::Malformed(ChannelKind::Signal))?;
-            let timestamp = envelope["timestamp"]
+            // Routes are Signal groups, so a direct message has no route.
+            let Some(destination) = data["groupInfo"]["groupId"].as_str() else {
+                continue;
+            };
+            let Some(timestamp) = envelope["timestamp"]
                 .as_i64()
                 .map(|value| value.to_string())
                 .or_else(|| envelope["timestamp"].as_str().map(str::to_owned))
-                .ok_or(ChannelDeliveryError::Malformed(ChannelKind::Signal))?;
+            else {
+                tracing::warn!("skipped a Signal message without a timestamp");
+                continue;
+            };
             let source = envelope["sourceNumber"]
                 .as_str()
                 .or_else(|| envelope["source"].as_str())
@@ -916,6 +924,7 @@ async fn read_bounded_line(
     reader: &mut BufReader<UnixStream>,
 ) -> Result<Vec<u8>, ChannelDeliveryError> {
     let mut line = Vec::new();
+    let mut oversized = false;
     loop {
         let available = reader
             .fill_buf()
@@ -928,15 +937,23 @@ async fn read_bounded_line(
             .iter()
             .position(|byte| *byte == b'\n')
             .map_or(available.len(), |position| position + 1);
-        if line.len() + consumed > MAX_INBOUND_BYTES {
-            return Err(ChannelDeliveryError::Malformed(ChannelKind::Signal));
-        }
         let complete = available[consumed - 1] == b'\n';
-        line.extend_from_slice(&available[..consumed]);
+        oversized |= line.len() + consumed > MAX_INBOUND_BYTES;
+        if !oversized {
+            line.extend_from_slice(&available[..consumed]);
+        }
         reader.consume(consumed);
-        if complete {
+        if !complete {
+            continue;
+        }
+        if !oversized {
             return Ok(line);
         }
+        // The rest of an oversized line is discarded and reading resumes at
+        // the next one.
+        tracing::warn!("skipped an oversized Signal notification");
+        line.clear();
+        oversized = false;
     }
 }
 

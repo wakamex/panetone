@@ -913,3 +913,54 @@ async fn replies_tell_the_agent_which_message_they_answer() {
     );
     store.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn signal_notifications_panetone_cannot_use_are_skipped() {
+    let directory = tempdir().unwrap();
+    let socket_path = directory.path().join("signal-skip.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut request = String::new();
+        reader.read_line(&mut request).await.unwrap();
+        reader
+            .get_mut()
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"panetone-subscribe\",\"result\":{}}\n")
+            .await
+            .unwrap();
+        let receive = |data: serde_json::Value| {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "receive",
+                "params": {"result": {"envelope": {
+                    "sourceNumber": "+15551111",
+                    "timestamp": 9003,
+                    "dataMessage": data
+                }}}
+            })
+        };
+        let direct = receive(serde_json::json!({"message": "direct message"}));
+        let oversized = receive(serde_json::json!({
+            "message": "x".repeat(1024 * 1024),
+            "groupInfo": {"groupId": "group-one=="}
+        }));
+        let grouped = receive(serde_json::json!({
+            "message": "after the skipped ones",
+            "groupInfo": {"groupId": "group-one=="}
+        }));
+        reader
+            .get_mut()
+            .write_all(format!("{direct}\nnot json\n{oversized}\n{grouped}\n").as_bytes())
+            .await
+            .unwrap();
+    });
+
+    let mut subscriber =
+        SignalSubscriber::connect(&socket_path, "+15550000", Duration::from_secs(2))
+            .await
+            .unwrap();
+    let message = subscriber.next().await.unwrap();
+    assert_eq!(message.body, "after the skipped ones");
+    server.await.unwrap();
+}
