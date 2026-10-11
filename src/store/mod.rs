@@ -1484,10 +1484,13 @@ fn ingest_agent_events(
                     )
                 }
                 Some(approval) => {
-                    let mut body = if approval.kind.starts_with("user_question") {
-                        "Input needed".to_string()
-                    } else {
+                    // Only a command approval asks to approve something; every
+                    // other kind, including ones Panetone does not know, is a
+                    // choice the agent is waiting on.
+                    let mut body = if approval.kind == "command_approval" {
                         "Approval needed".to_string()
+                    } else {
+                        "Input needed".to_string()
                     };
                     if let Some(prompt) = approval.prompt.as_deref() {
                         body.push_str("\n\n");

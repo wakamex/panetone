@@ -125,6 +125,72 @@ async fn question_event_routes_buttons_and_preserves_exact_identity() {
 }
 
 #[tokio::test]
+async fn an_approval_of_an_unknown_kind_is_posted_with_its_choices_as_buttons() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let route = route();
+    store.save_route(route.clone(), 1).await.unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+    // The shape Wakterm emits for Claude's "Session paused" safeguards menu.
+    let event: EventRecord = serde_json::from_value(serde_json::json!({
+        "sequence": 101,
+        "event_id": "approval-event-101",
+        "kind": "approval_requested",
+        "agent_id": "agent-zola",
+        "incarnation_id": "incarnation-zola-7",
+        "turn_id": "",
+        "approval": {
+            "schema": "wakterm.agent-approval.v1",
+            "kind": "claude_refusal_fallback",
+            "request_id": "0123456789abcdef01234567",
+            "agent_id": "agent-zola",
+            "incarnation_id": "incarnation-zola-7",
+            "turn_id": "",
+            "item_id": "0123456789abcdef01234567",
+            "observed_at": "2026-10-11T04:06:12Z",
+            "prompt": "Session paused: Opus 5.5's safeguards flagged this session. Details: [cyber]",
+            "reason": null,
+            "command": null,
+            "cwd": null,
+            "choices": [
+                {"id": "retry_fallback", "label": "Switch to Opus 4.8"},
+                {"id": "edit_prompt", "label": "Edit prompt and retry with Opus 5.5"}
+            ],
+            "questions": []
+        }
+    }))
+    .unwrap();
+    store
+        .ingest_agent_events(100, 101, vec![event], live_agents(&route), 3)
+        .await
+        .unwrap();
+    let pending = store.pending_outbox().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].body,
+        "Input needed\n\nSession paused: Opus 5.5's safeguards flagged this session. Details: [cyber]"
+    );
+    assert_eq!(
+        pending[0]
+            .actions
+            .iter()
+            .map(|action| (action.id.as_str(), action.label.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "wakap:0123456789abcdef01234567:retry_fallback",
+                "Switch to Opus 4.8"
+            ),
+            (
+                "wakap:0123456789abcdef01234567:edit_prompt",
+                "Edit prompt and retry with Opus 5.5"
+            ),
+        ]
+    );
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn question_form_is_posted_as_text_for_the_agent_pane() {
     let directory = tempdir().unwrap();
     let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
