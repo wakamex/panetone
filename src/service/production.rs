@@ -907,6 +907,44 @@ impl ProductionService {
             .map(Option::unwrap_or_default)
     }
 
+    /// Shows a typing indicator in the Telegram topic of every route whose
+    /// agent is working and whose output goes to Telegram. Telegram clears the
+    /// indicator after about five seconds, so this runs every few seconds.
+    pub async fn typing_once(&self) -> Result<usize, String> {
+        if self.channels.telegram.is_none() {
+            return Ok(0);
+        }
+        let live = self.wakterm.live_routes().await.map_err(error_string)?;
+        let routes = self.store.list_routes().await.map_err(error_string)?;
+        let preferences: HashMap<String, String> = self
+            .store
+            .get_metadata("route_output_preferences_v1".into())
+            .await
+            .map_err(error_string)?
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default();
+        let mut shown = 0;
+        for route in &routes {
+            let preference = preferences.get(&route.id.to_string()).map(String::as_str);
+            let Some(topic_id) = telegram_output_topic(route, preference) else {
+                continue;
+            };
+            let Ok(live_route) = live.route(&route.title) else {
+                continue;
+            };
+            let Some(agent) = live_route.agents.iter().find(|agent| live.is_working(agent)) else {
+                continue;
+            };
+            match self.channels.telegram_typing(&agent.harness, topic_id).await {
+                Ok(()) => shown += 1,
+                Err(error) => {
+                    tracing::debug!(route = %route.title, error = %error, "typing indicator failed")
+                }
+            }
+        }
+        Ok(shown)
+    }
+
     /// Tells the sender's chat that an inbound message may not have reached the
     /// agent. The text may still be sitting in the pane, so the notice asks the
     /// user to check there rather than resending.
@@ -1812,6 +1850,23 @@ fn project_live_routes(
         }
     }
     Ok(projected)
+}
+
+/// The Telegram topic a route's agent output goes to, if it goes to Telegram:
+/// a route that also has a Signal group posts there unless Telegram was the
+/// channel last used.
+fn telegram_output_topic(route: &Route, preference: Option<&str>) -> Option<i64> {
+    let has_signal = route
+        .channels
+        .iter()
+        .any(|binding| matches!(binding, ChannelBinding::Signal { .. }));
+    if has_signal && preference != Some("tg") {
+        return None;
+    }
+    route.channels.iter().find_map(|binding| match binding {
+        ChannelBinding::Telegram { topic_id } => Some(*topic_id),
+        ChannelBinding::Signal { .. } => None,
+    })
 }
 
 fn route_matches_inbox(route: &Route, item: &InboxItem) -> bool {
@@ -3072,6 +3127,30 @@ fi
         assert_eq!(record["state"], "indeterminate");
         assert_eq!(record["receipt"]["status"], "indeterminate");
         assert_eq!(record["receipt"]["prompt_written"], true);
+    }
+
+    #[test]
+    fn typing_shows_only_where_agent_output_goes_to_telegram() {
+        let route = |channels: Vec<ChannelBinding>| Route {
+            id: RouteId::new(Uuid::new_v4()),
+            title: "route".into(),
+            channels,
+            agent: None,
+        };
+        let telegram = ChannelBinding::Telegram { topic_id: 10 };
+        let signal = ChannelBinding::Signal {
+            group_id: "group".into(),
+            allow_members: true,
+        };
+        assert_eq!(
+            telegram_output_topic(&route(vec![telegram.clone()]), None),
+            Some(10)
+        );
+        let both = route(vec![telegram, signal.clone()]);
+        assert_eq!(telegram_output_topic(&both, None), None);
+        assert_eq!(telegram_output_topic(&both, Some("sig")), None);
+        assert_eq!(telegram_output_topic(&both, Some("tg")), Some(10));
+        assert_eq!(telegram_output_topic(&route(vec![signal]), Some("tg")), None);
     }
 
     #[tokio::test]

@@ -271,6 +271,31 @@ async fn telegram_creates_a_forum_topic_for_a_new_route() {
 }
 
 #[tokio::test]
+async fn telegram_shows_the_harness_bot_typing_in_a_topic() {
+    let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 25\r\n\r\n{\"ok\":true,\"result\":true}";
+    let (base, request) = http_server(response, Duration::ZERO).await;
+    let mut channels = RealChannels::default();
+    channels.telegram_by_harness.insert(
+        "claude".into(),
+        TelegramClient::new(&base, "claude-token", -1001, Duration::from_secs(2)).unwrap(),
+    );
+    channels.telegram_typing("Claude", 77).await.unwrap();
+    let request = request.await.unwrap();
+    assert_eq!(
+        request.request_line,
+        "POST /botclaude-token/sendChatAction HTTP/1.1"
+    );
+    assert_eq!(
+        request.body,
+        serde_json::json!({"chat_id": -1001, "message_thread_id": 77, "action": "typing"})
+    );
+    assert!(matches!(
+        RealChannels::default().telegram_typing("claude", 77).await,
+        Err(ChannelDeliveryError::NotConfigured(ChannelKind::Telegram))
+    ));
+}
+
+#[tokio::test]
 async fn telegram_uses_the_originating_harness_bot_when_configured() {
     let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 39\r\n\r\n{\"ok\":true,\"result\":{\"message_id\":402}}";
     let (base, request) = http_server(response, Duration::ZERO).await;

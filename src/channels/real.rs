@@ -161,6 +161,34 @@ impl TelegramClient {
         result
     }
 
+    /// Shows the bot as typing in a topic for about five seconds. It is not
+    /// paced like a post, so it never delays one.
+    pub async fn send_typing(&self, topic_id: i64) -> Result<(), ChannelDeliveryError> {
+        let kind = ChannelKind::Telegram;
+        let response = self
+            .http
+            .post(format!(
+                "{}/bot{}/sendChatAction",
+                self.api_base, self.token
+            ))
+            .json(&json!({
+                "chat_id": self.chat_id,
+                "message_thread_id": topic_id,
+                "action": "typing"
+            }))
+            .send()
+            .await
+            .map_err(|error| map_http_error(kind, &error))?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(ChannelDeliveryError::Rejected {
+                kind,
+                detail: format!("sendChatAction returned HTTP {}", response.status().as_u16()),
+            })
+        }
+    }
+
     async fn wait_for_send(&self) -> tokio::sync::MutexGuard<'_, Instant> {
         let next_send = self.next_send.lock().await;
         if *next_send > Instant::now() {
@@ -328,6 +356,20 @@ impl RealChannels {
                     .await
             }
         }
+    }
+
+    /// Shows the harness's bot, or the default bot, as typing in a topic.
+    pub async fn telegram_typing(
+        &self,
+        harness: &str,
+        topic_id: i64,
+    ) -> Result<(), ChannelDeliveryError> {
+        self.telegram_by_harness
+            .get(&harness.to_ascii_lowercase())
+            .or(self.telegram.as_ref())
+            .ok_or(ChannelDeliveryError::NotConfigured(ChannelKind::Telegram))?
+            .send_typing(topic_id)
+            .await
     }
 
     pub async fn create_telegram_topic(&self, name: &str) -> Result<i64, ChannelDeliveryError> {

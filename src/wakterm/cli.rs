@@ -314,11 +314,18 @@ pub struct LiveRouteSnapshot {
     routes: Vec<LiveRoute>,
     /// Wakterm agent names by agent ID.
     names: BTreeMap<String, String>,
+    /// IDs of agents in the middle of a turn.
+    working: BTreeSet<String>,
 }
 
 impl LiveRouteSnapshot {
     pub fn routes(&self) -> &[LiveRoute] {
         &self.routes
+    }
+
+    /// Whether the agent is working on a turn rather than waiting for input.
+    pub fn is_working(&self, agent: &AgentBinding) -> bool {
+        self.working.contains(&agent.agent_id)
     }
 
     pub fn agent_name(&self, agent: &AgentBinding) -> Option<&str> {
@@ -527,7 +534,17 @@ impl WaktermCli {
             .iter()
             .map(|agent| (agent.agent_id.clone(), agent.name.clone()))
             .collect();
-        Ok(LiveRouteSnapshot { routes, names })
+        let working = after
+            .agents
+            .iter()
+            .filter(|agent| agent.alive && agent.turn_state == "waiting_on_agent")
+            .map(|agent| agent.agent_id.clone())
+            .collect();
+        Ok(LiveRouteSnapshot {
+            routes,
+            names,
+            working,
+        })
     }
 
     /// Live agents Panetone cannot fully use, with their tab titles.

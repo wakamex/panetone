@@ -255,6 +255,7 @@ enum ProductionWorker {
     PendingReturns,
     Inbox,
     RouteHealth,
+    Typing,
 }
 
 async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
@@ -369,15 +370,17 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
         ("pending-returns", ProductionWorker::PendingReturns),
         ("inbox", ProductionWorker::Inbox),
         ("route-health", ProductionWorker::RouteHealth),
+        ("typing", ProductionWorker::Typing),
     ] {
         let service = handler.clone();
         let shutdown = supervisor.shutdown_receiver();
         let health = supervisor.handle();
         // Agent registration changes slowly, and each check reads two Wakterm lists.
-        let period = if matches!(worker, ProductionWorker::RouteHealth) {
-            Duration::from_secs(60)
-        } else {
-            worker_period
+        let period = match worker {
+            ProductionWorker::RouteHealth => Duration::from_secs(60),
+            // Telegram clears a typing indicator after about five seconds.
+            ProductionWorker::Typing => Duration::from_secs(4),
+            _ => worker_period,
         };
         supervisor.spawn(name, TaskPolicy::Critical, async move {
             run_periodic(
@@ -541,6 +544,11 @@ async fn run_production_worker(
         ProductionWorker::PendingReturns => service.pending_return_once().await?,
         ProductionWorker::Inbox => service.inbox_once().await?,
         ProductionWorker::RouteHealth => service.route_health_once().await?,
+        // The indicator is cosmetic, so a failed pass is not a daemon problem.
+        ProductionWorker::Typing => service.typing_once().await.unwrap_or_else(|error| {
+            tracing::debug!(error = %error, "typing indicator pass failed");
+            0
+        }),
     };
     Ok(())
 }
