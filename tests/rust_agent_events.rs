@@ -936,3 +936,66 @@ async fn memory_citation_blocks_are_removed_before_posting() {
         .is_empty()
     );
 }
+
+#[tokio::test]
+async fn a_claude_menu_raised_outside_a_turn_is_posted_with_numbered_buttons() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let route = route();
+    store.save_route(route.clone(), 1).await.unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+    // The shape Wakterm emits for the "Switch model?" menu a `/model` command raises.
+    let event: EventRecord = serde_json::from_value(serde_json::json!({
+        "sequence": 101,
+        "event_id": "approval-event-101",
+        "kind": "approval_requested",
+        "agent_id": "agent-zola",
+        "incarnation_id": "incarnation-zola-7",
+        "turn_id": "",
+        "approval": {
+            "schema": "wakterm.agent-approval.v1",
+            "kind": "claude_menu",
+            "request_id": "0123456789abcdef01234567",
+            "agent_id": "agent-zola",
+            "incarnation_id": "incarnation-zola-7",
+            "turn_id": "",
+            "item_id": "0123456789abcdef01234567",
+            "observed_at": "2026-10-12T03:21:00Z",
+            "prompt": "Switch model?: Your next response will be slower and use more tokens",
+            "reason": null,
+            "command": null,
+            "cwd": null,
+            "choices": [
+                {"id": "1", "label": "Yes, switch to Opus 5.5"},
+                {"id": "2", "label": "No, go back"}
+            ],
+            "questions": []
+        }
+    }))
+    .unwrap();
+    store
+        .ingest_agent_events(100, 101, vec![event], live_agents(&route), 3)
+        .await
+        .unwrap();
+    let pending = store.pending_outbox().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].body,
+        "Input needed\n\nSwitch model?: Your next response will be slower and use more tokens"
+    );
+    assert_eq!(
+        pending[0]
+            .actions
+            .iter()
+            .map(|action| (action.id.as_str(), action.label.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "wakap:0123456789abcdef01234567:1",
+                "Yes, switch to Opus 5.5"
+            ),
+            ("wakap:0123456789abcdef01234567:2", "No, go back"),
+        ]
+    );
+    store.shutdown().await.unwrap();
+}
