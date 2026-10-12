@@ -32,8 +32,10 @@ pub struct SendParams {
     pub sender: Option<String>,
     #[serde(default)]
     pub return_final: bool,
+    /// Wait for a busy target to become idle instead of steering its active
+    /// turn.
     #[serde(default)]
-    pub steer: bool,
+    pub queue: bool,
     #[serde(default)]
     pub timeout_ms: u64,
 }
@@ -78,7 +80,9 @@ impl SendParams {
             target: self.target,
             message: self.message,
             return_final: self.return_final,
-            steer: self.steer,
+            // An outside sender reads the answer from the turn its message
+            // starts, so its message waits for an idle target.
+            steer: !self.queue && self.sender.is_none(),
             timeout_ms: self.timeout_ms,
         }
     }

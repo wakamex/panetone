@@ -198,13 +198,13 @@ disposition, and exits nonzero after its local timeout while still pending.
       "incarnation_id": "c3f1d2a4-7b9e-4e1a-8f60-5d2c7b1e9a34"
     },
     "return_final": false,
-    "steer": false,
+    "queue": false,
     "timeout_ms": 0
   }
 }
 ```
 
-`to` and `message` must be non-empty. A caller must provide `source_agent`, `source_pane_id`, or `from`, and at most one of `source_agent` and `source_pane_id`. Without `--source-pane-id`, the CLI runs `wakterm agent caller` in its inherited environment and supplies the resulting `agent_id` and `incarnation_id` as `source_agent`, so normal calls from a Wakterm agent omit `--from`. Wakterm resolves pane harnesses through `WAKTERM_PANE` and managed Codex tool commands, which run in a shared app server without a pane, through `CODEX_THREAD_ID`. If Wakterm cannot identify exactly one caller, the CLI fails unless `--from` is given. Panetone validates that the exact agent incarnation, or the agent in `source_pane_id`, is live and derives the source route from its pane's current effective title. A stale source fails with `source_agent_unavailable` or `source_pane_unavailable` unless `from` is also given. `from` remains an optional route override for the shared channel mirror and audit identity. A caller outside Wakterm instead sets `sender` to its name, which cannot be combined with `from`, `source_pane_id`, `source_agent` or `return_final`; the message is recorded on the target's route under the identity `external:NAME` with harness `external`, and the target sees `From: NAME (external)`. Route titles resolve by exact case-insensitive match and fail when missing. Every live agent with the same effective title belongs to the route, including agents in separate tabs. `to` is a route title or a live agent's Wakterm name, also matched case-insensitively, and a title takes precedence over an agent name. A title whose route has several live agents fails with `target_route_has_several_agents` and lists their names in `details.agents`, so the caller resends to one by name. A message queued for a busy target is later admitted to the same agent, or to its replacement if that agent has restarted. `return_final` and `steer` default to false, and `timeout_ms` defaults to zero. A nonzero timeout is rejected because asynchronous final callbacks do not expire.
+`to` and `message` must be non-empty. A caller must provide `source_agent`, `source_pane_id`, or `from`, and at most one of `source_agent` and `source_pane_id`. Without `--source-pane-id`, the CLI runs `wakterm agent caller` in its inherited environment and supplies the resulting `agent_id` and `incarnation_id` as `source_agent`, so normal calls from a Wakterm agent omit `--from`. Wakterm resolves pane harnesses through `WAKTERM_PANE` and managed Codex tool commands, which run in a shared app server without a pane, through `CODEX_THREAD_ID`. If Wakterm cannot identify exactly one caller, the CLI fails unless `--from` is given. Panetone validates that the exact agent incarnation, or the agent in `source_pane_id`, is live and derives the source route from its pane's current effective title. A stale source fails with `source_agent_unavailable` or `source_pane_unavailable` unless `from` is also given. `from` remains an optional route override for the shared channel mirror and audit identity. A caller outside Wakterm instead sets `sender` to its name, which cannot be combined with `from`, `source_pane_id`, `source_agent` or `return_final`; the message is recorded on the target's route under the identity `external:NAME` with harness `external`, and the target sees `From: NAME (external)`. Route titles resolve by exact case-insensitive match and fail when missing. Every live agent with the same effective title belongs to the route, including agents in separate tabs. `to` is a route title or a live agent's Wakterm name, also matched case-insensitively, and a title takes precedence over an agent name. A title whose route has several live agents fails with `target_route_has_several_agents` and lists their names in `details.agents`, so the caller resends to one by name. A message queued for a busy target is later admitted to the same agent, or to its replacement if that agent has restarted. `return_final` and `queue` default to false, and `timeout_ms` defaults to zero. A nonzero timeout is rejected because asynchronous final callbacks do not expire.
 
 The normal sequence is:
 
@@ -227,14 +227,15 @@ A successful acknowledgement is:
 }
 ```
 
-A definitively busy target returns a successful durable registration with
-`delivery_state: "queued"`, `submitted: false`, and `reply_pending: false`,
-with a `delivery_detail` saying the message is delivered when the target is
-idle and must not be sent again.
-The busy worker resolves the workspace route again before admission. It does
-not steer an active turn.
+Panetone always attempts exact atomic admission first. An idle target accepts the message as a normal new turn and returns `delivery_state: "submitted"`.
 
-Set `steer: true` to allow immediate active-turn steering instead of queueing. Panetone still attempts exact atomic admission first. An idle target accepts the message as a normal new turn and returns `delivery_state: "submitted"`. A definitively busy target receives the same complete cross-agent message through Wakterm's steering path and returns `delivery_state: "steered"`, `submitted: true`, and `steering_acknowledged: true` or `false`. The acknowledgement field distinguishes observer confirmation from submission. When Wakterm refuses to steer because a dialog, shell mode or startup prompt holds the target's keyboard, nothing is written and the message waits in the busy queue with `delivery_state: "queued"`, the same as without `steer`. A channel message to such a target stays pending and is retried until the target can take input. `steer: true` cannot be combined with `return_final: true` because steering does not create a new provider turn with separate final-response correlation.
+A definitively busy target receives the complete cross-agent message through Wakterm's steering path, so a message is not held until the end of a long turn. The acknowledgement has `delivery_state: "steered"`, `submitted: true`, a `delivery_detail` saying the message went into the active turn, and `steering_acknowledged: true` or `false`, which distinguishes observer confirmation from submission.
+
+Set `queue: true` (`--queue`) to wait for the target to become idle instead, for a message that should start its own turn after the current work. A message from an external `sender` always waits, because that sender reads the answer from the turn its message starts. A waiting message returns a successful durable registration with `delivery_state: "queued"`, `submitted: false`, and `reply_pending: false`, with a `delivery_detail` saying the message is delivered when the target is idle and must not be sent again. The busy worker resolves the workspace route again before admission and offers each agent its oldest queued message first.
+
+When Wakterm refuses to steer because a dialog, shell mode, startup prompt or a draft the user is typing holds the target's keyboard, nothing is written and the message waits in the busy queue with `delivery_state: "queued"`. It is delivered, by steering if the target is still busy, once the target can take input. A channel message to such a target stays pending and is retried the same way.
+
+Requests that carry the retired `steer` field are accepted and the field is ignored.
 
 If Wakterm may have accepted a prompt but Panetone did not receive or persist a
 definitive receipt, the workflow becomes indeterminate and is never retried
@@ -249,7 +250,11 @@ tombstones from the initial claim.
 
 ## Asynchronous final return
 
-`return_final: true` requests a correlated Wakterm terminal result. Panetone stores the exact source and target incarnations, then returns immediately after target admission with `reply_pending: true`, `reply_mode: "asynchronous_final_callback"`, and a `reply_detail` explaining the delivery path. The control response is an admission acknowledgement, not the target's final response.
+`return_final: true` asks for the target's reply. How the reply travels depends on the target's state at delivery.
+
+A busy target cannot give a correlated final response, because a steered message has no turn of its own. Panetone steers the message in with `Reply mode: reply by message`, which tells the target to answer with its own `panetone send --to SOURCE` and quote the request ID. The acknowledgement has `delivery_state: "steered"`, `reply_pending: false`, `reply_mode: "message"`, and a `reply_detail` saying no final callback follows. The reply then arrives as an ordinary cross-agent message, and Panetone tracks no terminal for the request.
+
+For an idle target, Panetone requests a correlated Wakterm terminal result. It stores the exact source and target incarnations, then returns immediately after target admission with `reply_pending: true`, `reply_mode: "asynchronous_final_callback"`, and a `reply_detail` explaining the delivery path. The control response is an admission acknowledgement, not the target's final response.
 
 When Wakterm emits the terminal result, Panetone verifies it against the exact
 submitted target and persists it before:

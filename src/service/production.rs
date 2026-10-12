@@ -1116,14 +1116,6 @@ impl ProductionService {
 
     async fn handle_send(&self, request: ControlRequest, params: SendParams) -> ControlResponse {
         let id = request.id;
-        if params.steer && params.return_final {
-            return error_response(
-                id,
-                "invalid_params",
-                "active-turn steering cannot request a correlated final callback",
-                None,
-            );
-        }
         if params.timeout_ms != 0 {
             return error_response(
                 id,

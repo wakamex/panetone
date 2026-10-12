@@ -88,7 +88,7 @@ WAK_SIG_OWNER=+15551111111
 Signal subscription timeouts and transport disconnects reconnect inside the inbound worker, so a signal-cli restart does not take down Panetone's control, Telegram, or outbound workers.
 
 After authorization and routing, Panetone sends the message body unchanged except for sender labels on member-enabled Signal groups and attachment paths. An idle agent receives a normal admitted prompt. A busy agent receives immediate active-turn steering after Wakterm definitively confirms that admission did not write the prompt.
-Channel, topic, update, and reply metadata remain internal and do not alter what the harness sees. Local `panetone send` queues a busy target by default; callers can opt into the same immediate behavior with `--steer`. Signal attachments are downloaded by signal-cli; Panetone appends their absolute local paths to the message so the harness can inspect them.
+Channel, topic, update, and reply metadata remain internal and do not alter what the harness sees. Local `panetone send` delivers into a busy target's active turn the same way by default; `--queue` waits for the target to become idle instead. Signal attachments are downloaded by signal-cli; Panetone appends their absolute local paths to the message so the harness can inspect them.
 Telegram documents up to 20 MB are downloaded into an `attachments/telegram`
 directory beside the database before the update cursor advances. Telegram
 photos use the largest available image size and the same durable download path.
@@ -158,15 +158,15 @@ target/release/panetone send \
   "Investigate the observer bug"
 ```
 
-Steer an active turn immediately, while retaining normal new-turn delivery if the target has become idle:
+An idle target starts a normal new turn. A busy target receives the message in its active turn, so a notice is not held until a long turn ends. Wait for the target to become idle instead when the message should start its own turn after the current work:
 
 ```sh
-target/release/panetone send --steer \
+target/release/panetone send --queue \
   --to wow-sol \
-  "Use the corrected requirement for the current turn"
+  "When you finish, rerun the benchmark on the corrected data"
 ```
 
-Add `--steer` when the message should redirect an active target turn immediately instead of waiting in the durable busy queue. If the target is idle, it starts a normal new turn. Add `--return-final` when a correlated completion callback is wanted. The two modes are mutually exclusive because active-turn steering cannot create separate final-response correlation. The send command exits after target admission; Panetone mirrors a requested final to the source route's channel when it arrives and delivers the agent callback when the source agent is idle. A stable `--id UUID` makes a retry idempotent. Panetone permanently reserves completed UUIDs and never automatically retries a prompt whose admission became uncertain.
+Add `--return-final` when a reply is wanted. The send command exits after target admission. For an idle target, Panetone mirrors the turn's final response to the source route's channel when it arrives and delivers the agent callback when the source agent is idle. A busy target is instead asked, in the message header, to reply with its own `panetone send`, and the acknowledgement says so with `reply_mode: "message"`. A stable `--id UUID` makes a retry idempotent. Panetone permanently reserves completed UUIDs and never automatically retries a prompt whose admission became uncertain.
 
 A sender outside Wakterm, such as a remote assistant with shell access, names itself with `--as NAME`, for example `panetone send --as orch --to wakterm "..."`. The target sees `From: orch (external)`, and such a send is one-way, since there is no agent to return a final to. Use `--from ROUTE` to override the calling pane's route for the shared channel mirror and audit identity. A final callback still returns to the exact calling agent while it remains live. If that agent has exited, Panetone falls back to the selected source route's current agent.
 

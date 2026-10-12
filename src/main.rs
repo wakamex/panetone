@@ -122,14 +122,16 @@ struct SendArgs {
     source_pane_id: Option<u64>,
     #[arg(
         long,
-        help = "Request an asynchronous final callback; this command exits after admission"
+        help = "Ask for the target's reply: its final response returns when it was idle, and a busy target is asked to reply by message"
     )]
     return_final: bool,
     #[arg(
         long,
-        conflicts_with = "return_final",
-        help = "Steer an active turn immediately; starts a normal turn when the target is idle"
+        help = "Wait for a busy target to become idle instead of delivering into its active turn"
     )]
+    queue: bool,
+    /// Accepted for older callers; delivering into an active turn is the default.
+    #[arg(long, hide = true, conflicts_with = "queue")]
     steer: bool,
     #[command(flatten)]
     control: ControlSocketArgs,
@@ -832,7 +834,7 @@ async fn run_send(args: SendArgs) -> Result<()> {
         source_agent,
         sender: args.sender,
         return_final: args.return_final,
-        steer: args.steer,
+        queue: args.queue,
         timeout_ms: 0,
     };
     let response = request(

@@ -2012,6 +2012,10 @@ fn has_unresolved_terminal(connection: &Connection) -> StoreResult<bool> {
             "SELECT EXISTS(
                  SELECT 1 FROM workflows AS workflow
                  WHERE json_extract(workflow.record_json, '$.command.return_final') = 1
+                   -- A steered request is answered by message, not by a terminal.
+                   AND COALESCE(
+                       json_extract(workflow.record_json, '$.response.delivery_state'), ''
+                   ) != 'steered'
                    AND json_type(
                        workflow.record_json,
                        '$.workflow.submitted_target'

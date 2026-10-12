@@ -543,6 +543,7 @@ async fn a_route_with_several_agents_is_addressed_by_agent_name() {
                 daemon.socket.to_str().unwrap(),
                 "--to",
                 target,
+                "--queue",
                 "hello",
             ])
             .env("WAKTERM_BIN", &wakterm)
@@ -857,7 +858,6 @@ async fn cli_steer_uses_the_busy_turn_path_and_deduplicates_retries() {
         "target",
         "--id",
         request_id,
-        "--steer",
         "correct the active turn",
     ];
 

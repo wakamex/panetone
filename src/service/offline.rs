@@ -17,6 +17,8 @@ use crate::wakterm::{
 };
 
 const QUEUED_DETAIL: &str = "The target is busy, so the message is queued and Panetone delivers it when the target is idle. Do not send it again.";
+const STEERED_DETAIL: &str = "The target was busy, so the message was delivered into its active turn.";
+const MESSAGE_REPLY_DETAIL: &str = "The target was busy, so no final callback follows. It was asked to reply with its own panetone send, which arrives as a separate message.";
 const ASYNC_REPLY_DETAIL: &str = "This command does not wait for completion. Panetone mirrors the final to the source route's channel when it arrives and delivers the agent callback when the source agent is idle.";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -63,20 +65,21 @@ impl ServiceAck {
         }
     }
 
-    fn steered(acknowledged: bool) -> Self {
+    fn steered(acknowledged: bool, reply_by_message: bool) -> Self {
         Self {
             accepted: true,
             delivery_state: "steered".into(),
             submitted: true,
-            delivery_detail: None,
+            delivery_detail: Some(STEERED_DETAIL.into()),
             reply_pending: false,
-            reply_mode: "none".into(),
-            reply_detail: None,
+            reply_mode: if reply_by_message { "message" } else { "none" }.into(),
+            reply_detail: reply_by_message.then(|| MESSAGE_REPLY_DETAIL.into()),
             steering_acknowledged: Some(acknowledged),
         }
     }
 
     fn restore_explanation(mut self, return_final: bool) -> Self {
+        let return_final = return_final && self.delivery_state != "steered";
         if self.reply_mode.is_empty() {
             self.reply_mode = if return_final {
                 "asynchronous_final_callback".into()
@@ -148,8 +151,6 @@ pub enum ServiceError {
     IdempotencyConflict,
     #[error("the request id payload has expired and remains reserved in state {0}")]
     Expired(String),
-    #[error("active-turn steering cannot request a correlated final callback")]
-    SteeringReturnFinal,
     #[error("audit delivery failed before prompt submission: {0}")]
     AuditFailed(String),
     #[error("target admission failed in state {0:?}")]
@@ -372,9 +373,6 @@ impl OfflineService {
         target: &Route,
         now_ms: i64,
     ) -> Result<ServiceAck, ServiceError> {
-        if command.steer && command.return_final {
-            return Err(ServiceError::SteeringReturnFinal);
-        }
         let source_binding = available_agent(source)?;
         let target_binding = available_agent(target)?;
         let claim = self
@@ -564,7 +562,12 @@ impl OfflineService {
         // A target whose keyboard is held by a dialog cannot be steered; the
         // request then waits in the busy queue like an unsteered one.
         let steering = if receipt.status == AdmissionStatus::Busy && record.command.steer {
-            match self.wakterm.steer(&target, prompt).await {
+            let steered = FakeWakterm::steered_envelope(
+                &record.command,
+                &record.workflow.observed_source.harness,
+                &target.harness,
+            );
+            match self.wakterm.steer(&target, steered).await {
                 Err(ServiceError::TargetBlocked(_)) => None,
                 result => Some(result),
             }
@@ -596,7 +599,7 @@ impl OfflineService {
             };
             self.faults.hit(FaultPoint::AfterSteeringEffect)?;
             record.workflow.submitted_target = Some(target);
-            let ack = ServiceAck::steered(acknowledged);
+            let ack = ServiceAck::steered(acknowledged, record.command.return_final);
             record.response = Some(serde_json::to_value(&ack)?);
             transition(&self.store, &mut record, WorkflowState::Submitted, now_ms).await?;
             self.faults.hit(FaultPoint::AfterReceiptCheckpoint)?;

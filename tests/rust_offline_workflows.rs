@@ -482,25 +482,30 @@ async fn crash_after_durable_steering_receipt_finishes_with_the_same_acknowledge
 }
 
 #[tokio::test]
-async fn explicit_steering_rejects_return_final_before_claiming_the_request() {
+async fn a_reply_request_to_a_busy_target_is_steered_and_answered_by_message() {
     let directory = tempdir().unwrap();
     let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
-    let service = OfflineService::new(
-        store.clone(),
-        FakeWakterm::new(contract()),
-        RecordingChannels::default(),
-    );
+    let wakterm = FakeWakterm::new(contract());
+    wakterm.script_receipts([AdmissionStatus::Busy]);
+    let service = OfflineService::new(store.clone(), wakterm, RecordingChannels::default());
     let (source, target) = routes();
     let mut request = command(122, true);
     request.steer = true;
 
-    assert!(matches!(
-        service.submit(request.clone(), &source, &target, 100).await,
-        Err(ServiceError::SteeringReturnFinal)
-    ));
-    assert!(store.get_workflow(request.id).await.unwrap().is_none());
-    assert!(service.channels().calls().is_empty());
+    let ack = service
+        .submit(request.clone(), &source, &target, 100)
+        .await
+        .unwrap();
+    assert_eq!(ack.delivery_state, "steered");
+    assert_eq!(ack.reply_mode, "message");
+    assert!(!ack.reply_pending);
+    assert!(ack.reply_detail.unwrap().contains("no final callback"));
+    let steered = &service.wakterm().steering_calls()[0].prompt;
+    assert!(steered.contains("Reply mode: reply by message."));
+    assert!(steered.contains(&format!("panetone send --to {}", source.title)));
     assert!(service.wakterm().calls().is_empty());
+    // No terminal is awaited for a request answered by message.
+    assert!(!store.has_unresolved_terminal().await.unwrap());
     drop(service);
     store.shutdown().await.unwrap();
 }

@@ -133,7 +133,33 @@ impl FakeWakterm {
     }
 
     pub fn envelope(command: &SendCommand, source_harness: &str, target_harness: &str) -> String {
-        let reply = if command.return_final {
+        Self::envelope_with_reply(command, source_harness, target_harness, false)
+    }
+
+    /// The envelope for a reply request steered into an active turn, whose
+    /// final response Panetone cannot return to the sender.
+    pub fn steered_envelope(
+        command: &SendCommand,
+        source_harness: &str,
+        target_harness: &str,
+    ) -> String {
+        Self::envelope_with_reply(command, source_harness, target_harness, command.return_final)
+    }
+
+    fn envelope_with_reply(
+        command: &SendCommand,
+        source_harness: &str,
+        target_harness: &str,
+        reply_by_message: bool,
+    ) -> String {
+        let by_message;
+        let reply = if reply_by_message {
+            by_message = format!(
+                "reply by message. This arrived during your current turn, so its final response is not returned to the sender. Answer by running `panetone send --to {} \"...\"` and quote the request ID",
+                command.source
+            );
+            by_message.as_str()
+        } else if command.return_final {
             "asynchronous final callback"
         } else if source_harness == "external" {
             // The sender is outside Wakterm and cannot be messaged back.

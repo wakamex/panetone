@@ -4,40 +4,37 @@ Status: implemented
 
 ## Context
 
-Wakterm definitively refuses a new prompt when the target agent already has an
-active turn. Local control sends need a safe choice between rejection and
-waiting for the next turn.
+Wakterm definitively refuses a new prompt when the target agent already has an active turn. A message for a busy target can either wait for the next turn or be steered into the active one.
 
-Steering an active turn is a different operation. It can be appropriate for a
-Telegram reply but cannot preserve new-turn return correlation.
+Waiting keeps each message in a turn of its own, but its delay is the length of the target's turn, which the sender cannot know. A target in a ten-hour turn received thirteen notices only after the turn ended, when most were out of date, and each then started a separate turn.
+
+Steering delivers at once but gives the message no turn of its own, so the turn's final response cannot be correlated with it.
 
 ## Decision
 
-The local control `send` method waits durably for a busy target to become idle by default. An explicit `steer` mode uses the same admit-then-steer behavior as authorized channel input. An idle target starts a normal turn; a definitive busy receipt proves admission wrote nothing before Panetone sends the complete cross-agent message through Wakterm's active-turn steering command. Steering and `return_final` are mutually exclusive because steering cannot establish a distinct provider-turn correlation boundary.
+Messages are delivered when they are sent. Local control `send` and authorized Telegram and Signal input use the same admit-then-steer behavior: Panetone first uses authoritative admission against the exact current agent identity, and an idle agent accepts the message as a new prompt. A definitive `busy` receipt proves that no prompt was written, so Panetone immediately sends the message through Wakterm's active-turn steering command instead of queueing it.
 
-Authorized Telegram and Signal input has different semantics. Panetone first
-uses authoritative admission against the exact current agent identity. An idle
-agent accepts the message as a new prompt. A definitive `busy` receipt proves
-that no prompt was written, so Panetone immediately sends the unchanged body
-through Wakterm's active-turn steering command instead of queueing it.
+A local sender that wants its message to start a turn after the current work sets `queue`, which waits durably for the target to become idle. A message from a sender outside Wakterm always waits, because that sender reads the answer from the turn its message starts.
+
+`return_final` states that the sender wants a reply, and Panetone chooses how it travels. An idle target starts a turn whose final response Wakterm correlates and Panetone returns. A busy target is steered with a reply mode that asks it to answer with its own `panetone send`, quoting the request ID; Panetone awaits no terminal for that request, and the acknowledgement reports `reply_mode: "message"`.
 
 The local control admission sequence is:
 
 1. claim and persist the idempotency key
 2. resolve the workspace title to its current live agents and select one agent incarnation
 3. establish a visible Telegram audit
-4. if the target is busy, persist `awaiting_target_idle` and return immediately
+4. if the target is busy, steer the message into its active turn; when the request sets `queue` or the steer is refused, persist `awaiting_target_idle` and return immediately
 5. after an authoritative idle observation, resolve the workspace again,
    persist the delivery attempt boundary, and submit once through Wakterm
 6. edit the audit from queued to submitted, or visibly mark a definitive or indeterminate failure
 
 The structured queued acknowledgement is successful registration, not delivery confirmation. It includes `delivery_state: "queued"` and `submitted: false`. `reply_pending` continues to describe the optional final callback, not whether target delivery is pending.
 
-The structured steering acknowledgement uses `delivery_state: "steered"`, `submitted: true`, and `steering_acknowledged` to report whether Wakterm observed the submitted input. A same-content, same-mode UUID retry returns the stored acknowledgement without another pane write. Reusing the UUID with a different steering mode is an idempotency conflict.
+The structured steering acknowledgement uses `delivery_state: "steered"`, `submitted: true`, and `steering_acknowledged` to report whether Wakterm observed the submitted input. A same-content, same-mode UUID retry returns the stored acknowledgement without another pane write. Reusing the UUID with a different delivery mode is an idempotency conflict.
 
 The Telegram audit uses `[queued]` while waiting and `[submitted]` only after Wakterm acceptance. A same-content duplicate UUID returns the same durable queued acknowledgement without another audit or prompt. A different request with the same UUID remains a conflict.
 
-Queued work survives Panetone and Wakterm restarts. It has no automatic expiry in control v1. It remains visible through future status and cancellation operations until submitted or explicitly cancelled. The worker uses bounded backoff or lifecycle notification rather than a tight poll.
+Queued work survives Panetone and Wakterm restarts. Each agent is offered its oldest queued message first, and prompts for one agent are written one at a time. It has no automatic expiry in control v1. It remains visible through future status and cancellation operations until submitted or explicitly cancelled. The worker uses bounded backoff or lifecycle notification rather than a tight poll.
 
 Before submission, Panetone resolves the persisted workspace title again and selects the agent chosen when the work was sent. A new incarnation of that agent may receive the work after a restart. Panetone records both the originally observed and submitted incarnation in the workflow audit. Missing live routes are not guessed.
 
@@ -49,6 +46,6 @@ Wakterm must classify `busy` as a definitive non-acceptance result. Panetone may
 
 Audit failure still fails closed. A crash after a queued audit but before its durable queued checkpoint is indeterminate and receives a visible failure annotation. A crash after the queued checkpoint resumes the queue without adding another audit.
 
-Before either steering path, Panetone persists `admission_prepared`. When Wakterm refuses to steer because a dialog, shell mode or startup prompt holds the target's keyboard, nothing was written: channel input stays pending and local work waits as queued. Any other steering command or receipt failure, or an unacknowledged steer of channel input, is not retried automatically. Channel input then waits for proof of delivery as described in the production operations guide, and a local workflow becomes `indeterminate`. This avoids duplicate steering when it is unknown whether the pane write occurred. Local queued work continues to use the durable workflow and audit states described above.
+Before either steering path, Panetone persists `admission_prepared`. When Wakterm refuses to steer because a dialog, shell mode, startup prompt or a draft the user is typing holds the target's keyboard, nothing was written: channel input stays pending and local work waits as queued. Any other steering command or receipt failure, or an unacknowledged steer of channel input, is not retried automatically. Channel input then waits for proof of delivery as described in the production operations guide, and a local workflow becomes `indeterminate`. This avoids duplicate steering when it is unknown whether the pane write occurred. Local queued work continues to use the durable workflow and audit states described above.
 
 The return-terminal stream may race the admission receipt. A terminal for a workflow still in `admission_prepared` remains unread until that workflow records whether submission occurred. If the workflow then ends without a submitted target, Panetone consumes the redundant terminal without manufacturing a callback. One request-level inconsistency therefore cannot stop unrelated routes or channel workers.
