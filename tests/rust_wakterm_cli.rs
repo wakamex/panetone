@@ -484,3 +484,40 @@ fi
         other => panic!("unexpected event read: {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn prompts_for_one_agent_are_written_one_at_a_time() {
+    let directory = tempdir().unwrap();
+    let log = directory.path().join("writes.log");
+    let script = format!(
+        r#"
+if [[ "$*" == *"agent capabilities"* ]]; then
+  printf '%s\n' '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
+  exit 0
+fi
+cat >/dev/null
+request_id=""
+while (($#)); do
+  if [[ "$1" == "--request-id" ]]; then request_id=$2; break; fi
+  shift
+done
+echo start >> '{log}'
+sleep 0.3
+echo end >> '{log}'
+printf '{{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"accepted","definitive":true,"prompt_written":true,"agent_id":"agent-zola","incarnation_id":"incarnation-zola-7","detail":null}}\n' "$request_id"
+"#,
+        log = log.display()
+    );
+    let (_script_directory, binary) = fake_cli(&script);
+    let cli = WaktermCli::new(binary, "/tmp/non-production.sock", Duration::from_secs(2));
+    let other = cli.clone();
+    let target = binding();
+
+    let (first, second) = tokio::join!(
+        cli.admit(EffectId::random(), &target, "first", false, 0),
+        other.admit(EffectId::random(), &target, "second", false, 0),
+    );
+    first.unwrap();
+    second.unwrap();
+    assert_eq!(fs::read_to_string(log).unwrap(), "start\nend\nstart\nend\n");
+}

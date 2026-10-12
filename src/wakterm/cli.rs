@@ -125,6 +125,9 @@ pub struct WaktermCli {
     deadline: Duration,
     capabilities: Arc<OnceCell<AgentApiCapabilities>>,
     event_follower: Arc<Mutex<Option<EventFollower>>>,
+    /// One lock per agent, held while a prompt is written to its pane. Two
+    /// prompts written at once would be recorded by the agent as one input.
+    pane_writes: Arc<std::sync::Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
 }
 
 #[derive(Debug)]
@@ -436,6 +439,7 @@ impl WaktermCli {
             deadline,
             capabilities: Arc::new(OnceCell::new()),
             event_follower: Arc::new(Mutex::new(None)),
+            pane_writes: Arc::default(),
         }
     }
 
@@ -564,6 +568,17 @@ impl WaktermCli {
         self.live_routes().await?.resolve(route_title, preferred)
     }
 
+    async fn pane_write(&self, binding: &AgentBinding) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self
+            .pane_writes
+            .lock()
+            .expect("pane write locks are not poisoned")
+            .entry(binding.agent_id.clone())
+            .or_default()
+            .clone();
+        lock.lock_owned().await
+    }
+
     pub async fn admit(
         &self,
         request_id: EffectId,
@@ -576,6 +591,7 @@ impl WaktermCli {
             return Err(WaktermCliError::InputTooLarge(MAX_PROMPT_BYTES));
         }
         self.capabilities().await?;
+        let _writing = self.pane_write(binding).await;
         let request_id = request_id.to_string();
         let mut owned = vec![
             "agent".to_owned(),
@@ -619,6 +635,7 @@ impl WaktermCli {
             return Err(WaktermCliError::InputTooLarge(MAX_PROMPT_BYTES));
         }
         self.capabilities().await?;
+        let _writing = self.pane_write(binding).await;
         let output = self
             .run_command(
                 &["agent", "send", binding.agent_id.as_str()],
