@@ -562,6 +562,9 @@ impl ProductionService {
         }
         let live = self.wakterm.live_routes().await.map_err(error_string)?;
         let mut attempted = 0;
+        // The store lists queued work oldest first, and each pass offers an
+        // agent only its oldest message, so a target receives them in order.
+        let mut offered = BTreeSet::new();
         for workflow in workflows {
             let Some(route) = self
                 .store
@@ -578,6 +581,9 @@ impl ProductionService {
             else {
                 continue;
             };
+            if !offered.insert(binding.agent_id.clone()) {
+                continue;
+            }
             let live_route = route.with_agent(binding);
             attempted += 1;
             match self
@@ -2866,6 +2872,7 @@ fi
         workflows.wakterm().script_receipts([
             AdmissionStatus::Busy,
             AdmissionStatus::Busy,
+            AdmissionStatus::Busy,
             AdmissionStatus::ObserverFailure,
             AdmissionStatus::Accepted,
         ]);
@@ -2893,6 +2900,17 @@ fi
             )
             .await
             .unwrap();
+        // A later message for the same target waits behind the earlier one.
+        let later_id = WorkflowId::new(Uuid::from_u128(905));
+        workflows
+            .submit(
+                command(905, &submitted_target),
+                &source,
+                &submitted_target,
+                30,
+            )
+            .await
+            .unwrap();
         let service = ProductionService {
             store: store.clone(),
             wakterm: WaktermCli::new(
@@ -2915,6 +2933,16 @@ fi
         assert_eq!(service.busy_once().await.unwrap(), 2);
         assert_eq!(
             store
+                .get_workflow(later_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .workflow
+                .state,
+            WorkflowState::AwaitingTargetIdle
+        );
+        assert_eq!(
+            store
                 .get_workflow(failed_id)
                 .await
                 .unwrap()
@@ -2934,10 +2962,10 @@ fi
             WorkflowState::Completed
         );
         let channel_calls = workflows.channels().calls();
-        assert_eq!(channel_calls.len(), 6);
-        assert!(channel_calls[4].body.starts_with("[delivery-failed]"));
-        assert!(channel_calls[5].body.starts_with("[submitted]"));
-        assert_eq!(store.status().await.unwrap().awaiting_target_idle, 0);
+        assert_eq!(channel_calls.len(), 8);
+        assert!(channel_calls[6].body.starts_with("[delivery-failed]"));
+        assert!(channel_calls[7].body.starts_with("[submitted]"));
+        assert_eq!(store.status().await.unwrap().awaiting_target_idle, 1);
         drop(service);
         drop(workflows);
         store.shutdown().await.unwrap();
