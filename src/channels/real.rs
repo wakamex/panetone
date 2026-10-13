@@ -13,7 +13,7 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep_until, timeout};
 
-use crate::domain::{ChannelKind, OutboxItem};
+use crate::domain::{ChannelKind, OutboxItem, SIGNAL_DIRECT_PREFIX};
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const TELEGRAM_GROUP_INTERVAL: Duration = Duration::from_millis(3100);
@@ -248,10 +248,13 @@ impl SignalClient {
             .map_err(|_| ChannelDeliveryError::Unreachable(ChannelKind::Signal))?;
         let request_id = item.id.to_string();
         let mut params = json!({
-            "groupId": item.destination,
             "message": item.body,
             "account": self.account,
         });
+        match item.destination.strip_prefix(SIGNAL_DIRECT_PREFIX) {
+            Some(recipient) => params["recipient"] = json!([recipient]),
+            None => params["groupId"] = json!(item.destination),
+        }
         if !item.attachments.is_empty() {
             params["attachments"] = Value::Array(
                 item.attachments

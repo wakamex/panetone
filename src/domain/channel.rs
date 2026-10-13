@@ -33,8 +33,16 @@ pub enum ChannelBinding {
         /// daemon's default account does.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account: Option<String>,
+        /// Whether direct messages the owner sends to the serving account
+        /// belong to this route.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        direct: bool,
     },
 }
+
+/// Starts the destination of a Signal direct message, followed by the other
+/// party's number or UUID. A group destination is the group ID.
+pub const SIGNAL_DIRECT_PREFIX: &str = "direct:";
 
 /// Removes characters that draw nothing, such as zero-width spaces, a byte
 /// order mark, direction controls and control codes, and turns lone line
@@ -215,18 +223,31 @@ fn flag_tag_positions(chars: &[char]) -> std::collections::BTreeSet<usize> {
     positions
 }
 
-/// The account bound to the route that serves a Signal group, when that
-/// binding names one.
-pub fn signal_group_account<'a>(routes: &'a [super::Route], group_id: &str) -> Option<&'a str> {
-    routes
+/// The account that sends to a Signal destination, when a binding names one:
+/// the account bound to the group, or for a direct message the account of
+/// the route that takes direct messages, preferring the item's own route.
+pub fn signal_group_account<'a>(
+    routes: &'a [super::Route],
+    route_id: Option<super::RouteId>,
+    destination: &str,
+) -> Option<&'a str> {
+    let direct = destination.starts_with(SIGNAL_DIRECT_PREFIX);
+    let mut candidates = routes
         .iter()
-        .flat_map(|route| &route.channels)
+        .filter(|route| !direct || route_id.is_none_or(|id| route.id == id))
+        .flat_map(|route| &route.channels);
+    candidates
         .find_map(|binding| match binding {
+            ChannelBinding::Signal {
+                account,
+                direct: true,
+                ..
+            } if direct => Some(account.as_deref()),
             ChannelBinding::Signal {
                 group_id: bound,
                 account,
                 ..
-            } if bound.trim_end_matches('=') == group_id.trim_end_matches('=') => {
+            } if !direct && bound.trim_end_matches('=') == destination.trim_end_matches('=') => {
                 Some(account.as_deref())
             }
             _ => None,

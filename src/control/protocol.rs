@@ -66,6 +66,9 @@ pub struct RouteEnsureParams {
     /// binding uses the default account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal_account: Option<String>,
+    /// Send the owner's direct messages to the serving account to this route.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub signal_direct: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

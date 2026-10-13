@@ -23,6 +23,7 @@ fn route() -> Route {
                 group_id: "signal-zola".into(),
                 allow_members: false,
                 account: None,
+                direct: false,
             },
         ],
         agent: Some(AgentBinding {
@@ -1041,5 +1042,52 @@ async fn input_recorded_with_its_tabs_expanded_proves_delivery() {
             .await
             .unwrap()
     );
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn output_after_a_direct_message_returns_to_its_sender() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let mut route = route();
+    for binding in &mut route.channels {
+        if let ChannelBinding::Signal { direct, .. } = binding {
+            *direct = true;
+        }
+    }
+    store.save_route(route.clone(), 1).await.unwrap();
+    let mut item = panetone::store::InboxItem {
+        id: panetone::domain::EffectId::new(Uuid::from_u128(901)),
+        channel: ChannelKind::Signal,
+        external_id: "owner:1".into(),
+        destination: "direct:+15551111".into(),
+        sender_id: Some("+15551111".into()),
+        sender: Some("Mihai".into()),
+        reply_to_external_id: None,
+        body: "[direct message] start".into(),
+        state: "pending".into(),
+        created_at_ms: 1,
+        receipt: None,
+        steering_acknowledged: None,
+        proof: None,
+    };
+    store.accept_inbox(item.clone()).await.unwrap();
+    item.state = "delivered".into();
+    store
+        .save_inbox(item, "pending", Some((route.id, ChannelKind::Signal)))
+        .await
+        .unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+
+    store
+        .ingest_agent_events(100, 107, fixture_events(), live_agents(&route), 3)
+        .await
+        .unwrap();
+    let pending = store.pending_outbox().await.unwrap();
+    assert!(!pending.is_empty());
+    for output in &pending {
+        assert_eq!(output.kind, ChannelKind::Signal);
+        assert_eq!(output.destination, "direct:+15551111");
+    }
     store.shutdown().await.unwrap();
 }

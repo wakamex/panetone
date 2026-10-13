@@ -10,7 +10,7 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use crate::domain::{ChannelKind, EffectId, OutboxAction};
+use crate::domain::{ChannelKind, EffectId, OutboxAction, SIGNAL_DIRECT_PREFIX};
 use crate::wakterm::form::{self, FormAction};
 
 use super::real::{ChannelDeliveryError, http_client, response_body};
@@ -650,9 +650,14 @@ impl SignalSubscriber {
             let Some(body) = signal_body(data, &self.attachment_directory) else {
                 continue;
             };
-            // Routes are Signal groups, so a direct message has no route.
-            let Some(destination) = data["groupInfo"]["groupId"].as_str() else {
-                continue;
+            let source = envelope["sourceNumber"]
+                .as_str()
+                .or_else(|| envelope["source"].as_str())
+                .unwrap_or("unknown");
+            // A message outside a group is a direct message from its sender.
+            let destination = match data["groupInfo"]["groupId"].as_str() {
+                Some(group_id) => group_id.trim_end_matches('=').to_owned(),
+                None => format!("{SIGNAL_DIRECT_PREFIX}{source}"),
             };
             let Some(timestamp) = envelope["timestamp"]
                 .as_i64()
@@ -662,14 +667,10 @@ impl SignalSubscriber {
                 tracing::warn!("skipped a Signal message without a timestamp");
                 continue;
             };
-            let source = envelope["sourceNumber"]
-                .as_str()
-                .or_else(|| envelope["source"].as_str())
-                .unwrap_or("unknown");
             return Ok(InboundMessage {
                 channel: ChannelKind::Signal,
                 external_id: format!("{source}:{timestamp}"),
-                destination: destination.trim_end_matches('=').into(),
+                destination,
                 sender_id: Some(source.into()),
                 sender: envelope["sourceName"]
                     .as_str()

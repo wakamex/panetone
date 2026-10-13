@@ -1680,6 +1680,17 @@ fn route_preferences(
 }
 
 fn output_destination(route: &Route, preference: Option<&str>) -> Option<(ChannelKind, String)> {
+    let takes_direct = route.channels.iter().any(|binding| {
+        matches!(
+            binding,
+            crate::domain::ChannelBinding::Signal { direct: true, .. }
+        )
+    });
+    if let Some(direct) = preference.and_then(|preference| preference.strip_prefix("sig:"))
+        && takes_direct
+    {
+        return Some((ChannelKind::Signal, direct.to_owned()));
+    }
     let selected = match preference {
         Some("tg") => Some(ChannelKind::Telegram),
         Some("sig") => Some(ChannelKind::Signal),
@@ -2266,10 +2277,17 @@ fn save_inbox(
         preferences.insert(
             route_id.to_string(),
             match channel {
-                ChannelKind::Telegram => "tg",
-                ChannelKind::Signal => "sig",
-            }
-            .into(),
+                ChannelKind::Telegram => "tg".to_owned(),
+                // A reply to a direct message returns to its sender.
+                ChannelKind::Signal
+                    if item
+                        .destination
+                        .starts_with(crate::domain::SIGNAL_DIRECT_PREFIX) =>
+                {
+                    format!("sig:{}", item.destination)
+                }
+                ChannelKind::Signal => "sig".to_owned(),
+            },
         );
         set_metadata(
             &transaction,

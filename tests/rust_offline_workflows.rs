@@ -60,6 +60,7 @@ fn routes() -> (Route, Route) {
                 group_id: "source-group".into(),
                 allow_members: false,
                 account: None,
+                direct: false,
             },
         ),
         route(

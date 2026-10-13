@@ -113,14 +113,15 @@ Wakterm resolution:
     "title": "infobase",
     "signal_group_id": "base64-signal-group-id",
     "signal_allow_members": true,
-    "signal_account": "+15552222222"
+    "signal_account": "+15552222222",
+    "signal_direct": true
   }
 }
 ```
 
 The title must contain 1 to 128 characters without surrounding whitespace. A new route requires a live Wakterm agent with that effective title. The configured primary Telegram bot creates its topic. A caller may instead pass `telegram_topic_id` to bind a known positive topic ID. `signal_group_id` adds one exact Signal group binding. Signal input remains owner-only unless `signal_allow_members` is true, in which case authenticated group members are accepted with a minimal first-name label. An existing conflicting binding returns `route_binding_conflict` and is not changed. Repeating a member-enabled binding does not downgrade it.
 
-`signal_account` names the Signal account that serves the group, either the daemon's default account or one listed in `WAK_SIG_EXTRA_ACCOUNTS`; an account the daemon is not configured with is rejected as `invalid_params`. Omitted, an existing binding keeps its account and a new binding uses the default account. Messages for the group are accepted only from the bound account's subscription, and posts to the group go through it.
+`signal_account` names the Signal account that serves the group, either the daemon's default account or one listed in `WAK_SIG_EXTRA_ACCOUNTS`; an account the daemon is not configured with is rejected as `invalid_params`. Omitted, an existing binding keeps its account and a new binding uses the default account. Messages for the group are accepted only from the bound account's subscription, and posts to the group go through it. `signal_direct` gives the route the owner's direct messages to that account; it stays set once given.
 
 The result is:
 

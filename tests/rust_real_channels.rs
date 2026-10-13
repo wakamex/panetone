@@ -638,3 +638,31 @@ async fn a_signal_item_is_sent_through_the_account_named_for_its_group() {
         ChannelDeliveryError::NotConfigured(ChannelKind::Signal)
     );
 }
+
+#[tokio::test]
+async fn a_signal_direct_destination_is_sent_to_a_recipient() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("direct.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut request = String::new();
+        reader.read_line(&mut request).await.unwrap();
+        let request: Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["params"]["recipient"], serde_json::json!(["+15551111"]));
+        assert!(request["params"].get("groupId").is_none());
+        reader
+            .get_mut()
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"11111111-1111-4111-8111-111111111111\",\"result\":{\"timestamp\":12345}}\n")
+            .await
+            .unwrap();
+    });
+    let signal = SignalClient::new(&socket, "+15550000", Duration::from_secs(2));
+
+    signal
+        .send(&item(ChannelKind::Signal, "direct:+15551111"))
+        .await
+        .unwrap();
+    server.await.unwrap();
+}

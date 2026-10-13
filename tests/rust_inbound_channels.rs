@@ -510,6 +510,7 @@ async fn signal_notifications_are_normalized_and_deduplicated_durably() {
                     group_id: "group-one".into(),
                     allow_members: false,
                     account: None,
+                    direct: false,
                 }],
                 agent: None,
             },
@@ -549,6 +550,7 @@ async fn configured_signal_group_accepts_members_and_adds_first_name_only() {
                     group_id: "inquisition-group==".into(),
                     allow_members: true,
                     account: None,
+                    direct: false,
                 }],
                 agent: None,
             },
@@ -565,6 +567,7 @@ async fn configured_signal_group_accepts_members_and_adds_first_name_only() {
                     group_id: "private-group".into(),
                     allow_members: false,
                     account: None,
+                    direct: false,
                 }],
                 agent: None,
             },
@@ -752,6 +755,7 @@ async fn archived_routes_record_each_inbound_signal_message_once() {
                     group_id: "GRTI+oGi/1wgJAbKEUMGNR3o1tP8o8igPibVb/xAo8k".into(),
                     allow_members: true,
                     account: None,
+                    direct: false,
                 }],
                 agent: None,
             },
@@ -869,6 +873,7 @@ async fn replies_tell_the_agent_which_message_they_answer() {
                     group_id: "group-one".into(),
                     allow_members: true,
                     account: None,
+                    direct: false,
                 }],
                 agent: None,
             },
@@ -977,8 +982,13 @@ async fn signal_notifications_panetone_cannot_use_are_skipped() {
         SignalSubscriber::connect(&socket_path, "+15550000", Duration::from_secs(2))
             .await
             .unwrap();
+    // A message outside a group is a direct message from its sender.
+    let direct = subscriber.next().await.unwrap();
+    assert_eq!(direct.body, "direct message");
+    assert_eq!(direct.destination, "direct:+15551111");
     let message = subscriber.next().await.unwrap();
     assert_eq!(message.body, "after the skipped ones");
+    assert_eq!(message.destination, "group-one");
     server.await.unwrap();
 }
 
@@ -994,6 +1004,7 @@ async fn a_signal_group_is_served_only_by_the_account_its_route_names() {
             group_id: group.into(),
             allow_members: false,
             account: account.map(str::to_owned),
+            direct: false,
         }],
         agent: None,
     };
@@ -1094,4 +1105,70 @@ async fn signal_attachment_paths_use_the_account_data_directory() {
         "[attached image/jpeg: /data/signal-cli-second/attachments/photo.jpg]"
     );
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn the_owners_direct_message_reaches_the_route_that_takes_them() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let ingestor = InboundIngestor::new(store.clone());
+    let route = |id: u128, title: &str, group: &str, account: Option<&str>, direct| Route {
+        id: RouteId::new(Uuid::from_u128(id)),
+        title: title.into(),
+        channels: vec![ChannelBinding::Signal {
+            group_id: group.into(),
+            allow_members: true,
+            account: account.map(str::to_owned),
+            direct,
+        }],
+        agent: None,
+    };
+    store
+        .save_route(route(81, "second", "group-second", Some("+15559999"), true), 1)
+        .await
+        .unwrap();
+    store
+        .save_route(route(82, "first", "group-first", None, false), 1)
+        .await
+        .unwrap();
+    let direct = |external_id: &str, sender: &str| InboundMessage {
+        channel: ChannelKind::Signal,
+        external_id: external_id.into(),
+        destination: format!("direct:{sender}"),
+        sender_id: Some(sender.into()),
+        sender: Some("Mihai Cosma".into()),
+        reply_to_external_id: None,
+        body: "start".into(),
+        quoted: None,
+    };
+    let second = SignalReceiver {
+        account: "+15559999",
+        default: false,
+    };
+
+    // Someone else's direct message, and one to an account whose routes take
+    // none, are dropped.
+    assert!(
+        !ingestor
+            .persist_signal(direct("+1555:1", "+1555"), "owner", second, 10)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !ingestor
+            .persist_signal(direct("owner:2", "owner"), "owner", DEFAULT_SIGNAL, 11)
+            .await
+            .unwrap()
+    );
+    assert!(
+        ingestor
+            .persist_signal(direct("owner:3", "owner"), "owner", second, 12)
+            .await
+            .unwrap()
+    );
+    let pending = store.pending_inbox().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].body, "[direct message] Mihai says: start");
+    assert_eq!(pending[0].destination, "direct:owner");
+    store.shutdown().await.unwrap();
 }

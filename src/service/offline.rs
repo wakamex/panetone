@@ -331,7 +331,7 @@ impl OfflineService {
                 ChannelKind::Signal => self.store.list_routes().await?,
                 ChannelKind::Telegram => Vec::new(),
             };
-            let signal_account = signal_group_account(&routes, &chunk.destination);
+            let signal_account = signal_group_account(&routes, chunk.route_id, &chunk.destination);
             match self.channels.send(&chunk, signal_account).await {
                 Ok(receipt) => {
                     if let Some(point) = fault_after_send {

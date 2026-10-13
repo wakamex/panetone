@@ -16,7 +16,7 @@ use crate::control::{
 };
 use crate::domain::{
     AdmissionStatus, AgentBinding, ChannelBinding, ChannelKind, EffectId, OutboxAction, OutboxItem,
-    OutboxState, Route, RouteId, WorkflowId, WorkflowState, signal_group_account,
+    OutboxState, Route, RouteId, WorkflowId, WorkflowState, SIGNAL_DIRECT_PREFIX, signal_group_account,
 };
 use crate::store::{
     DeliveryProof, EventCursorGap, InboxItem, RouteAgent, StoreHandle, StoredApproval,
@@ -326,6 +326,8 @@ impl ProductionService {
         if self.archives.is_empty()
             || item.kind != ChannelKind::Signal
             || item.sender_harness.is_none()
+            // A direct reply is not part of the group's record.
+            || item.destination.starts_with(SIGNAL_DIRECT_PREFIX)
         {
             return;
         }
@@ -521,7 +523,7 @@ impl ProductionService {
             ChannelKind::Signal => self.store.list_routes().await.map_err(error_string)?,
             ChannelKind::Telegram => Vec::new(),
         };
-        let signal_account = signal_group_account(&routes, &attempt.destination);
+        let signal_account = signal_group_account(&routes, attempt.route_id, &attempt.destination);
         match self.channels.send_as(&attempt, signal_account).await {
             Ok(receipt) => {
                 self.archive_delivered(&item, &receipt.external_id).await;
@@ -1477,7 +1479,8 @@ impl ProductionService {
                 .as_deref()
                 .is_some_and(|group_id| group_id.trim().is_empty())
             || (params.signal_allow_members && params.signal_group_id.is_none())
-            || (params.signal_account.is_some() && params.signal_group_id.is_none())
+            || ((params.signal_account.is_some() || params.signal_direct)
+                && params.signal_group_id.is_none())
         {
             return error_response(
                 id,
@@ -1559,6 +1562,7 @@ impl ProductionService {
                     params.signal_group_id.as_deref(),
                     params.signal_allow_members,
                     params.signal_account.as_deref(),
+                    params.signal_direct,
                 )
                 .expect("a new route has no conflicting Signal binding");
                 if let Err(error) = self.store.save_route(route.clone(), now_ms()).await {
@@ -1607,6 +1611,7 @@ impl ProductionService {
             params.signal_group_id.as_deref(),
             params.signal_allow_members,
             params.signal_account.as_deref(),
+            params.signal_direct,
         ) {
             Ok(changed) => binding_created |= changed,
             Err(existing) => {
@@ -1816,17 +1821,19 @@ fn ensure_signal_binding(
     requested_group_id: Option<&str>,
     allow_members: bool,
     requested_account: Option<&str>,
+    requested_direct: bool,
 ) -> Result<bool, String> {
     let Some(requested_group_id) = requested_group_id else {
         return Ok(false);
     };
-    if let Some((group_id, existing_allow_members, account)) =
+    if let Some((group_id, existing_allow_members, account, direct)) =
         route.channels.iter_mut().find_map(|binding| match binding {
             ChannelBinding::Signal {
                 group_id,
                 allow_members,
                 account,
-            } => Some((group_id, allow_members, account)),
+                direct,
+            } => Some((group_id, allow_members, account, direct)),
             ChannelBinding::Telegram { .. } => None,
         })
     {
@@ -1844,12 +1851,17 @@ fn ensure_signal_binding(
             *account = requested_account.map(str::to_owned);
             changed = true;
         }
+        if requested_direct && !*direct {
+            *direct = true;
+            changed = true;
+        }
         return Ok(changed);
     }
     route.channels.push(ChannelBinding::Signal {
         group_id: requested_group_id.to_owned(),
         allow_members,
         account: requested_account.map(str::to_owned),
+        direct: requested_direct,
     });
     Ok(true)
 }
@@ -1937,8 +1949,17 @@ fn route_matches_inbox(route: &Route, item: &InboxItem) -> bool {
             (ChannelBinding::Telegram { topic_id }, ChannelKind::Telegram) => {
                 topic_id.to_string() == item.destination
             }
-            (ChannelBinding::Signal { group_id, .. }, ChannelKind::Signal) => {
-                group_id.trim_end_matches('=') == item.destination.trim_end_matches('=')
+            (
+                ChannelBinding::Signal {
+                    group_id, direct, ..
+                },
+                ChannelKind::Signal,
+            ) => {
+                if item.destination.starts_with(SIGNAL_DIRECT_PREFIX) {
+                    *direct
+                } else {
+                    group_id.trim_end_matches('=') == item.destination.trim_end_matches('=')
+                }
             }
             _ => false,
         })
@@ -2175,6 +2196,7 @@ mod tests {
                 group_id: "group-one".into(),
                 allow_members: true,
                 account: None,
+                direct: false,
             }],
             agent: None,
         };
@@ -2509,7 +2531,7 @@ fi
     fn signal_binding_member_policy_is_explicit_and_monotonic() {
         let mut route = telegram_route("inquisition".into(), 42);
         assert_eq!(
-            ensure_signal_binding(&mut route, Some("group-id=="), true, None),
+            ensure_signal_binding(&mut route, Some("group-id=="), true, None, false),
             Ok(true)
         );
         assert!(matches!(
@@ -2518,14 +2540,15 @@ fi
                 group_id,
                 allow_members: true,
                 account: None,
+                direct: false,
             }) if group_id == "group-id=="
         ));
         assert_eq!(
-            ensure_signal_binding(&mut route, Some("group-id"), false, None),
+            ensure_signal_binding(&mut route, Some("group-id"), false, None, false),
             Ok(false)
         );
         assert_eq!(
-            ensure_signal_binding(&mut route, Some("other-group"), true, None),
+            ensure_signal_binding(&mut route, Some("other-group"), true, None, false),
             Err("group-id==".into())
         );
     }
@@ -2534,20 +2557,20 @@ fi
     fn naming_a_signal_account_moves_the_group_to_it_and_omitting_one_keeps_it() {
         let mut route = telegram_route("route".into(), 1);
         assert_eq!(
-            ensure_signal_binding(&mut route, Some("group-id"), false, None),
+            ensure_signal_binding(&mut route, Some("group-id"), false, None, false),
             Ok(true)
         );
         let account = |route: &Route| {
-            signal_group_account(std::slice::from_ref(route), "group-id==").map(str::to_owned)
+            signal_group_account(std::slice::from_ref(route), None, "group-id==").map(str::to_owned)
         };
         assert_eq!(account(&route), None);
         assert_eq!(
-            ensure_signal_binding(&mut route, Some("group-id"), false, Some("+15559999")),
+            ensure_signal_binding(&mut route, Some("group-id"), false, Some("+15559999"), false),
             Ok(true)
         );
         assert_eq!(account(&route).as_deref(), Some("+15559999"));
         assert_eq!(
-            ensure_signal_binding(&mut route, Some("group-id"), false, None),
+            ensure_signal_binding(&mut route, Some("group-id"), false, None, false),
             Ok(false)
         );
         assert_eq!(account(&route).as_deref(), Some("+15559999"));
@@ -2785,6 +2808,7 @@ fi
                 group_id: "source-group".into(),
                 allow_members: false,
                 account: None,
+                direct: false,
             }],
             agent: Some(AgentBinding {
                 agent_id: "agent-source".into(),
@@ -2919,6 +2943,7 @@ fi
                 group_id: "source-group".into(),
                 allow_members: false,
                 account: None,
+                direct: false,
             }],
             agent: Some(AgentBinding {
                 agent_id: "agent-source".into(),
@@ -3251,6 +3276,7 @@ fi
             group_id: "group".into(),
             allow_members: true,
             account: None,
+            direct: false,
         };
         assert_eq!(
             telegram_output_topic(&route(vec![telegram.clone()]), None),

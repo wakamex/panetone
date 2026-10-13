@@ -196,6 +196,12 @@ struct RouteEnsureArgs {
         help = "Signal account that serves the group (default: keep the current one)"
     )]
     signal_account: Option<String>,
+    #[arg(
+        long,
+        requires = "signal_group_id",
+        help = "Give this route the owner's direct messages to the serving Signal account"
+    )]
+    signal_direct: bool,
     #[command(flatten)]
     control: ControlSocketArgs,
 }
@@ -983,6 +989,7 @@ async fn run_route(args: RouteArgs) -> Result<()> {
                 signal_group_id: args.signal_group_id,
                 signal_allow_members: args.signal_allow_members,
                 signal_account: args.signal_account,
+                signal_direct: args.signal_direct,
             })?,
         ),
     };

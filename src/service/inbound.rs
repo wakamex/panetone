@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::archive::{ArchiveEntry, ChatArchives, split_signal_attachments};
 use crate::channels::{ChannelDeliveryError, InboundBatch, InboundMessage, SignalSubscriber};
-use crate::domain::{ChannelBinding, strip_invisible};
+use crate::domain::{ChannelBinding, SIGNAL_DIRECT_PREFIX, strip_invisible};
 use crate::store::{InboxItem, StoreError, StoreHandle};
 
 #[derive(Debug, Error)]
@@ -116,6 +116,7 @@ impl InboundIngestor {
         now_ms: i64,
     ) -> Result<bool, InboundIngestError> {
         let routes = self.store.list_routes().await?;
+        let is_direct = message.destination.starts_with(SIGNAL_DIRECT_PREFIX);
         let matching = routes
             .iter()
             .filter_map(|route| {
@@ -126,9 +127,14 @@ impl InboundIngestor {
                         group_id,
                         allow_members,
                         account,
-                    } if group_id.trim_end_matches('=')
-                        == message.destination.trim_end_matches('=')
-                        && receiver.serves(account.as_deref()) =>
+                        direct,
+                    } if receiver.serves(account.as_deref())
+                        && if is_direct {
+                            *direct
+                        } else {
+                            group_id.trim_end_matches('=')
+                                == message.destination.trim_end_matches('=')
+                        } =>
                     {
                         Some((route, *allow_members))
                     }
@@ -139,7 +145,9 @@ impl InboundIngestor {
         let [(route, allow_members)] = matching.as_slice() else {
             return Ok(false);
         };
-        if message.sender_id.as_deref() != Some(owner) && !allow_members {
+        // Only the owner may write to the agent directly.
+        let from_owner = message.sender_id.as_deref() == Some(owner);
+        if !from_owner && (is_direct || !allow_members) {
             return Ok(false);
         }
         let route_title = route.title.clone();
@@ -166,9 +174,13 @@ impl InboundIngestor {
                 .unwrap_or("Unknown");
             message.body = format!("{sender} says: {}", message.body);
         }
+        if is_direct {
+            message.body = format!("[direct message] {}", message.body);
+        }
         let inserted = self.persist(message, now_ms).await?;
-        // A redelivered message is already archived.
-        if inserted {
+        // A redelivered message is already archived, and a direct message is
+        // not part of the group's record.
+        if inserted && !is_direct {
             self.archives.append(&route_title, &entry);
         }
         Ok(inserted)
