@@ -146,7 +146,8 @@ impl InboundIngestor {
             return Ok(false);
         };
         // Only the owner may write to the agent directly.
-        let from_owner = message.sender_id.as_deref() == Some(owner);
+        let from_owner = message.sender_id.as_deref() == Some(owner)
+            || message.destination.strip_prefix(SIGNAL_DIRECT_PREFIX) == Some(owner);
         if !from_owner && (is_direct || !allow_members) {
             return Ok(false);
         }

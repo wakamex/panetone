@@ -654,10 +654,14 @@ impl SignalSubscriber {
                 .as_str()
                 .or_else(|| envelope["source"].as_str())
                 .unwrap_or("unknown");
-            // A message outside a group is a direct message from its sender.
+            // A message outside a group is a direct message from its sender,
+            // named by UUID because a sender can hide their number.
             let destination = match data["groupInfo"]["groupId"].as_str() {
                 Some(group_id) => group_id.trim_end_matches('=').to_owned(),
-                None => format!("{SIGNAL_DIRECT_PREFIX}{source}"),
+                None => format!(
+                    "{SIGNAL_DIRECT_PREFIX}{}",
+                    envelope["sourceUuid"].as_str().unwrap_or(source)
+                ),
             };
             let Some(timestamp) = envelope["timestamp"]
                 .as_i64()

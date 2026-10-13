@@ -957,6 +957,7 @@ async fn signal_notifications_panetone_cannot_use_are_skipped() {
                 "method": "receive",
                 "params": {"result": {"envelope": {
                     "sourceNumber": "+15551111",
+                    "sourceUuid": "uuid-1111",
                     "timestamp": 9003,
                     "dataMessage": data
                 }}}
@@ -985,7 +986,7 @@ async fn signal_notifications_panetone_cannot_use_are_skipped() {
     // A message outside a group is a direct message from its sender.
     let direct = subscriber.next().await.unwrap();
     assert_eq!(direct.body, "direct message");
-    assert_eq!(direct.destination, "direct:+15551111");
+    assert_eq!(direct.destination, "direct:uuid-1111");
     let message = subscriber.next().await.unwrap();
     assert_eq!(message.body, "after the skipped ones");
     assert_eq!(message.destination, "group-one");
@@ -1135,7 +1136,8 @@ async fn the_owners_direct_message_reaches_the_route_that_takes_them() {
         channel: ChannelKind::Signal,
         external_id: external_id.into(),
         destination: format!("direct:{sender}"),
-        sender_id: Some(sender.into()),
+        // The owner is configured by UUID while messages carry a number.
+        sender_id: Some(format!("+1555{}", sender.len())),
         sender: Some("Mihai Cosma".into()),
         reply_to_external_id: None,
         body: "start".into(),
