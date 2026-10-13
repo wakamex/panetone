@@ -623,6 +623,13 @@ impl SignalSubscriber {
         &self.account
     }
 
+    /// Reads attachments from the `attachments` directory of this account's
+    /// signal-cli data directory instead of the default one.
+    pub fn with_data_directory(mut self, directory: &Path) -> Self {
+        self.attachment_directory = directory.join("attachments");
+        self
+    }
+
     pub async fn next(&mut self) -> Result<InboundMessage, ChannelDeliveryError> {
         loop {
             let line = match timeout(self.deadline, read_bounded_line(&mut self.reader)).await {

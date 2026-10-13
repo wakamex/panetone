@@ -77,8 +77,10 @@ struct ProductionArgs {
     signal_account: Option<String>,
     #[arg(long, env = "WAK_SIG_OWNER")]
     signal_owner: Option<String>,
-    /// Further Signal accounts as comma-separated ACCOUNT=SOCKET pairs. A
-    /// route's Signal binding names the one that serves its group.
+    /// Further Signal accounts as comma-separated ACCOUNT=SOCKET[=DATA_DIR]
+    /// entries, where DATA_DIR is that signal-cli daemon's `--config`
+    /// directory. A route's Signal binding names the account that serves its
+    /// group.
     #[arg(long, env = "WAK_SIG_EXTRA_ACCOUNTS", value_delimiter = ',')]
     signal_extra_accounts: Vec<String>,
     #[arg(long, env = "PANETONE_WORKER_POLL_MS", default_value_t = 1000)]
@@ -423,7 +425,7 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
             .await
         });
     }
-    for (index, (socket, account, owner)) in signal.into_iter().enumerate() {
+    for (index, (socket, account, owner, data_directory)) in signal.into_iter().enumerate() {
         let ingestor = InboundIngestor::new(store.clone()).with_chat_archives(archives.clone());
         let shutdown = supervisor.shutdown_receiver();
         // The first account is the default one.
@@ -434,7 +436,16 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
             format!("signal-inbound-{index}")
         };
         supervisor.spawn(name, TaskPolicy::Critical, async move {
-            signal_loop(socket, account, owner, default, ingestor, shutdown).await
+            signal_loop(
+                socket,
+                account,
+                owner,
+                data_directory,
+                default,
+                ingestor,
+                shutdown,
+            )
+            .await
         });
     }
     supervisor
@@ -446,7 +457,8 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
 }
 
 type TelegramRuntime = (TelegramPoller, String);
-type SignalRuntime = (PathBuf, String, String);
+/// Socket, account, owner, and a signal-cli data directory other than the default.
+type SignalRuntime = (PathBuf, String, String, Option<PathBuf>);
 
 type ProductionChannels = (RealChannels, Option<TelegramRuntime>, Vec<SignalRuntime>);
 
@@ -499,17 +511,21 @@ fn production_channels(args: &ProductionArgs, deadline: Duration) -> Result<Prod
         (None, None, None) => Vec::new(),
         (Some(socket), Some(account), Some(owner)) => {
             channels.signal = Some(SignalClient::new(socket, account, deadline));
-            vec![(socket.clone(), account.clone(), owner.clone())]
+            vec![(socket.clone(), account.clone(), owner.clone(), None)]
         }
         _ => bail!("Signal requires WAK_SIG_SOCKET, WAK_SIG_ACCOUNT, and WAK_SIG_OWNER together"),
     };
     let mut signal = signal;
     for pair in &args.signal_extra_accounts {
-        let (Some((account, socket)), Some((_, _, owner))) = (pair.split_once('='), signal.first())
+        let (Some((account, rest)), Some((_, _, owner, _))) = (pair.split_once('='), signal.first())
         else {
             bail!(
-                "WAK_SIG_EXTRA_ACCOUNTS takes ACCOUNT=SOCKET pairs and requires the default Signal account"
+                "WAK_SIG_EXTRA_ACCOUNTS takes ACCOUNT=SOCKET[=DATA_DIR] entries and requires the default Signal account"
             );
+        };
+        let (socket, data_directory) = match rest.split_once('=') {
+            Some((socket, directory)) => (socket, Some(PathBuf::from(directory.trim()))),
+            None => (rest, None),
         };
         let (account, socket) = (account.trim(), PathBuf::from(socket.trim()));
         if account.is_empty() || channels.signal_client(Some(account)).is_some() {
@@ -518,7 +534,7 @@ fn production_channels(args: &ProductionArgs, deadline: Duration) -> Result<Prod
         channels
             .signal_extra
             .push(SignalClient::new(&socket, account, deadline));
-        signal.push((socket, account.to_owned(), owner.clone()));
+        signal.push((socket, account.to_owned(), owner.clone(), data_directory));
     }
 
     Ok((channels, telegram, signal))
@@ -737,6 +753,7 @@ async fn signal_loop(
     socket: PathBuf,
     account: String,
     owner: String,
+    data_directory: Option<PathBuf>,
     default: bool,
     ingestor: InboundIngestor,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -751,7 +768,10 @@ async fn signal_loop(
         if subscriber.is_none() {
             match SignalSubscriber::connect(&socket, &account, Duration::from_secs(35)).await {
                 Ok(connected) => {
-                    subscriber = Some(connected);
+                    subscriber = Some(match &data_directory {
+                        Some(directory) => connected.with_data_directory(directory),
+                        None => connected,
+                    });
                     consecutive_failures = 0;
                 }
                 Err(error) => {

@@ -88,10 +88,10 @@ WAK_SIG_OWNER=+15551111111
 Further Signal accounts, each with its own signal-cli daemon, let different routes appear in their groups under different bot names:
 
 ```text
-WAK_SIG_EXTRA_ACCOUNTS=+15552222222=/run/user/1000/signal-cli-second.sock
+WAK_SIG_EXTRA_ACCOUNTS=+15552222222=/run/user/1000/signal-cli-second.sock=/home/user/.local/share/signal-cli-second
 ```
 
-The value holds comma-separated `ACCOUNT=SOCKET` pairs. `WAK_SIG_ACCOUNT` remains the default account and serves every Signal group whose route names no account. `panetone route ensure TITLE --signal-group-id ID --signal-account +15552222222` moves a group to another configured account: messages for the group are then accepted only when they arrive on that account, and replies are sent through it. A group that two accounts have joined is therefore read and answered once, by the account its route names. To move a group between accounts, add the new account to the group, run `route ensure` with `--signal-account`, then remove the old account. Messages keep flowing through the old account until the `route ensure` and through the new one after it.
+The value holds comma-separated `ACCOUNT=SOCKET=DATA_DIR` entries, where `DATA_DIR` is the `--config` directory of that account's signal-cli daemon. Panetone gives agents the paths of received attachments under its `attachments` directory; without `DATA_DIR` it uses the default account's `signal-cli` data directory, which is wrong for a daemon that has its own. `WAK_SIG_ACCOUNT` remains the default account and serves every Signal group whose route names no account. `panetone route ensure TITLE --signal-group-id ID --signal-account +15552222222` moves a group to another configured account: messages for the group are then accepted only when they arrive on that account, and replies are sent through it. A group that two accounts have joined is therefore read and answered once, by the account its route names. To move a group between accounts, add the new account to the group, run `route ensure` with `--signal-account`, then remove the old account. Messages keep flowing through the old account until the `route ensure` and through the new one after it.
 
 Signal subscription timeouts and transport disconnects reconnect inside the inbound worker, so a signal-cli restart does not take down Panetone's control, Telegram, or outbound workers.
 
