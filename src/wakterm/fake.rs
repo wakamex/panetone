@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{
     AdmissionReceipt, AdmissionStatus, AgentBinding, EffectId, SendCommand, WorkflowId,
+    strip_invisible,
 };
 
 use super::{AgentCatalog, ContractError, EventRead, WaktermContract};
@@ -169,7 +170,10 @@ impl FakeWakterm {
         };
         format!(
             "[Panetone cross-agent message]\nFrom: {} ({source_harness})\nTo: {} ({target_harness})\nRequest ID: {}\nReply mode: {reply}\n\n{}",
-            command.source, command.target, command.id, command.message
+            command.source,
+            command.target,
+            command.id,
+            strip_invisible(&command.message)
         )
     }
 }

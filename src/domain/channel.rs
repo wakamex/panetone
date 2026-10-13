@@ -36,6 +36,39 @@ pub enum ChannelBinding {
     },
 }
 
+/// Removes characters that draw nothing, such as zero-width spaces, a byte
+/// order mark, direction controls and control codes. Claude Code strips them
+/// from a submitted prompt and then waits for a second Enter instead of
+/// sending it, so text bound for an agent must not carry them. Joiners and
+/// variation selectors stay because emoji and some scripts need them, and
+/// Unicode line separators become newlines.
+pub fn strip_invisible(text: &str) -> String {
+    text.chars()
+        .filter_map(|character| match character {
+            '\u{2028}' | '\u{2029}' => Some('\n'),
+            '\t' | '\n' => Some(character),
+            '\u{0}'..='\u{1f}'
+            | '\u{7f}'..='\u{9f}'
+            | '\u{ad}'
+            | '\u{34f}'
+            | '\u{61c}'
+            | '\u{115f}'
+            | '\u{1160}'
+            | '\u{180b}'..='\u{180f}'
+            | '\u{200b}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{3164}'
+            | '\u{feff}'
+            | '\u{ffa0}'
+            | '\u{fff0}'..='\u{fffb}' => None,
+            _ => Some(character),
+        })
+        .collect()
+}
+
 /// The account bound to the route that serves a Signal group, when that
 /// binding names one.
 pub fn signal_group_account<'a>(routes: &'a [super::Route], group_id: &str) -> Option<&'a str> {
@@ -294,5 +327,20 @@ mod tests {
         // A resent caption still fits Telegram's 1,024-character limit.
         chunks[0].uncertain_attempts = 1;
         assert_eq!(chunks[0].attempt_body().chars().count(), 1024);
+    }
+}
+
+#[cfg(test)]
+mod invisible_tests {
+    use super::strip_invisible;
+
+    #[test]
+    fn characters_that_draw_nothing_are_removed_and_emoji_survive() {
+        assert_eq!(
+            strip_invisible("\u{feff}Hi\u{200b} there\u{200e}\u{ad}\r\nnext\u{2028}line\u{7}"),
+            "Hi there\nnext\nline"
+        );
+        let kept = "tab\there \u{26a0}\u{fe0f} \u{1f468}\u{200d}\u{1f469} \u{645}\u{200c}\u{6cc}";
+        assert_eq!(strip_invisible(kept), kept);
     }
 }

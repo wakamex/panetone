@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::archive::{ArchiveEntry, ChatArchives, split_signal_attachments};
 use crate::channels::{ChannelDeliveryError, InboundBatch, InboundMessage, SignalSubscriber};
-use crate::domain::ChannelBinding;
+use crate::domain::{ChannelBinding, strip_invisible};
 use crate::store::{InboxItem, StoreError, StoreHandle};
 
 #[derive(Debug, Error)]
@@ -82,7 +82,7 @@ impl InboundIngestor {
             sender_id: message.sender_id,
             sender: message.sender,
             reply_to_external_id: message.reply_to_external_id,
-            body: message.body,
+            body: strip_invisible(&message.body),
             state: "pending".into(),
             created_at_ms: now_ms,
             receipt: None,
