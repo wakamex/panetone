@@ -126,6 +126,10 @@ pub struct DeliveryProof {
     pub after_sequence: u64,
     /// The SHA-256 of the trimmed message, as Wakterm's `input_sha256`.
     pub input_sha256: String,
+    /// The same hash of the message as Claude records it, when it contains
+    /// tabs: Claude turns each tab of pasted input into four spaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_expanded_sha256: Option<String>,
     pub deadline_ms: i64,
     /// Why delivery was unconfirmed, for the sender's notice if no proof comes.
     pub detail: String,
@@ -134,6 +138,11 @@ pub struct DeliveryProof {
 impl DeliveryProof {
     pub fn input_sha256(text: &str) -> String {
         format!("{:x}", Sha256::digest(text.trim().as_bytes()))
+    }
+
+    pub fn tab_expanded_sha256(text: &str) -> Option<String> {
+        text.contains('\t')
+            .then(|| Self::input_sha256(&text.replace('\t', "    ")))
     }
 }
 
@@ -2215,9 +2224,14 @@ fn input_recorded(connection: &Connection, proof: &DeliveryProof) -> StoreResult
             "SELECT 1 FROM agent_events
              WHERE agent_id = ?1 AND sequence > ?2
                AND kind IN ('input_accepted', 'turn_started')
-               AND json_extract(record_json, '$.input_sha256') = ?3
+               AND json_extract(record_json, '$.input_sha256') IN (?3, ?4)
              LIMIT 1",
-            params![proof.agent_id, proof.after_sequence, proof.input_sha256],
+            params![
+                proof.agent_id,
+                proof.after_sequence,
+                proof.input_sha256,
+                proof.tab_expanded_sha256
+            ],
             |_| Ok(()),
         )
         .optional()?

@@ -529,6 +529,7 @@ async fn an_admission_interrupted_by_a_restart_waits_for_proof_when_it_has_one()
                 agent_id: "agent".into(),
                 after_sequence: 0,
                 input_sha256: DeliveryProof::input_sha256("hello"),
+                tab_expanded_sha256: None,
                 deadline_ms: 1,
                 detail: "Panetone restarted while delivering it".into(),
             }),

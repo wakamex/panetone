@@ -1000,3 +1000,46 @@ async fn a_claude_menu_raised_outside_a_turn_is_posted_with_numbered_buttons() {
     );
     store.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn input_recorded_with_its_tabs_expanded_proves_delivery() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let route = route();
+    store.save_route(route.clone(), 1).await.unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+    let body = "Saved from\thost\n\t12 Oct 2026";
+    // Claude records each pasted tab as four spaces.
+    let recorded = "Saved from    host\n    12 Oct 2026";
+    let event: EventRecord = serde_json::from_value(serde_json::json!({
+        "sequence": 101,
+        "event_id": "input-event-101",
+        "kind": "input_accepted",
+        "agent_id": "agent-zola",
+        "incarnation_id": "incarnation-zola-7",
+        "turn_id": "turn-1",
+        "input_sha256": panetone::store::DeliveryProof::input_sha256(recorded),
+    }))
+    .unwrap();
+    store
+        .ingest_agent_events(100, 101, vec![event], live_agents(&route), 3)
+        .await
+        .unwrap();
+    let proof = |tab_expanded_sha256| panetone::store::DeliveryProof {
+        agent_id: "agent-zola".into(),
+        after_sequence: 100,
+        input_sha256: panetone::store::DeliveryProof::input_sha256(body),
+        tab_expanded_sha256,
+        deadline_ms: i64::MAX,
+        detail: String::new(),
+    };
+
+    assert!(!store.input_recorded(proof(None)).await.unwrap());
+    assert!(
+        store
+            .input_recorded(proof(panetone::store::DeliveryProof::tab_expanded_sha256(body)))
+            .await
+            .unwrap()
+    );
+    store.shutdown().await.unwrap();
+}

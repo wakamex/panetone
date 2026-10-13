@@ -783,6 +783,7 @@ impl ProductionService {
                 agent_id: binding.agent_id.clone(),
                 after_sequence,
                 input_sha256: DeliveryProof::input_sha256(&item.body),
+                tab_expanded_sha256: DeliveryProof::tab_expanded_sha256(&item.body),
                 deadline_ms: now_ms() + INBOX_PROOF_WINDOW_MS,
                 detail: "Panetone restarted while delivering it".into(),
             });
@@ -3301,6 +3302,7 @@ fi
             agent_id: "agent-route".into(),
             after_sequence: 10,
             input_sha256: DeliveryProof::input_sha256(body),
+            tab_expanded_sha256: DeliveryProof::tab_expanded_sha256(body),
             deadline_ms: i64::MAX,
             detail: "prompt was written".into(),
         });
