@@ -1464,10 +1464,31 @@ fn ingest_agent_events(
                     crate::domain::ChannelBinding::Signal { .. } => None,
                 })
             } else {
-                output_destination(
-                    route,
-                    preferences.get(&route.id.to_string()).map(String::as_str),
-                )
+                let preference = preferences.get(&route.id.to_string()).map(String::as_str);
+                // Where a turn's output goes follows the message that started
+                // it, so a reply to a direct message can never reach the
+                // group because a group message arrived meanwhile, and a
+                // reply to the group never goes to a direct chat.
+                let origin = turn_origin(&transaction, event)?;
+                let preference = match &origin {
+                    Some((ChannelKind::Signal, destination))
+                        if destination.starts_with(crate::domain::SIGNAL_DIRECT_PREFIX) =>
+                    {
+                        Some(format!("sig:{destination}"))
+                    }
+                    Some((ChannelKind::Signal, _))
+                        if preference.is_some_and(|value| value.starts_with("sig:")) =>
+                    {
+                        Some("sig".to_owned())
+                    }
+                    Some((ChannelKind::Telegram, _))
+                        if preference.is_some_and(|value| value.starts_with("sig:")) =>
+                    {
+                        Some("tg".to_owned())
+                    }
+                    _ => preference.map(str::to_owned),
+                };
+                output_destination(route, preference.as_deref())
             };
             let Some((kind, destination)) = destination else {
                 state = "unrouted";
@@ -1667,6 +1688,52 @@ fn insert_agent_event(
         ],
     )?;
     Ok(())
+}
+
+/// The channel and destination of the inbound message that started the turn
+/// an event belongs to, when a channel message started it.
+fn turn_origin(
+    connection: &Connection,
+    event: &EventRecord,
+) -> StoreResult<Option<(ChannelKind, String)>> {
+    let Some(turn_id) = event.fields.get("turn_id").and_then(|value| value.as_str()) else {
+        return Ok(None);
+    };
+    let Some(input_sha256) = connection
+        .query_row(
+            "SELECT json_extract(record_json, '$.input_sha256') FROM agent_events
+             WHERE agent_id = ?1 AND kind = 'turn_started'
+               AND json_extract(record_json, '$.turn_id') = ?2
+             ORDER BY sequence LIMIT 1",
+            params![event.agent_id, turn_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    let origin = connection
+        .query_row(
+            "SELECT channel, json_extract(record_json, '$.destination') FROM inbox
+             WHERE json_extract(record_json, '$.proof.agent_id') = ?1
+               AND ?2 IN (
+                   json_extract(record_json, '$.proof.input_sha256'),
+                   json_extract(record_json, '$.proof.tab_expanded_sha256')
+               )
+             ORDER BY created_at_ms DESC LIMIT 1",
+            params![event.agent_id, input_sha256],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    Ok(origin.map(|(channel, destination)| {
+        let kind = if channel == channel_name(ChannelKind::Signal) {
+            ChannelKind::Signal
+        } else {
+            ChannelKind::Telegram
+        };
+        (kind, destination)
+    }))
 }
 
 fn route_preferences(

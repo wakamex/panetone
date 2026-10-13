@@ -1091,3 +1091,123 @@ async fn output_after_a_direct_message_returns_to_its_sender() {
     }
     store.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_turns_output_goes_where_the_message_that_started_it_came_from() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let mut route = route();
+    for binding in &mut route.channels {
+        if let ChannelBinding::Signal { direct, .. } = binding {
+            *direct = true;
+        }
+    }
+    store.save_route(route.clone(), 1).await.unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+    let deliver = |id: u128, destination: &'static str, body: &'static str| {
+        let store = store.clone();
+        let route_id = route.id;
+        async move {
+            let mut item = panetone::store::InboxItem {
+                id: panetone::domain::EffectId::new(Uuid::from_u128(id)),
+                channel: ChannelKind::Signal,
+                external_id: format!("owner:{id}"),
+                destination: destination.into(),
+                sender_id: Some("+15551111".into()),
+                sender: Some("Mihai".into()),
+                reply_to_external_id: None,
+                body: body.into(),
+                state: "pending".into(),
+                created_at_ms: id as i64,
+                receipt: None,
+                steering_acknowledged: None,
+                proof: None,
+            };
+            store.accept_inbox(item.clone()).await.unwrap();
+            item.state = "delivered".into();
+            item.proof = Some(panetone::store::DeliveryProof {
+                agent_id: "agent-zola".into(),
+                after_sequence: 100,
+                input_sha256: panetone::store::DeliveryProof::input_sha256(body),
+                tab_expanded_sha256: None,
+                deadline_ms: i64::MAX,
+                detail: String::new(),
+            });
+            store
+                .save_inbox(item, "pending", Some((route_id, ChannelKind::Signal)))
+                .await
+                .unwrap();
+        }
+    };
+    let event = |sequence: u64, kind: &str, turn: &str, field: &str, value: &str| -> EventRecord {
+        serde_json::from_value(serde_json::json!({
+            "sequence": sequence,
+            "event_id": format!("event-{sequence}"),
+            "kind": kind,
+            "agent_id": "agent-zola",
+            "incarnation_id": "incarnation-zola-7",
+            "turn_id": turn,
+            "observed_at": "2026-10-13T18:08:50Z",
+            field: value,
+        }))
+        .unwrap()
+    };
+    let hash = panetone::store::DeliveryProof::input_sha256;
+
+    // A direct message starts a turn, and a group message arrives before the
+    // reply is posted, so the route's last channel is the group again.
+    deliver(1, "direct:uuid-owner", "[direct message] is this private?").await;
+    deliver(2, "signal-zola", "Melissa says: hello").await;
+    store
+        .ingest_agent_events(
+            100,
+            104,
+            vec![
+                event(101, "turn_started", "turn-direct", "input_sha256", &hash("[direct message] is this private?")),
+                event(102, "assistant_message", "turn-direct", "text", "Yes, only you see this."),
+                event(103, "turn_started", "turn-group", "input_sha256", &hash("Melissa says: hello")),
+                event(104, "assistant_message", "turn-group", "text", "Hello Melissa."),
+            ],
+            live_agents(&route),
+            3,
+        )
+        .await
+        .unwrap();
+    let destinations = |pending: Vec<panetone::domain::OutboxItem>| {
+        pending
+            .into_iter()
+            .map(|item| (item.body, item.destination))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        destinations(store.pending_outbox().await.unwrap()),
+        [
+            ("Yes, only you see this.".to_owned(), "direct:uuid-owner".to_owned()),
+            ("Hello Melissa.".to_owned(), "signal-zola".to_owned()),
+        ]
+    );
+
+    // The reverse order: the group's reply is posted after a direct message
+    // made the direct chat the route's last channel.
+    deliver(3, "signal-zola", "Melissa says: again").await;
+    deliver(4, "direct:uuid-owner", "[direct message] start").await;
+    store
+        .ingest_agent_events(
+            104,
+            106,
+            vec![
+                event(105, "turn_started", "turn-group-2", "input_sha256", &hash("Melissa says: again")),
+                event(106, "assistant_message", "turn-group-2", "text", "Again, hello."),
+            ],
+            live_agents(&route),
+            3,
+        )
+        .await
+        .unwrap();
+    let pending = destinations(store.pending_outbox().await.unwrap());
+    assert_eq!(
+        pending.last().unwrap(),
+        &("Again, hello.".to_owned(), "signal-zola".to_owned())
+    );
+    store.shutdown().await.unwrap();
+}

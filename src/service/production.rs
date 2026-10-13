@@ -812,6 +812,19 @@ impl ProductionService {
             item.receipt = Some(receipt.clone());
             item.state = match receipt.status {
                 AdmissionStatus::Accepted => "delivered",
+                // A direct message is never written into a turn another
+                // conversation started, nor a group or Telegram message into
+                // a turn a direct message started: the agent's reply would
+                // go to the wrong audience. It waits and starts its own turn.
+                AdmissionStatus::Busy if self.crosses_direct_boundary(route, &item).await? => {
+                    item.state = "pending".into();
+                    item.receipt = None;
+                    self.store
+                        .save_inbox(item, "admission_prepared", None)
+                        .await
+                        .map_err(error_string)?;
+                    continue;
+                }
                 AdmissionStatus::Busy => {
                     let steering = match self.wakterm.steer(&binding, &item.body).await {
                         Ok(steering) => steering,
@@ -962,6 +975,28 @@ impl ProductionService {
             }
         }
         Ok(shown)
+    }
+
+    /// Whether an inbound message and the route's last turn-starting channel
+    /// message sit on opposite sides of the direct-message boundary.
+    async fn crosses_direct_boundary(
+        &self,
+        route: &Route,
+        item: &InboxItem,
+    ) -> Result<bool, String> {
+        let preferences: BTreeMap<String, String> = match self
+            .store
+            .get_metadata("route_output_preferences_v1".into())
+            .await
+            .map_err(error_string)?
+        {
+            Some(json) => serde_json::from_str(&json).map_err(error_string)?,
+            None => BTreeMap::new(),
+        };
+        let direct_turn = preferences
+            .get(&route.id.to_string())
+            .is_some_and(|preference| preference.starts_with("sig:"));
+        Ok(direct_turn != item.destination.starts_with(SIGNAL_DIRECT_PREFIX))
     }
 
     /// Tells the sender's chat that an inbound message may not have reached the
