@@ -61,6 +61,11 @@ pub struct RouteEnsureParams {
     pub signal_group_id: Option<String>,
     #[serde(default)]
     pub signal_allow_members: bool,
+    /// The Signal account that serves the group, one the daemon is
+    /// configured with. Omitted, the binding keeps its account, and a new
+    /// binding uses the default account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_account: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

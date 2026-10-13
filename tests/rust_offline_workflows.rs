@@ -59,6 +59,7 @@ fn routes() -> (Route, Route) {
             ChannelBinding::Signal {
                 group_id: "source-group".into(),
                 allow_members: false,
+                account: None,
             },
         ),
         route(

@@ -16,7 +16,7 @@ use crate::control::{
 };
 use crate::domain::{
     AdmissionStatus, AgentBinding, ChannelBinding, ChannelKind, EffectId, OutboxAction, OutboxItem,
-    OutboxState, Route, RouteId, WorkflowId, WorkflowState,
+    OutboxState, Route, RouteId, WorkflowId, WorkflowState, signal_group_account,
 };
 use crate::store::{
     DeliveryProof, EventCursorGap, InboxItem, RouteAgent, StoreHandle, StoredApproval,
@@ -515,7 +515,12 @@ impl ProductionService {
             body: item.attempt_body(),
             ..item.clone()
         };
-        match self.channels.send(&attempt).await {
+        let routes = match attempt.kind {
+            ChannelKind::Signal => self.store.list_routes().await.map_err(error_string)?,
+            ChannelKind::Telegram => Vec::new(),
+        };
+        let signal_account = signal_group_account(&routes, &attempt.destination);
+        match self.channels.send_as(&attempt, signal_account).await {
             Ok(receipt) => {
                 self.archive_delivered(&item, &receipt.external_id).await;
                 item.state = OutboxState::Delivered;
@@ -1438,11 +1443,22 @@ impl ProductionService {
                 .as_deref()
                 .is_some_and(|group_id| group_id.trim().is_empty())
             || (params.signal_allow_members && params.signal_group_id.is_none())
+            || (params.signal_account.is_some() && params.signal_group_id.is_none())
         {
             return error_response(
                 id,
                 "invalid_params",
-                "route title must be 1 to 128 characters without surrounding whitespace, a Telegram topic ID must be positive, and Signal member access requires a non-empty group ID",
+                "route title must be 1 to 128 characters without surrounding whitespace, a Telegram topic ID must be positive, and Signal member access or a Signal account requires a non-empty group ID",
+                None,
+            );
+        }
+        if let Some(account) = params.signal_account.as_deref()
+            && self.channels.signal_client(Some(account)).is_none()
+        {
+            return error_response(
+                id,
+                "invalid_params",
+                format!("the daemon is not configured with Signal account {account:?}"),
                 None,
             );
         }
@@ -1508,6 +1524,7 @@ impl ProductionService {
                     &mut route,
                     params.signal_group_id.as_deref(),
                     params.signal_allow_members,
+                    params.signal_account.as_deref(),
                 )
                 .expect("a new route has no conflicting Signal binding");
                 if let Err(error) = self.store.save_route(route.clone(), now_ms()).await {
@@ -1555,6 +1572,7 @@ impl ProductionService {
             &mut route,
             params.signal_group_id.as_deref(),
             params.signal_allow_members,
+            params.signal_account.as_deref(),
         ) {
             Ok(changed) => binding_created |= changed,
             Err(existing) => {
@@ -1763,31 +1781,41 @@ fn ensure_signal_binding(
     route: &mut Route,
     requested_group_id: Option<&str>,
     allow_members: bool,
+    requested_account: Option<&str>,
 ) -> Result<bool, String> {
     let Some(requested_group_id) = requested_group_id else {
         return Ok(false);
     };
-    if let Some((group_id, existing_allow_members)) =
+    if let Some((group_id, existing_allow_members, account)) =
         route.channels.iter_mut().find_map(|binding| match binding {
             ChannelBinding::Signal {
                 group_id,
                 allow_members,
-            } => Some((group_id, allow_members)),
+                account,
+            } => Some((group_id, allow_members, account)),
             ChannelBinding::Telegram { .. } => None,
         })
     {
         if group_id.trim_end_matches('=') != requested_group_id.trim_end_matches('=') {
             return Err(group_id.clone());
         }
+        let mut changed = false;
         if allow_members && !*existing_allow_members {
             *existing_allow_members = true;
-            return Ok(true);
+            changed = true;
         }
-        return Ok(false);
+        // Naming an account moves the group to it; omitting one keeps the
+        // account that serves it now.
+        if requested_account.is_some() && account.as_deref() != requested_account {
+            *account = requested_account.map(str::to_owned);
+            changed = true;
+        }
+        return Ok(changed);
     }
     route.channels.push(ChannelBinding::Signal {
         group_id: requested_group_id.to_owned(),
         allow_members,
+        account: requested_account.map(str::to_owned),
     });
     Ok(true)
 }
@@ -2112,6 +2140,7 @@ mod tests {
             channels: vec![ChannelBinding::Signal {
                 group_id: "group-one".into(),
                 allow_members: true,
+                account: None,
             }],
             agent: None,
         };
@@ -2446,7 +2475,7 @@ fi
     fn signal_binding_member_policy_is_explicit_and_monotonic() {
         let mut route = telegram_route("inquisition".into(), 42);
         assert_eq!(
-            ensure_signal_binding(&mut route, Some("group-id=="), true),
+            ensure_signal_binding(&mut route, Some("group-id=="), true, None),
             Ok(true)
         );
         assert!(matches!(
@@ -2454,16 +2483,40 @@ fi
             Some(ChannelBinding::Signal {
                 group_id,
                 allow_members: true,
+                account: None,
             }) if group_id == "group-id=="
         ));
         assert_eq!(
-            ensure_signal_binding(&mut route, Some("group-id"), false),
+            ensure_signal_binding(&mut route, Some("group-id"), false, None),
             Ok(false)
         );
         assert_eq!(
-            ensure_signal_binding(&mut route, Some("other-group"), true),
+            ensure_signal_binding(&mut route, Some("other-group"), true, None),
             Err("group-id==".into())
         );
+    }
+
+    #[test]
+    fn naming_a_signal_account_moves_the_group_to_it_and_omitting_one_keeps_it() {
+        let mut route = telegram_route("route".into(), 1);
+        assert_eq!(
+            ensure_signal_binding(&mut route, Some("group-id"), false, None),
+            Ok(true)
+        );
+        let account = |route: &Route| {
+            signal_group_account(std::slice::from_ref(route), "group-id==").map(str::to_owned)
+        };
+        assert_eq!(account(&route), None);
+        assert_eq!(
+            ensure_signal_binding(&mut route, Some("group-id"), false, Some("+15559999")),
+            Ok(true)
+        );
+        assert_eq!(account(&route).as_deref(), Some("+15559999"));
+        assert_eq!(
+            ensure_signal_binding(&mut route, Some("group-id"), false, None),
+            Ok(false)
+        );
+        assert_eq!(account(&route).as_deref(), Some("+15559999"));
     }
 
     #[tokio::test]
@@ -2697,6 +2750,7 @@ fi
             channels: vec![ChannelBinding::Signal {
                 group_id: "source-group".into(),
                 allow_members: false,
+                account: None,
             }],
             agent: Some(AgentBinding {
                 agent_id: "agent-source".into(),
@@ -2830,6 +2884,7 @@ fi
             channels: vec![ChannelBinding::Signal {
                 group_id: "source-group".into(),
                 allow_members: false,
+                account: None,
             }],
             agent: Some(AgentBinding {
                 agent_id: "agent-source".into(),
@@ -3161,6 +3216,7 @@ fi
         let signal = ChannelBinding::Signal {
             group_id: "group".into(),
             allow_members: true,
+            account: None,
         };
         assert_eq!(
             telegram_output_topic(&route(vec![telegram.clone()]), None),

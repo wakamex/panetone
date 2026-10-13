@@ -8,6 +8,7 @@ use crate::channels::{RealChannels, RecordingChannels};
 use crate::domain::{
     AdmissionStatus, AgentBinding, CallbackDelivery, ChannelBinding, ChannelKind, DeliveryState,
     EffectId, OutboxItem, OutboxState, Route, SendCommand, WorkflowId, WorkflowState,
+    signal_group_account,
 };
 use crate::store::{
     ClaimResult, DestinationDelivery, ReturnDelivery, StoreError, StoreHandle, StoredWorkflow,
@@ -232,13 +233,17 @@ impl WaktermBackend {
 }
 
 impl ChannelBackend {
-    async fn send(&self, item: &OutboxItem) -> Result<String, ServiceError> {
+    async fn send(
+        &self,
+        item: &OutboxItem,
+        signal_account: Option<&str>,
+    ) -> Result<String, ServiceError> {
         match self {
             Self::Fake(channels) => channels
                 .send(item)
                 .map_err(|error| ServiceError::Adapter(error.to_string())),
             Self::Real(channels) => channels
-                .send(item)
+                .send_as(item, signal_account)
                 .await
                 .map(|receipt| receipt.external_id)
                 .map_err(|error| ServiceError::Adapter(error.to_string())),
@@ -322,7 +327,12 @@ impl OfflineService {
             chunk.attempts += 1;
             chunk.last_error = None;
             self.store.save_outbox(chunk.clone(), now_ms).await?;
-            match self.channels.send(&chunk).await {
+            let routes = match chunk.kind {
+                ChannelKind::Signal => self.store.list_routes().await?,
+                ChannelKind::Telegram => Vec::new(),
+            };
+            let signal_account = signal_group_account(&routes, &chunk.destination);
+            match self.channels.send(&chunk, signal_account).await {
                 Ok(receipt) => {
                     if let Some(point) = fault_after_send {
                         self.faults.hit(point)?;

@@ -19,6 +19,24 @@ pub struct InboundIngestor {
     archives: ChatArchives,
 }
 
+/// The Signal account a message arrived on.
+#[derive(Clone, Copy, Debug)]
+pub struct SignalReceiver<'a> {
+    pub account: &'a str,
+    /// Whether this is the daemon's default account, which serves every
+    /// binding that names no account.
+    pub default: bool,
+}
+
+impl SignalReceiver<'_> {
+    fn serves(self, bound: Option<&str>) -> bool {
+        match bound {
+            Some(bound) => bound == self.account,
+            None => self.default,
+        }
+    }
+}
+
 impl InboundIngestor {
     pub fn new(store: StoreHandle) -> Self {
         Self {
@@ -94,6 +112,7 @@ impl InboundIngestor {
         &self,
         mut message: InboundMessage,
         owner: &str,
+        receiver: SignalReceiver<'_>,
         now_ms: i64,
     ) -> Result<bool, InboundIngestError> {
         let routes = self.store.list_routes().await?;
@@ -101,11 +120,15 @@ impl InboundIngestor {
             .iter()
             .filter_map(|route| {
                 route.channels.iter().find_map(|binding| match binding {
+                    // A group that two accounts have joined is served only by
+                    // the account its route is bound to.
                     ChannelBinding::Signal {
                         group_id,
                         allow_members,
+                        account,
                     } if group_id.trim_end_matches('=')
-                        == message.destination.trim_end_matches('=') =>
+                        == message.destination.trim_end_matches('=')
+                        && receiver.serves(account.as_deref()) =>
                     {
                         Some((route, *allow_members))
                     }
@@ -158,7 +181,11 @@ impl InboundIngestor {
         now_ms: i64,
     ) -> Result<bool, InboundIngestError> {
         let message = subscriber.next().await?;
-        self.persist_signal(message, owner, now_ms).await
+        let receiver = SignalReceiver {
+            account: subscriber.account(),
+            default: true,
+        };
+        self.persist_signal(message, owner, receiver, now_ms).await
     }
 }
 

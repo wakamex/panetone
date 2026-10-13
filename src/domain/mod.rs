@@ -4,6 +4,7 @@ mod route;
 mod workflow;
 
 pub use channel::{
+    signal_group_account,
     ChannelAttachment, ChannelBinding, ChannelKind, MAX_CHANNEL_ATTACHMENT_BYTES,
     MAX_CHANNEL_ATTACHMENT_TOTAL_BYTES, MAX_CHANNEL_ATTACHMENTS, OutboxAction, OutboxItem,
     OutboxState, chunk_outbox,

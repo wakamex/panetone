@@ -229,6 +229,10 @@ impl SignalClient {
         &self.socket
     }
 
+    pub fn account(&self) -> &str {
+        &self.account
+    }
+
     pub async fn send(&self, item: &OutboxItem) -> Result<DeliveryReceipt, ChannelDeliveryError> {
         if item.kind != ChannelKind::Signal || item.destination.is_empty() {
             return Err(ChannelDeliveryError::InvalidDestination(item.kind));
@@ -334,10 +338,33 @@ pub struct RealChannels {
     pub telegram: Option<TelegramClient>,
     pub telegram_by_harness: BTreeMap<String, TelegramClient>,
     pub signal: Option<SignalClient>,
+    /// Further Signal accounts, each serving the routes bound to it.
+    pub signal_extra: Vec<SignalClient>,
 }
 
 impl RealChannels {
     pub async fn send(&self, item: &OutboxItem) -> Result<DeliveryReceipt, ChannelDeliveryError> {
+        self.send_as(item, None).await
+    }
+
+    /// The client for a Signal account, or the default one without a name.
+    pub fn signal_client(&self, account: Option<&str>) -> Option<&SignalClient> {
+        match account {
+            None => self.signal.as_ref(),
+            Some(account) => self
+                .signal
+                .iter()
+                .chain(&self.signal_extra)
+                .find(|client| client.account() == account),
+        }
+    }
+
+    /// Sends an item, a Signal one through the named account.
+    pub async fn send_as(
+        &self,
+        item: &OutboxItem,
+        signal_account: Option<&str>,
+    ) -> Result<DeliveryReceipt, ChannelDeliveryError> {
         match item.kind {
             ChannelKind::Telegram => {
                 item.sender_harness
@@ -349,8 +376,7 @@ impl RealChannels {
                     .await
             }
             ChannelKind::Signal => {
-                self.signal
-                    .as_ref()
+                self.signal_client(signal_account)
                     .ok_or(ChannelDeliveryError::NotConfigured(item.kind))?
                     .send(item)
                     .await

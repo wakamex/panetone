@@ -592,3 +592,49 @@ async fn dispatcher_fails_closed_when_a_channel_is_not_configured() {
         ChannelDeliveryError::NotConfigured(ChannelKind::Telegram)
     );
 }
+
+#[tokio::test]
+async fn a_signal_item_is_sent_through_the_account_named_for_its_group() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("second.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut request = String::new();
+        reader.read_line(&mut request).await.unwrap();
+        let request: Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["params"]["account"], "+15559999");
+        reader
+            .get_mut()
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"11111111-1111-4111-8111-111111111111\",\"result\":{\"timestamp\":12345}}\n")
+            .await
+            .unwrap();
+    });
+    let channels = RealChannels {
+        signal: Some(SignalClient::new(
+            directory.path().join("default.sock"),
+            "+15550000",
+            Duration::from_secs(2),
+        )),
+        signal_extra: vec![SignalClient::new(
+            &socket,
+            "+15559999",
+            Duration::from_secs(2),
+        )],
+        ..RealChannels::default()
+    };
+    let item = item(ChannelKind::Signal, "group-one");
+
+    channels.send_as(&item, Some("+15559999")).await.unwrap();
+    server.await.unwrap();
+    // The default account's socket does not exist, and an unknown account is refused.
+    assert_eq!(
+        channels.send_as(&item, None).await.unwrap_err(),
+        ChannelDeliveryError::Unreachable(ChannelKind::Signal)
+    );
+    assert_eq!(
+        channels.send_as(&item, Some("+15558888")).await.unwrap_err(),
+        ChannelDeliveryError::NotConfigured(ChannelKind::Signal)
+    );
+}

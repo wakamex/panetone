@@ -13,7 +13,7 @@ use panetone::control::{
     CONTROL_SCHEMA, ControlRequest, ControlServer, OutputDispositionParams, RouteEnsureParams,
     RouteInspectParams, SendParams, SourceAgent, request,
 };
-use panetone::service::{FormUpdate, InboundIngestor, ProductionService};
+use panetone::service::{FormUpdate, InboundIngestor, ProductionService, SignalReceiver};
 use panetone::store::StoreHandle;
 use panetone::supervisor::{Supervisor, TaskPolicy, run_periodic};
 use panetone::wakterm::{EventRead, EventRecord, WaktermCli, resume_cursor};
@@ -77,6 +77,10 @@ struct ProductionArgs {
     signal_account: Option<String>,
     #[arg(long, env = "WAK_SIG_OWNER")]
     signal_owner: Option<String>,
+    /// Further Signal accounts as comma-separated ACCOUNT=SOCKET pairs. A
+    /// route's Signal binding names the one that serves its group.
+    #[arg(long, env = "WAK_SIG_EXTRA_ACCOUNTS", value_delimiter = ',')]
+    signal_extra_accounts: Vec<String>,
     #[arg(long, env = "PANETONE_WORKER_POLL_MS", default_value_t = 1000)]
     worker_poll_ms: u64,
     #[arg(long, env = "PANETONE_REPLAY_OFFLINE_OUTPUT", default_value_t = false)]
@@ -184,6 +188,12 @@ struct RouteEnsureArgs {
     signal_group_id: Option<String>,
     #[arg(long, requires = "signal_group_id")]
     signal_allow_members: bool,
+    #[arg(
+        long,
+        requires = "signal_group_id",
+        help = "Signal account that serves the group (default: keep the current one)"
+    )]
+    signal_account: Option<String>,
     #[command(flatten)]
     control: ControlSocketArgs,
 }
@@ -413,11 +423,18 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
             .await
         });
     }
-    if let Some((socket, account, owner)) = signal {
+    for (index, (socket, account, owner)) in signal.into_iter().enumerate() {
         let ingestor = InboundIngestor::new(store.clone()).with_chat_archives(archives.clone());
         let shutdown = supervisor.shutdown_receiver();
-        supervisor.spawn("signal-inbound", TaskPolicy::Critical, async move {
-            signal_loop(socket, account, owner, ingestor, shutdown).await
+        // The first account is the default one.
+        let default = index == 0;
+        let name = if default {
+            "signal-inbound".to_owned()
+        } else {
+            format!("signal-inbound-{index}")
+        };
+        supervisor.spawn(name, TaskPolicy::Critical, async move {
+            signal_loop(socket, account, owner, default, ingestor, shutdown).await
         });
     }
     supervisor
@@ -431,7 +448,7 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
 type TelegramRuntime = (TelegramPoller, String);
 type SignalRuntime = (PathBuf, String, String);
 
-type ProductionChannels = (RealChannels, Option<TelegramRuntime>, Option<SignalRuntime>);
+type ProductionChannels = (RealChannels, Option<TelegramRuntime>, Vec<SignalRuntime>);
 
 fn production_channels(args: &ProductionArgs, deadline: Duration) -> Result<ProductionChannels> {
     let mut channels = RealChannels::default();
@@ -479,13 +496,30 @@ fn production_channels(args: &ProductionArgs, deadline: Duration) -> Result<Prod
         args.signal_account.as_ref(),
         args.signal_owner.as_ref(),
     ) {
-        (None, None, None) => None,
+        (None, None, None) => Vec::new(),
         (Some(socket), Some(account), Some(owner)) => {
             channels.signal = Some(SignalClient::new(socket, account, deadline));
-            Some((socket.clone(), account.clone(), owner.clone()))
+            vec![(socket.clone(), account.clone(), owner.clone())]
         }
         _ => bail!("Signal requires WAK_SIG_SOCKET, WAK_SIG_ACCOUNT, and WAK_SIG_OWNER together"),
     };
+    let mut signal = signal;
+    for pair in &args.signal_extra_accounts {
+        let (Some((account, socket)), Some((_, _, owner))) = (pair.split_once('='), signal.first())
+        else {
+            bail!(
+                "WAK_SIG_EXTRA_ACCOUNTS takes ACCOUNT=SOCKET pairs and requires the default Signal account"
+            );
+        };
+        let (account, socket) = (account.trim(), PathBuf::from(socket.trim()));
+        if account.is_empty() || channels.signal_client(Some(account)).is_some() {
+            bail!("WAK_SIG_EXTRA_ACCOUNTS names an empty or repeated account");
+        }
+        channels
+            .signal_extra
+            .push(SignalClient::new(&socket, account, deadline));
+        signal.push((socket, account.to_owned(), owner.clone()));
+    }
 
     Ok((channels, telegram, signal))
 }
@@ -703,9 +737,14 @@ async fn signal_loop(
     socket: PathBuf,
     account: String,
     owner: String,
+    default: bool,
     ingestor: InboundIngestor,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
+    let receiver = SignalReceiver {
+        account: &account,
+        default,
+    };
     let mut subscriber = None;
     let mut consecutive_failures = 0_u32;
     loop {
@@ -750,7 +789,7 @@ async fn signal_loop(
                     Ok(message) => {
                         consecutive_failures = 0;
                         ingestor
-                            .persist_signal(message, &owner, wall_now_ms())
+                            .persist_signal(message, &owner, receiver, wall_now_ms())
                             .await
                             .map_err(|error| error.to_string())?;
                     }
@@ -923,6 +962,7 @@ async fn run_route(args: RouteArgs) -> Result<()> {
                 telegram_topic_id: args.telegram_topic_id,
                 signal_group_id: args.signal_group_id,
                 signal_allow_members: args.signal_allow_members,
+                signal_account: args.signal_account,
             })?,
         ),
     };
@@ -1141,6 +1181,7 @@ mod tests {
             signal_socket: None,
             signal_account: None,
             signal_owner: None,
+            signal_extra_accounts: Vec::new(),
             worker_poll_ms: 1000,
             replay_offline_output: false,
             chat_archives: String::new(),

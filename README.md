@@ -85,6 +85,14 @@ WAK_SIG_ACCOUNT=+15550000000
 WAK_SIG_OWNER=+15551111111
 ```
 
+Further Signal accounts, each with its own signal-cli daemon, let different routes appear in their groups under different bot names:
+
+```text
+WAK_SIG_EXTRA_ACCOUNTS=+15552222222=/run/user/1000/signal-cli-second.sock
+```
+
+The value holds comma-separated `ACCOUNT=SOCKET` pairs. `WAK_SIG_ACCOUNT` remains the default account and serves every Signal group whose route names no account. `panetone route ensure TITLE --signal-group-id ID --signal-account +15552222222` moves a group to another configured account: messages for the group are then accepted only when they arrive on that account, and replies are sent through it. A group that two accounts have joined is therefore read and answered once, by the account its route names. To move a group between accounts, add the new account to the group, run `route ensure` with `--signal-account`, then remove the old account. Messages keep flowing through the old account until the `route ensure` and through the new one after it.
+
 Signal subscription timeouts and transport disconnects reconnect inside the inbound worker, so a signal-cli restart does not take down Panetone's control, Telegram, or outbound workers.
 
 After authorization and routing, Panetone sends the message body unchanged except for sender labels on member-enabled Signal groups and attachment paths. An idle agent receives a normal admitted prompt. A busy agent receives immediate active-turn steering after Wakterm definitively confirms that admission did not write the prompt.

@@ -22,6 +22,7 @@ fn route() -> Route {
             ChannelBinding::Signal {
                 group_id: "signal-zola".into(),
                 allow_members: false,
+                account: None,
             },
         ],
         agent: Some(AgentBinding {

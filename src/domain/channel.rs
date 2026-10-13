@@ -29,7 +29,30 @@ pub enum ChannelBinding {
         group_id: String,
         #[serde(default)]
         allow_members: bool,
+        /// The Signal account that serves this group. Without one, the
+        /// daemon's default account does.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
     },
+}
+
+/// The account bound to the route that serves a Signal group, when that
+/// binding names one.
+pub fn signal_group_account<'a>(routes: &'a [super::Route], group_id: &str) -> Option<&'a str> {
+    routes
+        .iter()
+        .flat_map(|route| &route.channels)
+        .find_map(|binding| match binding {
+            ChannelBinding::Signal {
+                group_id: bound,
+                account,
+                ..
+            } if bound.trim_end_matches('=') == group_id.trim_end_matches('=') => {
+                Some(account.as_deref())
+            }
+            _ => None,
+        })
+        .flatten()
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

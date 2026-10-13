@@ -619,6 +619,10 @@ impl SignalSubscriber {
         })
     }
 
+    pub fn account(&self) -> &str {
+        &self.account
+    }
+
     pub async fn next(&mut self) -> Result<InboundMessage, ChannelDeliveryError> {
         loop {
             let line = match timeout(self.deadline, read_bounded_line(&mut self.reader)).await {

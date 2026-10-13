@@ -1,6 +1,12 @@
 use std::time::Duration;
 
 use panetone::channels::{InboundMessage, SignalSubscriber, TelegramPoller};
+use panetone::service::SignalReceiver;
+
+const DEFAULT_SIGNAL: SignalReceiver<'static> = SignalReceiver {
+    account: "+15550000",
+    default: true,
+};
 use panetone::domain::{ChannelBinding, ChannelKind, Route, RouteId};
 use panetone::service::InboundIngestor;
 use panetone::store::StoreHandle;
@@ -503,6 +509,7 @@ async fn signal_notifications_are_normalized_and_deduplicated_durably() {
                 channels: vec![ChannelBinding::Signal {
                     group_id: "group-one".into(),
                     allow_members: false,
+                    account: None,
                 }],
                 agent: None,
             },
@@ -541,6 +548,7 @@ async fn configured_signal_group_accepts_members_and_adds_first_name_only() {
                 channels: vec![ChannelBinding::Signal {
                     group_id: "inquisition-group==".into(),
                     allow_members: true,
+                    account: None,
                 }],
                 agent: None,
             },
@@ -556,6 +564,7 @@ async fn configured_signal_group_accepts_members_and_adds_first_name_only() {
                 channels: vec![ChannelBinding::Signal {
                     group_id: "private-group".into(),
                     allow_members: false,
+                    account: None,
                 }],
                 agent: None,
             },
@@ -586,8 +595,9 @@ async fn configured_signal_group_accepts_members_and_adds_first_name_only() {
                     "Melissa Young",
                 ),
                 "owner",
+                DEFAULT_SIGNAL,
                 10,
-            )
+        )
             .await
             .unwrap()
     );
@@ -596,8 +606,9 @@ async fn configured_signal_group_accepts_members_and_adds_first_name_only() {
             .persist_signal(
                 message("friend-private", "private-group", "friend", "Andrew RM"),
                 "owner",
+                DEFAULT_SIGNAL,
                 11,
-            )
+        )
             .await
             .unwrap()
     );
@@ -606,8 +617,9 @@ async fn configured_signal_group_accepts_members_and_adds_first_name_only() {
             .persist_signal(
                 message("owner-private", "private-group", "owner", "Mihai Cosma"),
                 "owner",
+                DEFAULT_SIGNAL,
                 12,
-            )
+        )
             .await
             .unwrap()
     );
@@ -616,8 +628,9 @@ async fn configured_signal_group_accepts_members_and_adds_first_name_only() {
             .persist_signal(
                 message("friend-unknown", "unknown-group", "friend", "Andrew RM"),
                 "owner",
+                DEFAULT_SIGNAL,
                 13,
-            )
+        )
             .await
             .unwrap()
     );
@@ -738,6 +751,7 @@ async fn archived_routes_record_each_inbound_signal_message_once() {
                 channels: vec![ChannelBinding::Signal {
                     group_id: "GRTI+oGi/1wgJAbKEUMGNR3o1tP8o8igPibVb/xAo8k".into(),
                     allow_members: true,
+                    account: None,
                 }],
                 agent: None,
             },
@@ -761,12 +775,12 @@ async fn archived_routes_record_each_inbound_signal_message_once() {
     };
     assert!(
         ingestor
-            .persist_signal(message.clone(), "owner", 10)
+            .persist_signal(message.clone(), "owner", DEFAULT_SIGNAL, 10)
             .await
             .unwrap()
     );
     // The same Signal message delivered again is neither stored nor archived twice.
-    assert!(!ingestor.persist_signal(message, "owner", 11).await.unwrap());
+    assert!(!ingestor.persist_signal(message, "owner", DEFAULT_SIGNAL, 11).await.unwrap());
 
     let jsonl = std::fs::read_to_string(stem.with_extension("jsonl")).unwrap();
     assert_eq!(jsonl.lines().count(), 1);
@@ -854,6 +868,7 @@ async fn replies_tell_the_agent_which_message_they_answer() {
                 channels: vec![ChannelBinding::Signal {
                     group_id: "group-one".into(),
                     allow_members: true,
+                    account: None,
                 }],
                 agent: None,
             },
@@ -882,6 +897,7 @@ async fn replies_tell_the_agent_which_message_they_answer() {
                 None,
             ),
             "owner",
+            DEFAULT_SIGNAL,
             200,
         )
         .await
@@ -902,6 +918,7 @@ async fn replies_tell_the_agent_which_message_they_answer() {
                 Some(quoted),
             ),
             "owner",
+            DEFAULT_SIGNAL,
             201,
         )
         .await
@@ -963,4 +980,71 @@ async fn signal_notifications_panetone_cannot_use_are_skipped() {
     let message = subscriber.next().await.unwrap();
     assert_eq!(message.body, "after the skipped ones");
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_signal_group_is_served_only_by_the_account_its_route_names() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let ingestor = InboundIngestor::new(store.clone());
+    let route = |id: u128, title: &str, group: &str, account: Option<&str>| Route {
+        id: RouteId::new(Uuid::from_u128(id)),
+        title: title.into(),
+        channels: vec![ChannelBinding::Signal {
+            group_id: group.into(),
+            allow_members: false,
+            account: account.map(str::to_owned),
+        }],
+        agent: None,
+    };
+    store
+        .save_route(route(71, "second", "group-second", Some("+15559999")), 1)
+        .await
+        .unwrap();
+    store
+        .save_route(route(72, "first", "group-first", None), 1)
+        .await
+        .unwrap();
+    let message = |external_id: &str, group: &str| InboundMessage {
+        channel: ChannelKind::Signal,
+        external_id: external_id.into(),
+        destination: group.into(),
+        sender_id: Some("owner".into()),
+        sender: Some("Owner".into()),
+        reply_to_external_id: None,
+        body: "hello".into(),
+        quoted: None,
+    };
+    let second = SignalReceiver {
+        account: "+15559999",
+        default: false,
+    };
+
+    // Both accounts are in each group, so each message arrives on both.
+    assert!(
+        !ingestor
+            .persist_signal(message("owner:1", "group-second"), "owner", DEFAULT_SIGNAL, 10)
+            .await
+            .unwrap()
+    );
+    assert!(
+        ingestor
+            .persist_signal(message("owner:1", "group-second"), "owner", second, 11)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !ingestor
+            .persist_signal(message("owner:2", "group-first"), "owner", second, 12)
+            .await
+            .unwrap()
+    );
+    assert!(
+        ingestor
+            .persist_signal(message("owner:2", "group-first"), "owner", DEFAULT_SIGNAL, 13)
+            .await
+            .unwrap()
+    );
+    assert_eq!(store.pending_inbox().await.unwrap().len(), 2);
+    store.shutdown().await.unwrap();
 }
