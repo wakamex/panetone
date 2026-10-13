@@ -1,0 +1,605 @@
+[
+ {
+  "name": "plain",
+  "input": "hello world",
+  "input_codepoints": "U+0068 U+0065 U+006C U+006C U+006F U+0020 U+0077 U+006F U+0072 U+006C U+0064",
+  "output": "hello world",
+  "output_codepoints": "U+0068 U+0065 U+006C U+006C U+006F U+0020 U+0077 U+006F U+0072 U+006C U+0064",
+  "removed": 0,
+  "kept_conditional": 0
+ },
+ {
+  "name": "zwsp_ascii",
+  "input": "a​b",
+  "input_codepoints": "U+0061 U+200B U+0062",
+  "output": "ab",
+  "output_codepoints": "U+0061 U+0062",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "zwsp_thai",
+  "input": "ไทย​ไทย",
+  "input_codepoints": "U+0E44 U+0E17 U+0E22 U+200B U+0E44 U+0E17 U+0E22",
+  "output": "ไทย​ไทย",
+  "output_codepoints": "U+0E44 U+0E17 U+0E22 U+200B U+0E44 U+0E17 U+0E22",
+  "removed": 0,
+  "kept_conditional": 1
+ },
+ {
+  "name": "zwsp_khmer_digit",
+  "input": "ខ្មែរ​5",
+  "input_codepoints": "U+1781 U+17D2 U+1798 U+17C2 U+179A U+200B U+0035",
+  "output": "ខ្មែរ​5",
+  "output_codepoints": "U+1781 U+17D2 U+1798 U+17C2 U+179A U+200B U+0035",
+  "removed": 0,
+  "kept_conditional": 1
+ },
+ {
+  "name": "bom_start",
+  "input": "﻿hello",
+  "input_codepoints": "U+FEFF U+0068 U+0065 U+006C U+006C U+006F",
+  "output": "hello",
+  "output_codepoints": "U+0068 U+0065 U+006C U+006C U+006F",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "soft_hyphen",
+  "input": "co­operate",
+  "input_codepoints": "U+0063 U+006F U+00AD U+006F U+0070 U+0065 U+0072 U+0061 U+0074 U+0065",
+  "output": "cooperate",
+  "output_codepoints": "U+0063 U+006F U+006F U+0070 U+0065 U+0072 U+0061 U+0074 U+0065",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "word_joiner",
+  "input": "a⁠b",
+  "input_codepoints": "U+0061 U+2060 U+0062",
+  "output": "ab",
+  "output_codepoints": "U+0061 U+0062",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "family",
+  "input": "👨‍👩‍👧",
+  "input_codepoints": "U+1F468 U+200D U+1F469 U+200D U+1F467",
+  "output": "👨‍👩‍👧",
+  "output_codepoints": "U+1F468 U+200D U+1F469 U+200D U+1F467",
+  "removed": 0,
+  "kept_conditional": 2
+ },
+ {
+  "name": "skin_zwj",
+  "input": "👩🏽‍💻",
+  "input_codepoints": "U+1F469 U+1F3FD U+200D U+1F4BB",
+  "output": "👩🏽‍💻",
+  "output_codepoints": "U+1F469 U+1F3FD U+200D U+1F4BB",
+  "removed": 0,
+  "kept_conditional": 1
+ },
+ {
+  "name": "heart_vs_zwj",
+  "input": "❤️‍🔥",
+  "input_codepoints": "U+2764 U+FE0F U+200D U+1F525",
+  "output": "❤️‍🔥",
+  "output_codepoints": "U+2764 U+FE0F U+200D U+1F525",
+  "removed": 0,
+  "kept_conditional": 2
+ },
+ {
+  "name": "zwj_ascii",
+  "input": "a‍b",
+  "input_codepoints": "U+0061 U+200D U+0062",
+  "output": "ab",
+  "output_codepoints": "U+0061 U+0062",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "zwj_trailing_emoji",
+  "input": "👨‍",
+  "input_codepoints": "U+1F468 U+200D",
+  "output": "👨",
+  "output_codepoints": "U+1F468",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "zwj_double",
+  "input": "👨‍‍👩",
+  "input_codepoints": "U+1F468 U+200D U+200D U+1F469",
+  "output": "👨‍👩",
+  "output_codepoints": "U+1F468 U+200D U+1F469",
+  "removed": 1,
+  "kept_conditional": 1
+ },
+ {
+  "name": "zwj_emoji_then_letter",
+  "input": "👨‍a",
+  "input_codepoints": "U+1F468 U+200D U+0061",
+  "output": "👨a",
+  "output_codepoints": "U+1F468 U+0061",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "vs16_warning",
+  "input": "⚠️ careful",
+  "input_codepoints": "U+26A0 U+FE0F U+0020 U+0063 U+0061 U+0072 U+0065 U+0066 U+0075 U+006C",
+  "output": "⚠️ careful",
+  "output_codepoints": "U+26A0 U+FE0F U+0020 U+0063 U+0061 U+0072 U+0065 U+0066 U+0075 U+006C",
+  "removed": 0,
+  "kept_conditional": 1
+ },
+ {
+  "name": "vs16_ascii",
+  "input": "a️",
+  "input_codepoints": "U+0061 U+FE0F",
+  "output": "a",
+  "output_codepoints": "U+0061",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "vs16_double",
+  "input": "⚠️️",
+  "input_codepoints": "U+26A0 U+FE0F U+FE0F",
+  "output": "⚠️",
+  "output_codepoints": "U+26A0 U+FE0F",
+  "removed": 1,
+  "kept_conditional": 1
+ },
+ {
+  "name": "vs15_heart",
+  "input": "❤︎",
+  "input_codepoints": "U+2764 U+FE0E",
+  "output": "❤︎",
+  "output_codepoints": "U+2764 U+FE0E",
+  "removed": 0,
+  "kept_conditional": 1
+ },
+ {
+  "name": "vs16_digit_no_keycap",
+  "input": "1️",
+  "input_codepoints": "U+0031 U+FE0F",
+  "output": "1",
+  "output_codepoints": "U+0031",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "keycap",
+  "input": "1️⃣",
+  "input_codepoints": "U+0031 U+FE0F U+20E3",
+  "output": "1️⃣",
+  "output_codepoints": "U+0031 U+FE0F U+20E3",
+  "removed": 0,
+  "kept_conditional": 1
+ },
+ {
+  "name": "keycap_hash",
+  "input": "#️⃣",
+  "input_codepoints": "U+0023 U+FE0F U+20E3",
+  "output": "#️⃣",
+  "output_codepoints": "U+0023 U+FE0F U+20E3",
+  "removed": 0,
+  "kept_conditional": 1
+ },
+ {
+  "name": "vs16_copyright",
+  "input": "©️",
+  "input_codepoints": "U+00A9 U+FE0F",
+  "output": "©️",
+  "output_codepoints": "U+00A9 U+FE0F",
+  "removed": 0,
+  "kept_conditional": 1
+ },
+ {
+  "name": "vs16_start",
+  "input": "️x",
+  "input_codepoints": "U+FE0F U+0078",
+  "output": "x",
+  "output_codepoints": "U+0078",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "flag_scotland",
+  "input": "🏴󠁧󠁢󠁳󠁣󠁴󠁿",
+  "input_codepoints": "U+1F3F4 U+E0067 U+E0062 U+E0073 U+E0063 U+E0074 U+E007F",
+  "output": "🏴󠁧󠁢󠁳󠁣󠁴󠁿",
+  "output_codepoints": "U+1F3F4 U+E0067 U+E0062 U+E0073 U+E0063 U+E0074 U+E007F",
+  "removed": 0,
+  "kept_conditional": 6
+ },
+ {
+  "name": "flag_england",
+  "input": "🏴󠁧󠁢󠁥󠁮󠁧󠁿",
+  "input_codepoints": "U+1F3F4 U+E0067 U+E0062 U+E0065 U+E006E U+E0067 U+E007F",
+  "output": "🏴󠁧󠁢󠁥󠁮󠁧󠁿",
+  "output_codepoints": "U+1F3F4 U+E0067 U+E0062 U+E0065 U+E006E U+E0067 U+E007F",
+  "removed": 0,
+  "kept_conditional": 6
+ },
+ {
+  "name": "flag_texas",
+  "input": "🏴󠁵󠁳󠁴󠁸󠁿",
+  "input_codepoints": "U+1F3F4 U+E0075 U+E0073 U+E0074 U+E0078 U+E007F",
+  "output": "🏴",
+  "output_codepoints": "U+1F3F4",
+  "removed": 5,
+  "kept_conditional": 0
+ },
+ {
+  "name": "tags_hidden_text",
+  "input": "hi󠁩󠁧󠁮󠁯󠁲󠁥",
+  "input_codepoints": "U+0068 U+0069 U+E0069 U+E0067 U+E006E U+E006F U+E0072 U+E0065",
+  "output": "hi",
+  "output_codepoints": "U+0068 U+0069",
+  "removed": 6,
+  "kept_conditional": 0
+ },
+ {
+  "name": "tag_cancel_alone",
+  "input": "x󠁿",
+  "input_codepoints": "U+0078 U+E007F",
+  "output": "x",
+  "output_codepoints": "U+0078",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "persian_zwnj",
+  "input": "می‌خواهم",
+  "input_codepoints": "U+0645 U+06CC U+200C U+062E U+0648 U+0627 U+0647 U+0645",
+  "output": "می‌خواهم",
+  "output_codepoints": "U+0645 U+06CC U+200C U+062E U+0648 U+0627 U+0647 U+0645",
+  "removed": 0,
+  "kept_conditional": 1
+ },
+ {
+  "name": "zwnj_ascii",
+  "input": "a‌b",
+  "input_codepoints": "U+0061 U+200C U+0062",
+  "output": "ab",
+  "output_codepoints": "U+0061 U+0062",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "zwnj_space_before_arabic",
+  "input": " ‌م",
+  "input_codepoints": "U+0020 U+200C U+0645",
+  "output": " م",
+  "output_codepoints": "U+0020 U+0645",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "zwnj_myanmar",
+  "input": "မ‌မ",
+  "input_codepoints": "U+1019 U+200C U+1019",
+  "output": "မ‌မ",
+  "output_codepoints": "U+1019 U+200C U+1019",
+  "removed": 0,
+  "kept_conditional": 1
+ },
+ {
+  "name": "zwnj_khmer",
+  "input": "ក‌ក",
+  "input_codepoints": "U+1780 U+200C U+1780",
+  "output": "ក‌ក",
+  "output_codepoints": "U+1780 U+200C U+1780",
+  "removed": 0,
+  "kept_conditional": 1
+ },
+ {
+  "name": "hindi_zwj",
+  "input": "क्‍ष",
+  "input_codepoints": "U+0915 U+094D U+200D U+0937",
+  "output": "क्‍ष",
+  "output_codepoints": "U+0915 U+094D U+200D U+0937",
+  "removed": 0,
+  "kept_conditional": 1
+ },
+ {
+  "name": "hindi_zwnj",
+  "input": "क्‌ष",
+  "input_codepoints": "U+0915 U+094D U+200C U+0937",
+  "output": "क्‌ष",
+  "output_codepoints": "U+0915 U+094D U+200C U+0937",
+  "removed": 0,
+  "kept_conditional": 1
+ },
+ {
+  "name": "zwj_before_arabic_after_space",
+  "input": " ‍ه",
+  "input_codepoints": "U+0020 U+200D U+0647",
+  "output": " ‍ه",
+  "output_codepoints": "U+0020 U+200D U+0647",
+  "removed": 0,
+  "kept_conditional": 1
+ },
+ {
+  "name": "zwj_tifinagh",
+  "input": "ⵜ‍ⵜ",
+  "input_codepoints": "U+2D5C U+200D U+2D5C",
+  "output": "ⵜ‍ⵜ",
+  "output_codepoints": "U+2D5C U+200D U+2D5C",
+  "removed": 0,
+  "kept_conditional": 1
+ },
+ {
+  "name": "rlm_arabic_line",
+  "input": "مرحبا‏!",
+  "input_codepoints": "U+0645 U+0631 U+062D U+0628 U+0627 U+200F U+0021",
+  "output": "مرحبا‏!",
+  "output_codepoints": "U+0645 U+0631 U+062D U+0628 U+0627 U+200F U+0021",
+  "removed": 0,
+  "kept_conditional": 1
+ },
+ {
+  "name": "rlm_ascii_line",
+  "input": "hello‏!",
+  "input_codepoints": "U+0068 U+0065 U+006C U+006C U+006F U+200F U+0021",
+  "output": "hello!",
+  "output_codepoints": "U+0068 U+0065 U+006C U+006C U+006F U+0021",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "lrm_hebrew_line",
+  "input": "שלום‎ abc",
+  "input_codepoints": "U+05E9 U+05DC U+05D5 U+05DD U+200E U+0020 U+0061 U+0062 U+0063",
+  "output": "שלום‎ abc",
+  "output_codepoints": "U+05E9 U+05DC U+05D5 U+05DD U+200E U+0020 U+0061 U+0062 U+0063",
+  "removed": 0,
+  "kept_conditional": 1
+ },
+ {
+  "name": "alm_arabic",
+  "input": "؜مرحبا",
+  "input_codepoints": "U+061C U+0645 U+0631 U+062D U+0628 U+0627",
+  "output": "؜مرحبا",
+  "output_codepoints": "U+061C U+0645 U+0631 U+062D U+0628 U+0627",
+  "removed": 0,
+  "kept_conditional": 1
+ },
+ {
+  "name": "rlo",
+  "input": "abc‮def",
+  "input_codepoints": "U+0061 U+0062 U+0063 U+202E U+0064 U+0065 U+0066",
+  "output": "abcdef",
+  "output_codepoints": "U+0061 U+0062 U+0063 U+0064 U+0065 U+0066",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "isolate",
+  "input": "a⁦b⁩c",
+  "input_codepoints": "U+0061 U+2066 U+0062 U+2069 U+0063",
+  "output": "abc",
+  "output_codepoints": "U+0061 U+0062 U+0063",
+  "removed": 2,
+  "kept_conditional": 0
+ },
+ {
+  "name": "cgj_mark",
+  "input": "á͏́",
+  "input_codepoints": "U+0061 U+0301 U+034F U+0301",
+  "output": "á͏́",
+  "output_codepoints": "U+0061 U+0301 U+034F U+0301",
+  "removed": 0,
+  "kept_conditional": 1
+ },
+ {
+  "name": "cgj_plain",
+  "input": "a͏b",
+  "input_codepoints": "U+0061 U+034F U+0062",
+  "output": "ab",
+  "output_codepoints": "U+0061 U+0062",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "lone_cr",
+  "input": "a\rb",
+  "input_codepoints": "U+0061 U+000D U+0062",
+  "output": "a\nb",
+  "output_codepoints": "U+0061 U+000A U+0062",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "crlf",
+  "input": "a\r\nb",
+  "input_codepoints": "U+0061 U+000D U+000A U+0062",
+  "output": "a\nb",
+  "output_codepoints": "U+0061 U+000A U+0062",
+  "removed": 0,
+  "kept_conditional": 0
+ },
+ {
+  "name": "vt",
+  "input": "a\u000bb",
+  "input_codepoints": "U+0061 U+000B U+0062",
+  "output": "a\nb",
+  "output_codepoints": "U+0061 U+000A U+0062",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "ff",
+  "input": "a\fb",
+  "input_codepoints": "U+0061 U+000C U+0062",
+  "output": "a\nb",
+  "output_codepoints": "U+0061 U+000A U+0062",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "nel",
+  "input": "ab",
+  "input_codepoints": "U+0061 U+0085 U+0062",
+  "output": "a\nb",
+  "output_codepoints": "U+0061 U+000A U+0062",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "ls",
+  "input": "a b",
+  "input_codepoints": "U+0061 U+2028 U+0062",
+  "output": "a\nb",
+  "output_codepoints": "U+0061 U+000A U+0062",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "ps",
+  "input": "a b",
+  "input_codepoints": "U+0061 U+2029 U+0062",
+  "output": "a\nb",
+  "output_codepoints": "U+0061 U+000A U+0062",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "esc",
+  "input": "a\u001b[31mb",
+  "input_codepoints": "U+0061 U+001B U+005B U+0033 U+0031 U+006D U+0062",
+  "output": "a[31mb",
+  "output_codepoints": "U+0061 U+005B U+0033 U+0031 U+006D U+0062",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "nul",
+  "input": "a\u0000b",
+  "input_codepoints": "U+0061 U+0000 U+0062",
+  "output": "ab",
+  "output_codepoints": "U+0061 U+0062",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "del",
+  "input": "ab",
+  "input_codepoints": "U+0061 U+007F U+0062",
+  "output": "ab",
+  "output_codepoints": "U+0061 U+0062",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "c1",
+  "input": "ab",
+  "input_codepoints": "U+0061 U+009B U+0062",
+  "output": "ab",
+  "output_codepoints": "U+0061 U+0062",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "tab_newline",
+  "input": "a\tb\nc",
+  "input_codepoints": "U+0061 U+0009 U+0062 U+000A U+0063",
+  "output": "a\tb\nc",
+  "output_codepoints": "U+0061 U+0009 U+0062 U+000A U+0063",
+  "removed": 0,
+  "kept_conditional": 0
+ },
+ {
+  "name": "nbsp",
+  "input": "a b",
+  "input_codepoints": "U+0061 U+00A0 U+0062",
+  "output": "a b",
+  "output_codepoints": "U+0061 U+00A0 U+0062",
+  "removed": 0,
+  "kept_conditional": 0
+ },
+ {
+  "name": "hangul_filler",
+  "input": "aㅤb",
+  "input_codepoints": "U+0061 U+3164 U+0062",
+  "output": "ab",
+  "output_codepoints": "U+0061 U+0062",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "vs1_math",
+  "input": "≨︀",
+  "input_codepoints": "U+2268 U+FE00",
+  "output": "≨︀",
+  "output_codepoints": "U+2268 U+FE00",
+  "removed": 0,
+  "kept_conditional": 1
+ },
+ {
+  "name": "vs1_ascii",
+  "input": "a︀",
+  "input_codepoints": "U+0061 U+FE00",
+  "output": "a",
+  "output_codepoints": "U+0061",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "vs4",
+  "input": "a︃",
+  "input_codepoints": "U+0061 U+FE03",
+  "output": "a",
+  "output_codepoints": "U+0061",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "vs17",
+  "input": "葛󠄀",
+  "input_codepoints": "U+845B U+E0100",
+  "output": "葛",
+  "output_codepoints": "U+845B",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "music",
+  "input": "a𝅳b",
+  "input_codepoints": "U+0061 U+1D173 U+0062",
+  "output": "ab",
+  "output_codepoints": "U+0061 U+0062",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "mongolian_fvs",
+  "input": "ᠠ᠋ᠠ",
+  "input_codepoints": "U+1820 U+180B U+1820",
+  "output": "ᠠ᠋ᠠ",
+  "output_codepoints": "U+1820 U+180B U+1820",
+  "removed": 0,
+  "kept_conditional": 1
+ },
+ {
+  "name": "mongolian_fvs_ascii",
+  "input": "a᠋b",
+  "input_codepoints": "U+0061 U+180B U+0062",
+  "output": "ab",
+  "output_codepoints": "U+0061 U+0062",
+  "removed": 1,
+  "kept_conditional": 0
+ },
+ {
+  "name": "mixed_two",
+  "input": "x​y﻿z",
+  "input_codepoints": "U+0078 U+200B U+0079 U+FEFF U+007A",
+  "output": "xyz",
+  "output_codepoints": "U+0078 U+0079 U+007A",
+  "removed": 2,
+  "kept_conditional": 0
+ }
+]

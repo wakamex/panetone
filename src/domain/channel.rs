@@ -115,7 +115,7 @@ static JOINER_BEFORE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::n
 });
 static NON_JOINER_LETTER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     class(&format!(
-        r"[{INDIC}\p{{Arabic}}\p{{Syriac}}\p{{Nko}}\p{{Mongolian}}\p{{Tibetan}}]&&\p{{L}}"
+        r"[{INDIC}\p{{Myanmar}}\p{{Khmer}}\p{{Arabic}}\p{{Syriac}}\p{{Nko}}\p{{Mongolian}}\p{{Tibetan}}]&&\p{{L}}"
     ))
 });
 static SELECTOR_ONE_BASE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
@@ -147,9 +147,14 @@ fn keeps_joiner(chars: &[char], index: usize) -> bool {
             skipped >= 2 || !matches!(character, '\u{fe0f}' | '\u{1f3fb}'..='\u{1f3ff}')
         })
         .is_some_and(|(_, character)| in_class(&PICTOGRAPH, character));
+    // A run of joiners keeps its first one.
+    let after_joiners = chars[index + 1..]
+        .iter()
+        .copied()
+        .find(|&character| character != '\u{200d}');
     if previous != Some('\u{200d}')
         && pictograph_before
-        && next.is_some_and(|character| in_class(&PICTOGRAPH, character))
+        && after_joiners.is_some_and(|character| in_class(&PICTOGRAPH, character))
     {
         return true;
     }
@@ -507,10 +512,50 @@ mod invisible_tests {
         assert_eq!(strip_invisible("a\u{fe0f}"), "a");
         assert_eq!(strip_invisible("1\u{fe0f}"), "1");
         assert_eq!(strip_invisible("\u{26a0}\u{fe0f}\u{fe0f}"), "\u{26a0}\u{fe0f}");
-        assert_eq!(strip_invisible("\u{1f468}\u{200d}\u{200d}\u{1f469}"), "\u{1f468}\u{1f469}");
+        assert_eq!(
+            strip_invisible("\u{1f468}\u{200d}\u{200d}\u{1f469}"),
+            "\u{1f468}\u{200d}\u{1f469}"
+        );
         assert_eq!(
             strip_invisible("\u{1f3f4}\u{e0075}\u{e0073}\u{e007f}"),
             "\u{1f3f4}"
         );
+    }
+}
+
+#[cfg(test)]
+mod claude_code_parity_tests {
+    use super::strip_invisible;
+
+    /// Cases where Claude Code keeps a character that this strip removes
+    /// everywhere, with the character. Removing more never pauses a submit.
+    const STRIPPED_FURTHER: [(&str, char); 7] = [
+        ("zwsp_thai", '\u{200b}'),
+        ("zwsp_khmer_digit", '\u{200b}'),
+        ("rlm_arabic_line", '\u{200f}'),
+        ("lrm_hebrew_line", '\u{200e}'),
+        ("alm_arabic", '\u{61c}'),
+        ("cgj_mark", '\u{34f}'),
+        ("mongolian_fvs", '\u{180b}'),
+    ];
+
+    /// Inputs and outputs of `$sanitizeInvisibleCharacters` from Claude Code
+    /// 2.1.296, run unmodified under Node.
+    #[test]
+    fn the_strip_matches_claude_code_2_1_296() {
+        let cases: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/claude-code-2.1.296-invisible-cases.json"
+        ))
+        .unwrap();
+        assert_eq!(cases.len(), 67);
+        for case in &cases {
+            let name = case["name"].as_str().unwrap();
+            let input = case["input"].as_str().unwrap();
+            let mut expected = case["output"].as_str().unwrap().to_owned();
+            if let Some((_, further)) = STRIPPED_FURTHER.iter().find(|(case, _)| *case == name) {
+                expected = expected.replace(*further, "");
+            }
+            assert_eq!(strip_invisible(input), expected, "{name}");
+        }
     }
 }
