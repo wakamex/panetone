@@ -36,6 +36,8 @@ const MAX_UNCERTAIN_ATTEMPTS: u32 = 3;
 /// before its sender is told it may not have arrived. Codex records steering
 /// only when the running turn takes it, which can be after a long tool call.
 const INBOX_PROOF_WINDOW_MS: i64 = 120_000;
+/// How long a channel message waits on a blocked pane before its sender is told why.
+const INBOX_WAITING_NOTICE_MS: i64 = 60_000;
 
 pub struct ProductionService {
     store: StoreHandle,
@@ -811,7 +813,10 @@ impl ProductionService {
                     let steering = match self.wakterm.steer(&binding, &item.body).await {
                         Ok(steering) => steering,
                         // Nothing was written; a later pass retries.
-                        Err(WaktermCliError::TargetBlocked(_)) => {
+                        Err(WaktermCliError::TargetBlocked(detail)) => {
+                            if now_ms() - item.created_at_ms >= INBOX_WAITING_NOTICE_MS {
+                                self.notify_waiting(&item, route, &detail).await?;
+                            }
                             item.state = "pending".into();
                             item.receipt = None;
                             self.store
@@ -965,9 +970,41 @@ impl ProductionService {
         route: &Route,
         detail: &str,
     ) -> Result<(), String> {
+        let body = format!(
+            "[unconfirmed] {} may not have received your message: {detail}. \
+             Check the pane before resending; the text may still be there.",
+            route.title
+        );
+        self.notify_sender(item, route, "unconfirmed", body).await
+    }
+
+    /// Tells the sender's chat, once, why an inbound message is still waiting
+    /// for an agent whose pane cannot take input.
+    async fn notify_waiting(
+        &self,
+        item: &InboxItem,
+        route: &Route,
+        detail: &str,
+    ) -> Result<(), String> {
+        let body = format!(
+            "[waiting] {} cannot take your message yet: {detail}. \
+             Panetone delivers it when the pane can take input; do not resend.",
+            route.title
+        );
+        self.notify_sender(item, route, "waiting", body).await
+    }
+
+    /// Posts one notice of a kind about an inbound message to its own chat.
+    async fn notify_sender(
+        &self,
+        item: &InboxItem,
+        route: &Route,
+        kind: &str,
+        body: String,
+    ) -> Result<(), String> {
         let namespace = Uuid::new_v5(
             &Uuid::NAMESPACE_URL,
-            b"https://panetone.dev/inbox/unconfirmed/v1",
+            format!("https://panetone.dev/inbox/{kind}/v1").as_bytes(),
         );
         let notice = OutboxItem {
             id: EffectId::new(Uuid::new_v5(&namespace, item.id.to_string().as_bytes())),
@@ -976,11 +1013,7 @@ impl ProductionService {
             source_agent: None,
             kind: item.channel,
             destination: item.destination.clone(),
-            body: format!(
-                "[unconfirmed] {} may not have received your message: {detail}. \
-                 Check the pane before resending; the text may still be there.",
-                route.title
-            ),
+            body,
             attachments: Vec::new(),
             actions: Vec::new(),
             state: OutboxState::Pending,
@@ -3343,7 +3376,12 @@ elif [[ "$operation" == *"list --format json"* ]]; then
   echo '[{"pane_id":1,"tab_id":2,"window_id":3,"effective_title":"route"}]'
 elif [[ "$operation" == *"agent admit"* ]]; then
   cat >/dev/null
-  echo '{"schema":"wakterm.agent-api.v1","request_id":"00000000-0000-0000-0000-00000000007e","status":"busy","definitive":true,"prompt_written":false,"agent_id":"agent-route","incarnation_id":"inc-route","detail":"the target is waiting for dialog open"}'
+  request_id=""
+  while (($#)); do
+    if [[ "$1" == "--request-id" ]]; then request_id=$2; break; fi
+    shift
+  done
+  printf '{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"busy","definitive":true,"prompt_written":false,"agent_id":"agent-route","incarnation_id":"inc-route","detail":"the target is waiting for dialog open"}\n' "$request_id"
 elif [[ "$operation" == *"agent send agent-route"* ]]; then
   cat >/dev/null
   echo '{"agent_id":"agent-route","agent_name":"route","pane_id":1,"transport":"ObservedPty","submitted":false,"acknowledgement":{"kind":"not_requested","acknowledged":false,"latency_ms":null,"session_path":null,"detail":null},"refusal":{"reason":"input_blocked","detail":"the target is waiting for dialog open"}}'
@@ -3380,7 +3418,7 @@ fi
                 reply_to_external_id: None,
                 body: "I just woke up. summarize.".into(),
                 state: "pending".into(),
-                created_at_ms: 1,
+                created_at_ms: now_ms(),
                 receipt: None,
                 steering_acknowledged: None,
                 proof: None,
@@ -3407,6 +3445,35 @@ fi
         assert_eq!(service.inbox_once().await.unwrap(), 1);
         assert!(store.pending_outbox().await.unwrap().is_empty());
         assert_eq!(store.status().await.unwrap().pending_inbox, 1);
+        // A message that has waited a minute tells its sender why, once.
+        store
+            .accept_inbox(InboxItem {
+                id: EffectId::new(Uuid::from_u128(127)),
+                channel: ChannelKind::Telegram,
+                external_id: "update-4".into(),
+                destination: "10".into(),
+                sender_id: Some("42".into()),
+                sender: Some("Mihai".into()),
+                reply_to_external_id: None,
+                body: "still there?".into(),
+                state: "pending".into(),
+                created_at_ms: now_ms() - INBOX_WAITING_NOTICE_MS,
+                receipt: None,
+                steering_acknowledged: None,
+                proof: None,
+            })
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(service.inbox_once().await.unwrap(), 2);
+            let notices = store.pending_outbox().await.unwrap();
+            assert_eq!(notices.len(), 1);
+            assert_eq!(
+                notices[0].body,
+                "[waiting] route cannot take your message yet: input_blocked: the target is waiting for dialog open. Panetone delivers it when the pane can take input; do not resend."
+            );
+            assert_eq!(store.status().await.unwrap().pending_inbox, 2);
+        }
         drop(service);
         store.shutdown().await.unwrap();
     }
