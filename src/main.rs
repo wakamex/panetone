@@ -119,7 +119,10 @@ struct SendArgs {
         help = "Target route title, or an agent's Wakterm name when the route has several agents"
     )]
     target: String,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Request UUID, which makes a retry safe: resending the same message with the same ID returns the first acknowledgement and delivers nothing again, and a different message with that ID is rejected (default: a new random ID). A notifier can derive it from its own event ID, for example a version 5 UUID of a run ID"
+    )]
     id: Option<Uuid>,
     #[arg(
         long,

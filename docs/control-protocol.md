@@ -252,6 +252,8 @@ acknowledgement without repeating effects. Reusing it with different content
 returns `idempotency_conflict`. Request UUIDs are reserved in durable
 tombstones from the initial claim.
 
+A successful response (`ok: true`, which the CLI reports with exit status 0) always carries `accepted: true` and means Panetone holds the message durably and will deliver it or report its failure in the target's channel; a caller stops retrying on it, whatever `delivery_state` and `submitted` say. Any other response means the message may not be held. A caller that retries with the same request UUID, such as `panetone send --id`, can never cause a second delivery, so a notifier can retry until it succeeds without keeping its own record of what it sent; a version 5 UUID of its own event ID makes a suitable request ID. A send to a title with no route, or to a route with no live agent, is rejected and is not held for a session that starts later.
+
 ## Asynchronous final return
 
 `return_final: true` asks for the target's reply. How the reply travels depends on the target's state at delivery.
