@@ -600,7 +600,7 @@ async fn configured_signal_group_accepts_members_and_adds_first_name_only() {
                 "owner",
                 DEFAULT_SIGNAL,
                 10,
-        )
+            )
             .await
             .unwrap()
     );
@@ -611,7 +611,7 @@ async fn configured_signal_group_accepts_members_and_adds_first_name_only() {
                 "owner",
                 DEFAULT_SIGNAL,
                 11,
-        )
+            )
             .await
             .unwrap()
     );
@@ -622,7 +622,7 @@ async fn configured_signal_group_accepts_members_and_adds_first_name_only() {
                 "owner",
                 DEFAULT_SIGNAL,
                 12,
-        )
+            )
             .await
             .unwrap()
     );
@@ -633,7 +633,7 @@ async fn configured_signal_group_accepts_members_and_adds_first_name_only() {
                 "owner",
                 DEFAULT_SIGNAL,
                 13,
-        )
+            )
             .await
             .unwrap()
     );
@@ -784,7 +784,12 @@ async fn archived_routes_record_each_inbound_signal_message_once() {
             .unwrap()
     );
     // The same Signal message delivered again is neither stored nor archived twice.
-    assert!(!ingestor.persist_signal(message, "owner", DEFAULT_SIGNAL, 11).await.unwrap());
+    assert!(
+        !ingestor
+            .persist_signal(message, "owner", DEFAULT_SIGNAL, 11)
+            .await
+            .unwrap()
+    );
 
     let jsonl = std::fs::read_to_string(stem.with_extension("jsonl")).unwrap();
     assert_eq!(jsonl.lines().count(), 1);
@@ -1035,7 +1040,12 @@ async fn a_signal_group_is_served_only_by_the_account_its_route_names() {
     // Both accounts are in each group, so each message arrives on both.
     assert!(
         !ingestor
-            .persist_signal(message("owner:1", "group-second"), "owner", DEFAULT_SIGNAL, 10)
+            .persist_signal(
+                message("owner:1", "group-second"),
+                "owner",
+                DEFAULT_SIGNAL,
+                10
+            )
             .await
             .unwrap()
     );
@@ -1053,7 +1063,12 @@ async fn a_signal_group_is_served_only_by_the_account_its_route_names() {
     );
     assert!(
         ingestor
-            .persist_signal(message("owner:2", "group-first"), "owner", DEFAULT_SIGNAL, 13)
+            .persist_signal(
+                message("owner:2", "group-first"),
+                "owner",
+                DEFAULT_SIGNAL,
+                13
+            )
             .await
             .unwrap()
     );
@@ -1125,7 +1140,10 @@ async fn the_owners_direct_message_reaches_the_route_that_takes_them() {
         agent: None,
     };
     store
-        .save_route(route(81, "second", "group-second", Some("+15559999"), true), 1)
+        .save_route(
+            route(81, "second", "group-second", Some("+15559999"), true),
+            1,
+        )
         .await
         .unwrap();
     store

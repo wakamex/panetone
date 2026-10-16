@@ -184,7 +184,10 @@ impl TelegramClient {
         } else {
             Err(ChannelDeliveryError::Rejected {
                 kind,
-                detail: format!("sendChatAction returned HTTP {}", response.status().as_u16()),
+                detail: format!(
+                    "sendChatAction returned HTTP {}",
+                    response.status().as_u16()
+                ),
             })
         }
     }

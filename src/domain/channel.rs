@@ -118,9 +118,8 @@ static JOINER_AFTER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::ne
         r"[{INDIC}\p{{Myanmar}}\p{{Khmer}}\p{{Tibetan}}\p{{Arabic}}\p{{Syriac}}\p{{Tifinagh}}]&&\p{{L}}"
     ))
 });
-static JOINER_BEFORE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    class(r"[\p{Arabic}\p{Syriac}\p{Mongolian}\p{Nko}]&&\p{L}")
-});
+static JOINER_BEFORE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| class(r"[\p{Arabic}\p{Syriac}\p{Mongolian}\p{Nko}]&&\p{L}"));
 static NON_JOINER_LETTER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     class(&format!(
         r"[{INDIC}\p{{Myanmar}}\p{{Khmer}}\p{{Arabic}}\p{{Syriac}}\p{{Nko}}\p{{Mongolian}}\p{{Tibetan}}]&&\p{{L}}"
@@ -532,7 +531,10 @@ mod invisible_tests {
         assert_eq!(strip_invisible("a\u{200d}b\u{200c}c"), "abc");
         assert_eq!(strip_invisible("a\u{fe0f}"), "a");
         assert_eq!(strip_invisible("1\u{fe0f}"), "1");
-        assert_eq!(strip_invisible("\u{26a0}\u{fe0f}\u{fe0f}"), "\u{26a0}\u{fe0f}");
+        assert_eq!(
+            strip_invisible("\u{26a0}\u{fe0f}\u{fe0f}"),
+            "\u{26a0}\u{fe0f}"
+        );
         assert_eq!(
             strip_invisible("\u{1f468}\u{200d}\u{200d}\u{1f469}"),
             "\u{1f468}\u{200d}\u{1f469}"

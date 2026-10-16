@@ -4,10 +4,9 @@ mod route;
 mod workflow;
 
 pub use channel::{
-    SIGNAL_DIRECT_PREFIX, signal_group_account, strip_invisible,
     ChannelAttachment, ChannelBinding, ChannelKind, MAX_CHANNEL_ATTACHMENT_BYTES,
     MAX_CHANNEL_ATTACHMENT_TOTAL_BYTES, MAX_CHANNEL_ATTACHMENTS, OutboxAction, OutboxItem,
-    OutboxState, chunk_outbox,
+    OutboxState, SIGNAL_DIRECT_PREFIX, chunk_outbox, signal_group_account, strip_invisible,
 };
 pub use ids::{EffectId, RouteId, WorkflowId};
 pub use route::{AgentBinding, Route};

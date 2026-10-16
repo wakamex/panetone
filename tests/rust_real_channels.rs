@@ -634,7 +634,10 @@ async fn a_signal_item_is_sent_through_the_account_named_for_its_group() {
         ChannelDeliveryError::Unreachable(ChannelKind::Signal)
     );
     assert_eq!(
-        channels.send_as(&item, Some("+15558888")).await.unwrap_err(),
+        channels
+            .send_as(&item, Some("+15558888"))
+            .await
+            .unwrap_err(),
         ChannelDeliveryError::NotConfigured(ChannelKind::Signal)
     );
 }
@@ -650,7 +653,10 @@ async fn a_signal_direct_destination_is_sent_to_a_recipient() {
         let mut request = String::new();
         reader.read_line(&mut request).await.unwrap();
         let request: Value = serde_json::from_str(&request).unwrap();
-        assert_eq!(request["params"]["recipient"], serde_json::json!(["+15551111"]));
+        assert_eq!(
+            request["params"]["recipient"],
+            serde_json::json!(["+15551111"])
+        );
         assert!(request["params"].get("groupId").is_none());
         reader
             .get_mut()
