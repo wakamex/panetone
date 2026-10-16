@@ -30,6 +30,8 @@ pub use replies::{ReplyDebt, ReplyMessage, TurnEnd};
 
 pub const SCHEMA_VERSION: i64 = 8;
 const COMMAND_CAPACITY: usize = 128;
+/// Output observed this long before it is ingested is not posted.
+const STALE_OUTPUT_MS: i64 = 15 * 60 * 1000;
 /// An agent replies with only this token to stay silent in a group chat.
 const NO_REPLY: &str = "<panetone:no-reply>";
 
@@ -1522,6 +1524,19 @@ fn ingest_agent_events(
             .map_err(|detail| StoreError::Conflict(detail.into()))?
             .map(|body| strip_memory_citations(&body))
             .filter(|body| !body.trim().is_empty());
+        // Output an agent produced long before Panetone saw it is a replay of
+        // its history, such as a new incarnation reporting its transcript
+        // again; it was shown when it was new.
+        if visible_body.is_some()
+            && approval.is_none()
+            && event
+                .observed_at_ms()
+                .is_some_and(|observed| now_ms - observed > STALE_OUTPUT_MS)
+        {
+            insert_agent_event(&transaction, event, route_id, "stale", &record_json, now_ms)?;
+            outcome.recorded += 1;
+            continue;
+        }
         if approval.is_some() || visible_body.is_some() {
             let Some(route) = route else {
                 state = "unrouted";

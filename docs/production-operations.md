@@ -168,6 +168,8 @@ or Signal's text limit. Every chunk has a deterministic effect ID and is
 committed with the source event cursor, so restart resumes at the first unsent
 chunk.
 
+Agent output that Wakterm reports more than 15 minutes after the agent produced it is recorded as `stale` and not posted. Such output is a replay of history, for example a new agent incarnation reporting its whole transcript again, and was posted when it was new.
+
 Panetone removes characters that draw nothing from an inbound message and from a cross-agent message before delivery: zero-width spaces, a byte order mark, direction controls, soft hyphens and control codes other than tab and newline. Lone carriage returns and other line terminators become newlines. Claude Code strips such characters from a submitted prompt and then waits for a second Enter, which would leave the message unsent in the input box. Joiners, variation selectors and tag characters stay only where Claude Code keeps them: in emoji, keycap and flag sequences and beside letters of scripts that need them.
 
 When Wakterm refuses to write an inbound Telegram or Signal message because a dialog, shell mode, startup prompt or a draft the user is typing holds the agent's keyboard, nothing is written and Panetone retries until the pane can take input. Once the message has waited a minute, Panetone posts one `[waiting]` notice in the sender's chat giving the reason.

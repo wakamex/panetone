@@ -1438,3 +1438,46 @@ async fn a_turn_a_reminder_started_is_not_followed_by_another_reminder() {
     assert!(ended.started_by_reminder);
     store.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn output_observed_long_before_ingest_is_a_replay_and_is_not_posted() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let route = route();
+    store.save_route(route.clone(), 1).await.unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+    let message = |sequence: u64, observed_at: &str, text: &str| -> EventRecord {
+        serde_json::from_value(serde_json::json!({
+            "sequence": sequence,
+            "event_id": format!("event-{sequence}"),
+            "kind": "assistant_message",
+            "agent_id": "agent-zola",
+            "incarnation_id": "incarnation-zola-7",
+            "turn_id": "turn-1",
+            "observed_at": observed_at,
+            "text": text,
+        }))
+        .unwrap()
+    };
+    // 2026-10-16T22:19:30Z
+    let now_ms = 1_792_189_170_000;
+
+    let outcome = store
+        .ingest_agent_events(
+            100,
+            102,
+            vec![
+                message(101, "2026-10-13T20:51:57.889Z", "an answer from three days ago"),
+                message(102, "2026-10-16T22:19:20.000Z", "a new answer"),
+            ],
+            live_agents(&route),
+            now_ms,
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.recorded, 2);
+    let posts = store.pending_outbox().await.unwrap();
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].body, "a new answer");
+    store.shutdown().await.unwrap();
+}

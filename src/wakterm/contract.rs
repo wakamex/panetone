@@ -412,6 +412,17 @@ fn unanswered(question: &EventRecord, later: &[EventRecord]) -> bool {
     })
 }
 
+impl EventRecord {
+    /// When the agent produced this event, in milliseconds since the Unix
+    /// epoch, if the event says.
+    pub fn observed_at_ms(&self) -> Option<i64> {
+        self.fields
+            .get("observed_at")
+            .and_then(Value::as_str)
+            .and_then(utc_millis)
+    }
+}
+
 /// Milliseconds since the Unix epoch for an RFC 3339 timestamp such as
 /// `2026-10-05T03:48:29.668Z`.
 fn utc_millis(timestamp: &str) -> Option<i64> {
