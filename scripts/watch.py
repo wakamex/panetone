@@ -30,6 +30,8 @@ def store_problems(connection, now_ms):
     for effect_id, channel, state, error, body in connection.execute(
         "SELECT effect_id, channel, state, json_extract(record_json, '$.last_error'),"
         " json_extract(record_json, '$.body') FROM outbox WHERE state IN ('failed', 'indeterminate')"
+        # A post an operator cancelled on purpose is not a problem.
+        " AND coalesce(json_extract(record_json, '$.last_error'), '') NOT LIKE 'cancelled:%'"
     ):
         what = "failed" if state == "failed" else "gave up after attempts that may have posted"
         problems[f"outbox:{effect_id}"] = f"{channel} post {what} ({error}): {snippet(body)}"

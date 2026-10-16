@@ -27,6 +27,7 @@ class StoreProblems(unittest.TestCase):
             ("outbox", "o1", "telegram", "failed", '{"last_error": "Bad Gateway", "body": "reply"}', 0),
             ("outbox", "o2", "telegram", "delivered", '{"body": "fine"}', 0),
             ("outbox", "o3", "signal", "indeterminate", '{"last_error": "closed", "body": "maybe"}', 0),
+            ("outbox", "o4", "telegram", "failed", '{"last_error": "cancelled: a replayed repeat", "body": "old"}', 0),
             ("inbox", "i1", "telegram", "indeterminate", '{"body": "hello"}', 0),
             ("inbox", "i2", "signal", "pending", '{"body": "old"}', 0),
             ("inbox", "i3", "signal", "pending", '{"body": "fresh"}', 999_900_000),
