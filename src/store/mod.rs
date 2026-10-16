@@ -24,7 +24,11 @@ use crate::domain::{
 };
 use crate::wakterm::{AgentCatalog, ApprovalRequest, EventRecord};
 
-pub const SCHEMA_VERSION: i64 = 7;
+mod replies;
+
+pub use replies::{ReplyDebt, ReplyMessage, TurnEnd};
+
+pub const SCHEMA_VERSION: i64 = 8;
 const COMMAND_CAPACITY: usize = 128;
 /// An agent replies with only this token to stay silent in a group chat.
 const NO_REPLY: &str = "<panetone:no-reply>";
@@ -232,6 +236,10 @@ pub struct StoreHandle {
 }
 
 enum Command {
+    /// Runs one store operation that has no dedicated command.
+    Run {
+        job: Box<dyn FnOnce(&mut Connection) + Send>,
+    },
     Claim {
         command: SendCommand,
         source_route_id: RouteId,
@@ -406,6 +414,89 @@ impl StoreHandle {
             sender,
             owner: Arc::new(Mutex::new(Some(owner))),
         })
+    }
+
+    async fn run<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&mut Connection) -> StoreResult<T> + Send + 'static,
+    ) -> StoreResult<T> {
+        self.request(|reply| Command::Run {
+            job: Box::new(move |connection| send_reply(reply, work(connection))),
+        })
+        .await
+    }
+
+    /// Records that the target of a request owes its sender a reply.
+    pub async fn open_reply_debt(&self, debt: ReplyDebt) -> StoreResult<()> {
+        self.run(move |connection| replies::open_debt(connection, debt))
+            .await
+    }
+
+    pub async fn reply_debt(&self, request_id: WorkflowId) -> StoreResult<Option<ReplyDebt>> {
+        self.run(move |connection| replies::debt(connection, request_id))
+            .await
+    }
+
+    pub async fn open_reply_debts(&self) -> StoreResult<Vec<ReplyDebt>> {
+        self.run(|connection| replies::open_debts(connection)).await
+    }
+
+    /// Withdraws a reply debt; returns its earlier state, or `None` when the
+    /// request did not ask for a reply.
+    pub async fn cancel_reply_debt(
+        &self,
+        request_id: WorkflowId,
+        now_ms: i64,
+    ) -> StoreResult<Option<String>> {
+        self.run(move |connection| replies::cancel_debt(connection, request_id, now_ms))
+            .await
+    }
+
+    pub async fn pending_reply_messages(&self) -> StoreResult<Vec<ReplyMessage>> {
+        self.run(|connection| replies::pending_messages(connection))
+            .await
+    }
+
+    pub async fn unreported_reply_tags(&self, agent_id: String) -> StoreResult<Vec<ReplyMessage>> {
+        self.run(move |connection| replies::unreported_tags(connection, &agent_id))
+            .await
+    }
+
+    pub async fn set_reply_message_state(&self, id: EffectId, state: String) -> StoreResult<()> {
+        self.run(move |connection| replies::set_message_state(connection, id, &state))
+            .await
+    }
+
+    pub async fn last_turn_end(
+        &self,
+        agent_id: String,
+        after_sequence: u64,
+    ) -> StoreResult<Option<TurnEnd>> {
+        self.run(move |connection| replies::last_turn_end(connection, &agent_id, after_sequence))
+            .await
+    }
+
+    pub async fn record_reply_reminder(
+        &self,
+        id: EffectId,
+        agent_id: String,
+        turn_id: String,
+        input_sha256: String,
+        reported: Vec<EffectId>,
+        now_ms: i64,
+    ) -> StoreResult<()> {
+        self.run(move |connection| {
+            replies::record_reminder(
+                connection,
+                id,
+                &agent_id,
+                &turn_id,
+                &input_sha256,
+                &reported,
+                now_ms,
+            )
+        })
+        .await
     }
 
     async fn request<T>(
@@ -722,6 +813,7 @@ fn owner_loop(mut connection: Connection, mut receiver: mpsc::Receiver<Command>)
 
 fn handle_command(connection: &mut Connection, command: Command) {
     match command {
+        Command::Run { job } => job(connection),
         Command::Claim {
             command,
             source_route_id,
@@ -981,6 +1073,11 @@ pub(crate) fn migrate_schema(connection: &mut Connection) -> StoreResult<()> {
              PRAGMA user_version = 7;",
         )?;
         transaction.commit()?;
+    } else if version < 6 {
+        return Err(StoreError::OlderSchema {
+            found: version,
+            supported: SCHEMA_VERSION,
+        });
     }
     if version == 6 {
         let transaction = connection.transaction()?;
@@ -989,17 +1086,14 @@ pub(crate) fn migrate_schema(connection: &mut Connection) -> StoreResult<()> {
              SET route_json = json_remove(route_json, '$.agent', '$.status')",
             [],
         )?;
-        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        transaction.pragma_update(None, "user_version", 7)?;
         transaction.commit()?;
     }
-    if version != 0 && version < SCHEMA_VERSION {
-        if version == 6 {
-            return Ok(());
-        }
-        return Err(StoreError::OlderSchema {
-            found: version,
-            supported: SCHEMA_VERSION,
-        });
+    if version < 8 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(replies::SCHEMA)?;
+        transaction.pragma_update(None, "user_version", 8)?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -1456,6 +1550,31 @@ fn ingest_agent_events(
                 outcome.recorded += 1;
                 continue;
             }
+            // A message tagged as a reply settles or reports the debt it
+            // names, and is shown without its tag.
+            let tagged = match (&approval, visible_body.as_deref()) {
+                (None, Some(body)) if event.kind == "assistant_message" => replies::find_tag(body),
+                _ => None,
+            };
+            if let Some((kind, named, rest)) = &tagged {
+                let namespace = Uuid::new_v5(
+                    &Uuid::NAMESPACE_URL,
+                    b"https://panetone.dev/replies/tagged/v1",
+                );
+                replies::record_tag(
+                    &transaction,
+                    EffectId::new(Uuid::new_v5(
+                        &namespace,
+                        format!("{}\0{}", event.incarnation_id, event.event_id).as_bytes(),
+                    )),
+                    &event.agent_id,
+                    route.id,
+                    *kind,
+                    named.as_deref(),
+                    rest,
+                    now_ms,
+                )?;
+            }
             let destination = if approval.is_some() {
                 route.channels.iter().find_map(|binding| match binding {
                     crate::domain::ChannelBinding::Telegram { topic_id } => {
@@ -1489,6 +1608,20 @@ fn ingest_agent_events(
                     _ => preference.map(str::to_owned),
                 };
                 output_destination(route, preference.as_deref())
+            };
+            // A reply never appears in a group whose other members are not
+            // its audience; the route's Telegram topic shows it instead.
+            let destination = match (&tagged, destination) {
+                (Some((_, _, rest)), _) if rest.is_empty() => None,
+                (Some(_), Some((ChannelKind::Signal, group))) if shared_group(route, &group) => {
+                    route.channels.iter().find_map(|binding| match binding {
+                        crate::domain::ChannelBinding::Telegram { topic_id } => {
+                            Some((ChannelKind::Telegram, topic_id.to_string()))
+                        }
+                        crate::domain::ChannelBinding::Signal { .. } => None,
+                    })
+                }
+                (_, destination) => destination,
             };
             let Some((kind, destination)) = destination else {
                 state = "unrouted";
@@ -1562,8 +1695,11 @@ fn ingest_agent_events(
                     (body, Vec::new(), actions)
                 }
                 None => {
-                    let (body, attachments) =
-                        visible_attachments(visible_body.expect("visible output was checked"));
+                    let text = match tagged {
+                        Some((_, _, rest)) => rest,
+                        None => visible_body.expect("visible output was checked"),
+                    };
+                    let (body, attachments) = visible_attachments(text);
                     (body, attachments, Vec::new())
                 }
             };
@@ -1734,6 +1870,21 @@ fn turn_origin(
         };
         (kind, destination)
     }))
+}
+
+/// Whether a Signal destination is a group of the route that admits members
+/// other than the owner.
+fn shared_group(route: &Route, group: &str) -> bool {
+    route.channels.iter().any(|binding| {
+        matches!(
+            binding,
+            crate::domain::ChannelBinding::Signal {
+                group_id,
+                allow_members: true,
+                ..
+            } if group_id.trim_end_matches('=') == group.trim_end_matches('=')
+        )
+    })
 }
 
 fn route_preferences(

@@ -134,32 +134,13 @@ impl FakeWakterm {
     }
 
     pub fn envelope(command: &SendCommand, source_harness: &str, target_harness: &str) -> String {
-        Self::envelope_with_reply(command, source_harness, target_harness, false)
-    }
-
-    /// The envelope for a reply request steered into an active turn, whose
-    /// final response Panetone cannot return to the sender.
-    pub fn steered_envelope(
-        command: &SendCommand,
-        source_harness: &str,
-        target_harness: &str,
-    ) -> String {
-        Self::envelope_with_reply(command, source_harness, target_harness, command.return_final)
-    }
-
-    fn envelope_with_reply(
-        command: &SendCommand,
-        source_harness: &str,
-        target_harness: &str,
-        reply_by_message: bool,
-    ) -> String {
-        let by_message;
-        let reply = if reply_by_message {
-            by_message = format!(
-                "reply by message. This arrived during your current turn, so its final response is not returned to the sender. Answer by running `panetone send --to {} \"...\"` and quote the request ID",
-                command.source
+        let requested;
+        let reply = if command.reply {
+            requested = format!(
+                "reply requested. Answer when you have the answer, in this turn or a later one: put [panetone:reply] on its own line, outside code, in the message that holds the answer, or [panetone:reply {}] if you owe several replies. [panetone:progress] sends an update and keeps the request open. A reply that you cannot do it counts as an answer. Your final response does not reach the sender",
+                &command.id.to_string()[..8]
             );
-            by_message.as_str()
+            requested.as_str()
         } else if command.return_final {
             "asynchronous final callback"
         } else if source_harness == "external" {

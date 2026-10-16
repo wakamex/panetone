@@ -1038,7 +1038,9 @@ async fn input_recorded_with_its_tabs_expanded_proves_delivery() {
     assert!(!store.input_recorded(proof(None)).await.unwrap());
     assert!(
         store
-            .input_recorded(proof(panetone::store::DeliveryProof::tab_expanded_sha256(body)))
+            .input_recorded(proof(panetone::store::DeliveryProof::tab_expanded_sha256(
+                body
+            )))
             .await
             .unwrap()
     );
@@ -1163,10 +1165,34 @@ async fn a_turns_output_goes_where_the_message_that_started_it_came_from() {
             100,
             104,
             vec![
-                event(101, "turn_started", "turn-direct", "input_sha256", &hash("[direct message] is this private?")),
-                event(102, "assistant_message", "turn-direct", "text", "Yes, only you see this."),
-                event(103, "turn_started", "turn-group", "input_sha256", &hash("Melissa says: hello")),
-                event(104, "assistant_message", "turn-group", "text", "Hello Melissa."),
+                event(
+                    101,
+                    "turn_started",
+                    "turn-direct",
+                    "input_sha256",
+                    &hash("[direct message] is this private?"),
+                ),
+                event(
+                    102,
+                    "assistant_message",
+                    "turn-direct",
+                    "text",
+                    "Yes, only you see this.",
+                ),
+                event(
+                    103,
+                    "turn_started",
+                    "turn-group",
+                    "input_sha256",
+                    &hash("Melissa says: hello"),
+                ),
+                event(
+                    104,
+                    "assistant_message",
+                    "turn-group",
+                    "text",
+                    "Hello Melissa.",
+                ),
             ],
             live_agents(&route),
             3,
@@ -1182,7 +1208,10 @@ async fn a_turns_output_goes_where_the_message_that_started_it_came_from() {
     assert_eq!(
         destinations(store.pending_outbox().await.unwrap()),
         [
-            ("Yes, only you see this.".to_owned(), "direct:uuid-owner".to_owned()),
+            (
+                "Yes, only you see this.".to_owned(),
+                "direct:uuid-owner".to_owned()
+            ),
             ("Hello Melissa.".to_owned(), "signal-zola".to_owned()),
         ]
     );
@@ -1196,8 +1225,20 @@ async fn a_turns_output_goes_where_the_message_that_started_it_came_from() {
             104,
             106,
             vec![
-                event(105, "turn_started", "turn-group-2", "input_sha256", &hash("Melissa says: again")),
-                event(106, "assistant_message", "turn-group-2", "text", "Again, hello."),
+                event(
+                    105,
+                    "turn_started",
+                    "turn-group-2",
+                    "input_sha256",
+                    &hash("Melissa says: again"),
+                ),
+                event(
+                    106,
+                    "assistant_message",
+                    "turn-group-2",
+                    "text",
+                    "Again, hello.",
+                ),
             ],
             live_agents(&route),
             3,
@@ -1209,5 +1250,191 @@ async fn a_turns_output_goes_where_the_message_that_started_it_came_from() {
         pending.last().unwrap(),
         &("Again, hello.".to_owned(), "signal-zola".to_owned())
     );
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tagged_message_settles_the_reply_its_agent_owes() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let mut route = route();
+    for binding in &mut route.channels {
+        if let ChannelBinding::Signal { allow_members, .. } = binding {
+            *allow_members = true;
+        }
+    }
+    store.save_route(route.clone(), 1).await.unwrap();
+    // The route's output goes to its shared Signal group.
+    store
+        .set_metadata(
+            "route_output_preferences_v1".into(),
+            serde_json::json!({route.id.to_string(): "sig"}).to_string(),
+        )
+        .await
+        .unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+    let debt = |id: u128| panetone::store::ReplyDebt {
+        request_id: panetone::domain::WorkflowId::new(Uuid::from_u128(id)),
+        source: "asker".into(),
+        source_route_id: RouteId::new(Uuid::from_u128(77)),
+        source_agent: route.agent.clone().unwrap(),
+        target: "zola".into(),
+        target_route_id: route.id,
+        target_agent_id: "agent-zola".into(),
+        summary: "run the trials".into(),
+        after_sequence: 0,
+        created_at_ms: 1,
+        state: "open".into(),
+    };
+    store
+        .open_reply_debt(debt(0xaaaa_aaaa_u128 << 96))
+        .await
+        .unwrap();
+    store
+        .open_reply_debt(debt(0xbbbb_bbbb_u128 << 96))
+        .await
+        .unwrap();
+    let message = |sequence: u64, text: &str| -> EventRecord {
+        serde_json::from_value(serde_json::json!({
+            "sequence": sequence,
+            "event_id": format!("event-{sequence}"),
+            "kind": "assistant_message",
+            "agent_id": "agent-zola",
+            "incarnation_id": "incarnation-zola-7",
+            "turn_id": "turn-1",
+            "observed_at": "2026-10-16T12:00:00Z",
+            "text": text,
+        }))
+        .unwrap()
+    };
+    let first = Uuid::from_u128(0xaaaa_aaaa_u128 << 96).to_string();
+
+    store
+        .ingest_agent_events(
+            100,
+            102,
+            vec![
+                // Two replies are owed, so a bare tag names neither.
+                message(101, "Done.\n[panetone:reply]"),
+                message(
+                    102,
+                    &format!("All 23 trials passed.\n[panetone:reply {}]", &first[..8]),
+                ),
+            ],
+            live_agents(&route),
+            3,
+        )
+        .await
+        .unwrap();
+
+    let open = store.open_reply_debts().await.unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(
+        open[0].request_id.to_string(),
+        Uuid::from_u128(0xbbbb_bbbb_u128 << 96).to_string()
+    );
+    let pending = store.pending_reply_messages().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].kind, "final");
+    assert_eq!(pending[0].body, "All 23 trials passed.");
+    let invalid = store
+        .unreported_reply_tags("agent-zola".into())
+        .await
+        .unwrap();
+    assert_eq!(invalid.len(), 1);
+    assert!(invalid[0].body.contains("several replies are owed"));
+    // Shown without the tag, in the Telegram topic instead of the shared group.
+    let posts = store.pending_outbox().await.unwrap();
+    assert_eq!(posts.len(), 2);
+    for post in &posts {
+        assert_eq!(post.kind, ChannelKind::Telegram);
+        assert!(!post.body.contains("[panetone:"));
+    }
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_turn_a_reminder_started_is_not_followed_by_another_reminder() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let route = route();
+    store.save_route(route.clone(), 1).await.unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+    let event = |sequence: u64, kind: &str, turn: &str, hash: Option<&str>| -> EventRecord {
+        let mut value = serde_json::json!({
+            "sequence": sequence,
+            "event_id": format!("event-{sequence}"),
+            "kind": kind,
+            "agent_id": "agent-zola",
+            "incarnation_id": "incarnation-zola-7",
+            "turn_id": turn,
+            "observed_at": "2026-10-16T12:00:00Z",
+        });
+        if let Some(hash) = hash {
+            value["input_sha256"] = hash.into();
+        }
+        serde_json::from_value(value).unwrap()
+    };
+    let reminder_hash = panetone::store::DeliveryProof::input_sha256("[Panetone reply reminder]");
+    store
+        .ingest_agent_events(
+            100,
+            102,
+            vec![
+                event(101, "turn_started", "turn-1", Some("other")),
+                event(102, "turn_final", "turn-1", None),
+            ],
+            live_agents(&route),
+            3,
+        )
+        .await
+        .unwrap();
+    let ended = store
+        .last_turn_end("agent-zola".into(), 100)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ended.turn_id, "turn-1");
+    assert!(!ended.started_by_reminder && !ended.reminded && !ended.superseded);
+
+    store
+        .record_reply_reminder(
+            panetone::domain::EffectId::new(Uuid::from_u128(5)),
+            "agent-zola".into(),
+            "turn-1".into(),
+            reminder_hash.clone(),
+            Vec::new(),
+            2,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .last_turn_end("agent-zola".into(), 100)
+            .await
+            .unwrap()
+            .unwrap()
+            .reminded
+    );
+    store
+        .ingest_agent_events(
+            102,
+            104,
+            vec![
+                event(103, "turn_started", "turn-2", Some(&reminder_hash)),
+                event(104, "turn_final", "turn-2", None),
+            ],
+            live_agents(&route),
+            3,
+        )
+        .await
+        .unwrap();
+    let ended = store
+        .last_turn_end("agent-zola".into(), 100)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ended.turn_id, "turn-2");
+    assert!(ended.started_by_reminder);
     store.shutdown().await.unwrap();
 }

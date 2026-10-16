@@ -26,8 +26,9 @@ async fn send_help_explains_queue_and_reply_modes() {
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Ask for the target's reply"));
-    assert!(stdout.contains("a busy target is asked to reply by message"));
+    assert!(stdout.contains("--reply"));
+    assert!(stdout.contains("[alias: --return-final]"));
+    assert!(stdout.contains("tags a message [panetone:reply]"));
     assert!(stdout.contains("Wait for a busy target to become idle"));
     assert!(!stdout.contains("--steer"));
 }

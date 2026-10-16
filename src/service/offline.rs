@@ -11,15 +11,17 @@ use crate::domain::{
     signal_group_account,
 };
 use crate::store::{
-    ClaimResult, DestinationDelivery, ReturnDelivery, StoreError, StoreHandle, StoredWorkflow,
+    ClaimResult, DestinationDelivery, ReplyDebt, ReturnDelivery, StoreError, StoreHandle,
+    StoredWorkflow,
 };
 use crate::wakterm::{
     ContractError, EventRead, FakeWakterm, TerminalResult, WaktermCli, WaktermCliError,
 };
 
 const QUEUED_DETAIL: &str = "The target is busy, so the message is queued and Panetone delivers it when the target is idle. Do not send it again.";
-const STEERED_DETAIL: &str = "The target was busy, so the message was delivered into its active turn.";
-const MESSAGE_REPLY_DETAIL: &str = "The target was busy, so no final callback follows. It was asked to reply with its own panetone send, which arrives as a separate message.";
+const STEERED_DETAIL: &str =
+    "The target was busy, so the message was delivered into its active turn.";
+const TAGGED_REPLY_DETAIL: &str = "The target owes you a reply until it sends a message tagged [panetone:reply]; it arrives as a separate cross-agent message, in this turn or a later one. Panetone reminds the target after its turns until then, and panetone cancel REQUEST_ID withdraws the request.";
 const ASYNC_REPLY_DETAIL: &str = "This command does not wait for completion. Panetone mirrors the final to the source route's channel when it arrives and delivers the agent callback when the source agent is idle.";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -41,57 +43,71 @@ pub struct ServiceAck {
 }
 
 impl ServiceAck {
-    fn queued(return_final: bool) -> Self {
-        Self::new("queued", false, false, return_final)
+    fn queued(command: &SendCommand) -> Self {
+        Self::new("queued", false, command)
     }
 
-    fn submitted(return_final: bool) -> Self {
-        Self::new("submitted", true, return_final, return_final)
+    fn submitted(command: &SendCommand) -> Self {
+        Self::new("submitted", true, command)
     }
 
-    fn new(delivery_state: &str, submitted: bool, reply_pending: bool, return_final: bool) -> Self {
+    fn steered(acknowledged: bool, command: &SendCommand) -> Self {
+        Self {
+            delivery_detail: Some(STEERED_DETAIL.into()),
+            steering_acknowledged: Some(acknowledged),
+            ..Self::new("steered", true, command)
+        }
+    }
+
+    fn new(delivery_state: &str, submitted: bool, command: &SendCommand) -> Self {
+        let (reply_mode, reply_detail) = reply_mode(command);
         Self {
             accepted: true,
             delivery_state: delivery_state.into(),
             submitted,
             delivery_detail: (delivery_state == "queued").then(|| QUEUED_DETAIL.into()),
-            reply_pending,
-            reply_mode: if return_final {
-                "asynchronous_final_callback".into()
-            } else {
-                "none".into()
-            },
-            reply_detail: return_final.then(|| ASYNC_REPLY_DETAIL.into()),
+            reply_pending: reply_detail.is_some() && (submitted || command.reply),
+            reply_mode: reply_mode.into(),
+            reply_detail: reply_detail.map(str::to_owned),
             steering_acknowledged: None,
         }
     }
 
-    fn steered(acknowledged: bool, reply_by_message: bool) -> Self {
-        Self {
-            accepted: true,
-            delivery_state: "steered".into(),
-            submitted: true,
-            delivery_detail: Some(STEERED_DETAIL.into()),
-            reply_pending: false,
-            reply_mode: if reply_by_message { "message" } else { "none" }.into(),
-            reply_detail: reply_by_message.then(|| MESSAGE_REPLY_DETAIL.into()),
-            steering_acknowledged: Some(acknowledged),
-        }
-    }
-
-    fn restore_explanation(mut self, return_final: bool) -> Self {
-        let return_final = return_final && self.delivery_state != "steered";
+    fn restore_explanation(mut self, command: &SendCommand) -> Self {
         if self.reply_mode.is_empty() {
-            self.reply_mode = if return_final {
-                "asynchronous_final_callback".into()
-            } else {
-                "none".into()
-            };
-        }
-        if return_final && self.reply_detail.is_none() {
-            self.reply_detail = Some(ASYNC_REPLY_DETAIL.into());
+            let (reply_mode, reply_detail) = reply_mode(command);
+            self.reply_mode = reply_mode.into();
+            self.reply_detail = self
+                .reply_detail
+                .or_else(|| reply_detail.map(str::to_owned));
         }
         self
+    }
+}
+
+/// The first line of a request, shortened, to remind both sides what a
+/// reply answers.
+pub fn request_summary(message: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    let line = message
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    match line.char_indices().nth(MAX_CHARS) {
+        Some((end, _)) => format!("{}…", &line[..end]),
+        None => line.to_owned(),
+    }
+}
+
+/// How the sender of a command receives its reply, if it asked for one.
+fn reply_mode(command: &SendCommand) -> (&'static str, Option<&'static str>) {
+    if command.reply {
+        ("tagged_reply", Some(TAGGED_REPLY_DETAIL))
+    } else if command.return_final {
+        ("asynchronous_final_callback", Some(ASYNC_REPLY_DETAIL))
+    } else {
+        ("none", None)
     }
 }
 
@@ -403,7 +419,7 @@ impl OfflineService {
                     && let Some(response) = record.response.as_ref()
                 {
                     return Ok(serde_json::from_value::<ServiceAck>(response.clone())?
-                        .restore_explanation(record.command.return_final));
+                        .restore_explanation(&record.command));
                 }
                 record
             }
@@ -424,14 +440,14 @@ impl OfflineService {
                     .await;
             }
             WorkflowState::AwaitingTargetIdle => {
-                let ack = ServiceAck::queued(record.command.return_final);
+                let ack = ServiceAck::queued(&record.command);
                 return persist_ack(&self.store, record, ack, now_ms).await;
             }
             WorkflowState::Submitted => {
                 let ack = match record.response.as_ref() {
                     Some(response) => serde_json::from_value::<ServiceAck>(response.clone())?
-                        .restore_explanation(record.command.return_final),
-                    None => ServiceAck::submitted(record.command.return_final),
+                        .restore_explanation(&record.command),
+                    None => ServiceAck::submitted(&record.command),
                 };
                 return self
                     .complete_submission(record, channel_destination(target)?, ack, now_ms)
@@ -572,12 +588,7 @@ impl OfflineService {
         // A target whose keyboard is held by a dialog cannot be steered; the
         // request then waits in the busy queue like an unsteered one.
         let steering = if receipt.status == AdmissionStatus::Busy && record.command.steer {
-            let steered = FakeWakterm::steered_envelope(
-                &record.command,
-                &record.workflow.observed_source.harness,
-                &target.harness,
-            );
-            match self.wakterm.steer(&target, steered).await {
+            match self.wakterm.steer(&target, prompt).await {
                 Err(ServiceError::TargetBlocked(_)) => None,
                 result => Some(result),
             }
@@ -609,7 +620,7 @@ impl OfflineService {
             };
             self.faults.hit(FaultPoint::AfterSteeringEffect)?;
             record.workflow.submitted_target = Some(target);
-            let ack = ServiceAck::steered(acknowledged, record.command.return_final);
+            let ack = ServiceAck::steered(acknowledged, &record.command);
             record.response = Some(serde_json::to_value(&ack)?);
             transition(&self.store, &mut record, WorkflowState::Submitted, now_ms).await?;
             self.faults.hit(FaultPoint::AfterReceiptCheckpoint)?;
@@ -621,7 +632,7 @@ impl OfflineService {
         let state = record.workflow.apply_target_receipt(&receipt, &target)?;
         // A queued workflow can be retried and submitted as soon as it is saved,
         // so its acknowledgement is saved with it rather than after the status post.
-        let queued = ServiceAck::queued(record.command.return_final);
+        let queued = ServiceAck::queued(&record.command);
         if state == WorkflowState::AwaitingTargetIdle {
             record.response = Some(serde_json::to_value(&queued)?);
         }
@@ -643,7 +654,7 @@ impl OfflineService {
                 Ok(queued)
             }
             WorkflowState::Submitted => {
-                let ack = ServiceAck::submitted(record.command.return_final);
+                let ack = ServiceAck::submitted(&record.command);
                 self.complete_submission(record, target_channel, ack, now_ms)
                     .await
             }
@@ -677,6 +688,25 @@ impl OfflineService {
         ack: ServiceAck,
         now_ms: i64,
     ) -> Result<ServiceAck, ServiceError> {
+        if record.command.reply
+            && let Some(target) = record.workflow.submitted_target.as_ref()
+        {
+            self.store
+                .open_reply_debt(ReplyDebt {
+                    request_id: record.command.id,
+                    source: record.command.source.clone(),
+                    source_route_id: record.workflow.source_route_id,
+                    source_agent: record.workflow.observed_source.clone(),
+                    target: record.command.target.clone(),
+                    target_route_id: record.workflow.target_route_id,
+                    target_agent_id: target.agent_id.clone(),
+                    summary: request_summary(&record.command.message),
+                    after_sequence: 0,
+                    created_at_ms: now_ms,
+                    state: "open".into(),
+                })
+                .await?;
+        }
         let (purpose, detail) = if ack.delivery_state == "steered" {
             (
                 "steered",

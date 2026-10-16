@@ -390,7 +390,7 @@ fi
 }
 
 #[tokio::test]
-async fn wakterm_caller_derives_the_route_and_callback_without_from() {
+async fn wakterm_caller_derives_the_route_and_the_reply_owed_without_from() {
     let directory = tempdir().unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let database = directory.path().join("state.sqlite3");
@@ -435,29 +435,27 @@ async fn wakterm_caller_derives_the_route_and_callback_without_from() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let log = fs::read_to_string(&admissions).unwrap_or_default();
-        if log.contains("agent-target") && log.contains("agent-caller") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "callback was not returned to agent-caller: {log}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    assert!(
+        fs::read_to_string(&admissions)
+            .unwrap_or_default()
+            .contains("agent-target")
+    );
     daemon.stop();
 
     let store = StoreHandle::open(&database).unwrap();
     let workflow_id = panetone::domain::WorkflowId::new(Uuid::parse_str(request_id).unwrap());
     let workflow = store.get_workflow(workflow_id).await.unwrap().unwrap();
     assert_eq!(workflow.command.source, "inq2");
+    assert!(workflow.command.reply);
+    assert!(!workflow.command.return_final);
     assert_eq!(workflow.workflow.observed_source.agent_id, "agent-caller");
     assert_eq!(workflow.workflow.observed_source.pane_id, Some(85));
-    let returned = store.get_return(workflow_id).await.unwrap().unwrap();
-    assert_eq!(returned.agent.source.agent_id, "agent-caller");
-    assert_eq!(returned.agent.source.pane_id, Some(85));
+    // The reply is owed to the exact calling agent.
+    let debt = store.reply_debt(workflow_id).await.unwrap().unwrap();
+    assert_eq!(debt.state, "open");
+    assert_eq!(debt.source, "inq2");
+    assert_eq!(debt.source_agent.agent_id, "agent-caller");
+    assert_eq!(debt.target_agent_id, "agent-target");
     store.shutdown().await.unwrap();
 }
 

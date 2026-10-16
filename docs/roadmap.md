@@ -2,9 +2,13 @@
 
 Open work, in priority order. Finished work is recorded in git history, so delete an item when it lands.
 
-## Callbacks to the exact caller
+## Replies to the exact caller
 
-A final callback whose original caller has exited falls back to the source route's current agent, which may be a different agent than the one that asked. The callback should go to the exact caller, or be posted to the source route's channel marked as having no caller.
+A reply whose original caller has exited goes to the source route's current agent, which may be a different agent than the one that asked. It should go to the exact caller, or be posted to the source route's channel marked as having no caller.
+
+## Remove Wakterm return correlation
+
+Requests that asked Wakterm to correlate them with a provider turn still finish through the terminal stream, return deliveries and the `return-terminals` and `pending-returns` workers. Once `panetone status` shows no unresolved returns, remove that path from Panetone and tell Wakterm its return-request support has no caller.
 
 ## Remove `--source-pane-id`
 

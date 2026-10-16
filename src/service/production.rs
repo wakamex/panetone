@@ -16,10 +16,12 @@ use crate::control::{
 };
 use crate::domain::{
     AdmissionStatus, AgentBinding, ChannelBinding, ChannelKind, EffectId, OutboxAction, OutboxItem,
-    OutboxState, Route, RouteId, WorkflowId, WorkflowState, SIGNAL_DIRECT_PREFIX, signal_group_account,
+    OutboxState, Route, RouteId, SIGNAL_DIRECT_PREFIX, SendCommand, WorkflowId, WorkflowState,
+    signal_group_account,
 };
 use crate::store::{
-    DeliveryProof, EventCursorGap, InboxItem, RouteAgent, StoreHandle, StoredApproval,
+    DeliveryProof, EventCursorGap, InboxItem, ReplyDebt, ReplyMessage, RouteAgent, StoreHandle,
+    StoredApproval,
 };
 use crate::supervisor::SupervisorHandle;
 use crate::wakterm::form::{self, FormAction, FormState};
@@ -36,6 +38,9 @@ const MAX_UNCERTAIN_ATTEMPTS: u32 = 3;
 /// before its sender is told it may not have arrived. Codex records steering
 /// only when the running turn takes it, which can be after a long tool call.
 const INBOX_PROOF_WINDOW_MS: i64 = 120_000;
+/// How long after an agent's turn ends a reminder waits, so that a turn
+/// something else starts meanwhile is checked instead.
+const REPLY_REMINDER_DELAY_MS: i64 = 30_000;
 /// How long a channel message waits on a blocked pane before its sender is told why.
 const INBOX_WAITING_NOTICE_MS: i64 = 60_000;
 
@@ -706,6 +711,212 @@ impl ProductionService {
         Ok(processed)
     }
 
+    /// Sends tagged replies to their senders, then reminds agents that still
+    /// owe a reply after a turn that something else started (ADR 0006).
+    pub async fn replies_once(&self) -> Result<usize, String> {
+        let messages = self
+            .store
+            .pending_reply_messages()
+            .await
+            .map_err(error_string)?;
+        let debts = self.store.open_reply_debts().await.map_err(error_string)?;
+        if messages.is_empty() && debts.is_empty() {
+            return Ok(0);
+        }
+        let live = self.wakterm.live_routes().await.map_err(error_string)?;
+        let mut done = 0;
+        for message in messages {
+            done += usize::from(self.send_reply(&live, message).await?);
+        }
+        let mut agents = BTreeMap::<String, Vec<ReplyDebt>>::new();
+        for debt in debts {
+            agents
+                .entry(debt.target_agent_id.clone())
+                .or_default()
+                .push(debt);
+        }
+        for (agent_id, owed) in agents {
+            done += usize::from(self.remind(&live, &agent_id, &owed).await?);
+        }
+        Ok(done)
+    }
+
+    /// Sends one tagged reply to its sender as a cross-agent message. Returns
+    /// whether it left the pending state.
+    async fn send_reply(
+        &self,
+        live: &LiveRouteSnapshot,
+        message: ReplyMessage,
+    ) -> Result<bool, String> {
+        let request_id = message.request_id.ok_or("a reply names no request")?;
+        let Some(debt) = self
+            .store
+            .reply_debt(request_id)
+            .await
+            .map_err(error_string)?
+        else {
+            self.store
+                .set_reply_message_state(message.id, "failed".into())
+                .await
+                .map_err(error_string)?;
+            return Ok(true);
+        };
+        let routes = (
+            self.store
+                .get_route(message.route_id)
+                .await
+                .map_err(error_string)?,
+            self.store
+                .get_route(debt.source_route_id)
+                .await
+                .map_err(error_string)?,
+        );
+        let (Some(replier), Some(sender)) = routes else {
+            return Ok(false);
+        };
+        let replier_agent = AgentBinding {
+            agent_id: message.agent_id.clone(),
+            incarnation_id: String::new(),
+            harness: String::new(),
+            pane_id: None,
+        };
+        let (Some(replier_binding), Some(sender_binding)) = (
+            resolve_live(live, &replier, Some(&replier_agent))?,
+            resolve_live(live, &sender, Some(&debt.source_agent))?,
+        ) else {
+            // The sender is not running; the reply waits for it.
+            return Ok(false);
+        };
+        let heading = if message.kind == "final" {
+            "Reply to your request"
+        } else {
+            "Progress on your request"
+        };
+        let command = SendCommand {
+            id: WorkflowId::new(message.id.as_uuid()),
+            source: debt.target.clone(),
+            target: debt.source.clone(),
+            message: format!(
+                "{heading} {} (\"{}\"):\n\n{}",
+                debt.request_id, debt.summary, message.body
+            ),
+            return_final: false,
+            steer: true,
+            reply: false,
+            timeout_ms: 0,
+        };
+        let outcome = self
+            .workflows
+            .submit(
+                command,
+                &replier.with_agent(replier_binding),
+                &sender.with_agent(sender_binding),
+                now_ms(),
+            )
+            .await;
+        let state = match outcome {
+            Ok(_) => "sent",
+            Err(ServiceError::RouteUnavailable(_) | ServiceError::TargetBlocked(_)) => {
+                return Ok(false);
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, request = %debt.request_id, "reply was not delivered");
+                "failed"
+            }
+        };
+        self.store
+            .set_reply_message_state(message.id, state.into())
+            .await
+            .map_err(error_string)?;
+        Ok(true)
+    }
+
+    /// Reminds an agent of the replies it owes, at most once after each turn
+    /// that a reminder did not start. Returns whether a reminder was sent.
+    async fn remind(
+        &self,
+        live: &LiveRouteSnapshot,
+        agent_id: &str,
+        owed: &[ReplyDebt],
+    ) -> Result<bool, String> {
+        let Some(first) = owed.first() else {
+            return Ok(false);
+        };
+        let Some(route) = self
+            .store
+            .get_route(first.target_route_id)
+            .await
+            .map_err(error_string)?
+        else {
+            return Ok(false);
+        };
+        let preferred = AgentBinding {
+            agent_id: agent_id.into(),
+            incarnation_id: String::new(),
+            harness: String::new(),
+            pane_id: None,
+        };
+        let Some(binding) = resolve_live(live, &route, Some(&preferred))? else {
+            return Ok(false);
+        };
+        let after = owed
+            .iter()
+            .map(|debt| debt.after_sequence)
+            .min()
+            .unwrap_or(0);
+        let Some(turn) = self
+            .store
+            .last_turn_end(binding.agent_id.clone(), after)
+            .await
+            .map_err(error_string)?
+        else {
+            return Ok(false);
+        };
+        if turn.superseded
+            || turn.started_by_reminder
+            || turn.reminded
+            || now_ms() - turn.ended_at_ms < REPLY_REMINDER_DELAY_MS
+        {
+            return Ok(false);
+        }
+        let invalid = self
+            .store
+            .unreported_reply_tags(binding.agent_id.clone())
+            .await
+            .map_err(error_string)?;
+        let body = reminder_body(owed, &invalid);
+        let namespace = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            b"https://panetone.dev/replies/reminder/v1",
+        );
+        let id = EffectId::new(Uuid::new_v5(
+            &namespace,
+            format!("{}\0{}", binding.agent_id, turn.turn_id).as_bytes(),
+        ));
+        let receipt = self
+            .wakterm
+            .admit(id, &binding, &body, false, 0)
+            .await
+            .map_err(error_string)?;
+        // Nothing was written to a busy agent; its current turn's end is
+        // checked again.
+        if receipt.prompt_written != Some(true) {
+            return Ok(false);
+        }
+        self.store
+            .record_reply_reminder(
+                id,
+                binding.agent_id,
+                turn.turn_id,
+                DeliveryProof::input_sha256(&body),
+                invalid.iter().map(|message| message.id).collect(),
+                now_ms(),
+            )
+            .await
+            .map_err(error_string)?;
+        Ok(true)
+    }
+
     pub async fn pending_return_once(&self) -> Result<usize, String> {
         let pending = self.store.pending_returns().await.map_err(error_string)?;
         if pending.is_empty() {
@@ -964,10 +1175,18 @@ impl ProductionService {
             let Ok(live_route) = live.route(&route.title) else {
                 continue;
             };
-            let Some(agent) = live_route.agents.iter().find(|agent| live.is_working(agent)) else {
+            let Some(agent) = live_route
+                .agents
+                .iter()
+                .find(|agent| live.is_working(agent))
+            else {
                 continue;
             };
-            match self.channels.telegram_typing(&agent.harness, topic_id).await {
+            match self
+                .channels
+                .telegram_typing(&agent.harness, topic_id)
+                .await
+            {
                 Ok(()) => shown += 1,
                 Err(error) => {
                     tracing::debug!(route = %route.title, error = %error, "typing indicator failed")
@@ -1230,11 +1449,11 @@ impl ProductionService {
                     None,
                 );
             }
-            if params.return_final {
+            if params.return_final || params.reply {
                 return error_response(
                     id,
                     "invalid_params",
-                    "an external sender cannot receive a final callback; send one-way",
+                    "an external sender cannot receive a reply; send one-way",
                     None,
                 );
             }
@@ -1412,7 +1631,47 @@ impl ProductionService {
         }
     }
 
+    async fn handle_reply_cancel(&self, id: Uuid, request_id: Uuid) -> ControlResponse {
+        match self
+            .store
+            .cancel_reply_debt(WorkflowId::new(request_id), now_ms())
+            .await
+        {
+            Ok(Some(previous)) => success_response(
+                id,
+                json!({
+                    "request_id": request_id,
+                    "cancelled": previous == "open",
+                    "previous_state": previous,
+                }),
+            ),
+            Ok(None) => error_response(
+                id,
+                "reply_not_found",
+                "no request with that ID asked for a reply",
+                None,
+            ),
+            Err(error) => internal(id, error),
+        }
+    }
+
     async fn status_response(&self, id: Uuid) -> ControlResponse {
+        let now = now_ms();
+        let replies_owed = match self.store.open_reply_debts().await {
+            Ok(debts) => debts
+                .into_iter()
+                .map(|debt| {
+                    json!({
+                        "request_id": debt.request_id,
+                        "from": debt.source,
+                        "to": debt.target,
+                        "age_ms": now - debt.created_at_ms,
+                        "request": debt.summary,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => return internal(id, error),
+        };
         let degraded_routes = match self.reported_problems().await {
             Ok(reported) => reported
                 .into_values()
@@ -1442,6 +1701,7 @@ impl ProductionService {
                     "control": {"path": self.control_socket},
                     "tasks": self.health.snapshot(),
                     "degraded_routes": degraded_routes,
+                    "replies_owed": replies_owed,
                 }),
             ),
             Err(error) => internal(id, error),
@@ -1805,6 +2065,20 @@ impl ControlHandler for ProductionService {
             }
             match request.method.as_str() {
                 "status" => self.status_response(request.id).await,
+                "reply.cancel" => match request
+                    .params
+                    .get("request_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| Uuid::parse_str(value).ok())
+                {
+                    Some(request_id) => self.handle_reply_cancel(request.id, request_id).await,
+                    None => error_response(
+                        request.id,
+                        "invalid_params",
+                        "reply.cancel requires a request_id UUID",
+                        None,
+                    ),
+                },
                 "send" => match serde_json::from_value::<SendParams>(request.params.clone()) {
                     Ok(params) => self.handle_send(request, params).await,
                     Err(error) => invalid(request.id, error),
@@ -1912,6 +2186,27 @@ fn telegram_route(title: String, topic_id: i64) -> Route {
         channels: vec![ChannelBinding::Telegram { topic_id }],
         agent: None,
     }
+}
+
+/// The text of a reminder: every reply an agent owes, any tags that matched
+/// nothing, and how to answer.
+fn reminder_body(owed: &[ReplyDebt], invalid: &[ReplyMessage]) -> String {
+    let mut body = String::from("[Panetone reply reminder]\nYou owe a reply to:\n");
+    for debt in owed {
+        body.push_str(&format!(
+            "- request {} from {}: \"{}\"\n",
+            &debt.request_id.to_string()[..8],
+            debt.source,
+            debt.summary
+        ));
+    }
+    for message in invalid {
+        body.push_str(&format!("Your last tag was not used: {}.\n", message.body));
+    }
+    body.push_str(
+        "\nWhen you have the answer, write it in your normal output with [panetone:reply] on its own line outside code, adding the request ID when you owe several, for example [panetone:reply 1a2b3c4d]. A reply that you cannot do it counts as an answer. [panetone:progress] sends an update and keeps the request open. If the work is still running, send a progress update or nothing; you are reminded again only after something else wakes you.",
+    );
+    body
 }
 
 fn resolve_live(
@@ -2600,7 +2895,13 @@ fi
         };
         assert_eq!(account(&route), None);
         assert_eq!(
-            ensure_signal_binding(&mut route, Some("group-id"), false, Some("+15559999"), false),
+            ensure_signal_binding(
+                &mut route,
+                Some("group-id"),
+                false,
+                Some("+15559999"),
+                false
+            ),
             Ok(true)
         );
         assert_eq!(account(&route).as_deref(), Some("+15559999"));
@@ -2887,6 +3188,7 @@ fi
             message: "do the work".into(),
             return_final: true,
             steer: false,
+            reply: false,
             timeout_ms: 0,
         };
         assert!(matches!(
@@ -2944,6 +3246,227 @@ fi
         assert!(store.get_return(bad_id).await.unwrap().is_none());
         assert!(store.get_return(good_id).await.unwrap().is_some());
         drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_owed_reply_is_reminded_once_per_turn_and_a_tagged_reply_reaches_the_sender() {
+        let directory = tempdir().unwrap();
+        let binary = directory.path().join("wakterm-fake");
+        let admitted = directory.path().join("admitted.log");
+        fs::write(
+            &binary,
+            format!(
+                r#"#!/bin/bash
+set -euo pipefail
+operation="$*"
+if [[ "$operation" == *"agent capabilities"* ]]; then
+  printf '%s\n' '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
+elif [[ "$operation" == *"agent catalog"* ]]; then
+  printf '%s\n' '{{"schema":"wakterm.agent-api.v1","as_of_event_sequence":10,"agents":[{{"agent_id":"agent-asker","incarnation_id":"inc-asker","pane_id":1,"name":"asker","harness":"claude","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-10-16T00:00:00Z"}},{{"agent_id":"agent-worker","incarnation_id":"inc-worker","pane_id":2,"name":"worker","harness":"claude","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-10-16T00:00:00Z"}}]}}'
+elif [[ "$operation" == *"list --format json"* ]]; then
+  printf '%s\n' '[{{"pane_id":1,"tab_id":1,"window_id":1,"effective_title":"asker"}},{{"pane_id":2,"tab_id":2,"window_id":1,"effective_title":"worker"}}]'
+elif [[ "$operation" == *"agent admit"* ]]; then
+  cat >> '{log}'
+  request_id=""
+  while (($#)); do
+    if [[ "$1" == "--request-id" ]]; then request_id=$2; break; fi
+    shift
+  done
+  printf '{{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"accepted","definitive":true,"prompt_written":true,"agent_id":"agent-worker","incarnation_id":"inc-worker","detail":null}}\n' "$request_id"
+else
+  echo "unexpected fake invocation: $operation" >&2
+  exit 9
+fi
+"#,
+                log = admitted.display()
+            ),
+        )
+        .unwrap();
+        crate::test_support::seal_executable(&binary);
+        let route = |id: u128, title: &str, pane_id: u64| Route {
+            id: RouteId::new(Uuid::from_u128(id)),
+            title: title.into(),
+            channels: vec![ChannelBinding::Telegram {
+                topic_id: pane_id as i64,
+            }],
+            agent: None,
+        };
+        let asker = route(1, "asker", 1);
+        let worker = route(2, "worker", 2);
+        let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        store.save_route(asker.clone(), 1).await.unwrap();
+        store.save_route(worker.clone(), 1).await.unwrap();
+        store.initialize_event_cursor(100).await.unwrap();
+        let request_id = WorkflowId::new(Uuid::from_u128(0x1a2b_3c4d_u128 << 96));
+        store
+            .open_reply_debt(ReplyDebt {
+                request_id,
+                source: "asker".into(),
+                source_route_id: asker.id,
+                source_agent: AgentBinding {
+                    agent_id: "agent-asker".into(),
+                    incarnation_id: "inc-asker".into(),
+                    harness: "claude".into(),
+                    pane_id: Some(1),
+                },
+                target: "worker".into(),
+                target_route_id: worker.id,
+                target_agent_id: "agent-worker".into(),
+                summary: "run the trials".into(),
+                after_sequence: 0,
+                created_at_ms: 1,
+                state: "open".into(),
+            })
+            .await
+            .unwrap();
+        let workflows = Arc::new(OfflineService::new(
+            store.clone(),
+            FakeWakterm::new(current_contract()),
+            RecordingChannels::default(),
+        ));
+        let service = ProductionService {
+            store: store.clone(),
+            wakterm: WaktermCli::new(
+                binary,
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            channels: RealChannels::default(),
+            workflows: workflows.clone(),
+            health: SupervisorHandle::default(),
+            capabilities: vec!["event_stream.v1".into()],
+            control_socket: directory.path().join("control.sock"),
+            started_at: Instant::now(),
+            last_agents: tokio::sync::RwLock::new(HashMap::new()),
+            route_changes: tokio::sync::Mutex::new(()),
+            health_candidates: tokio::sync::Mutex::new(BTreeSet::new()),
+            archives: ChatArchives::default(),
+        };
+        let event = |sequence: u64, kind: &str, turn: &str, extra: serde_json::Value| {
+            let mut value = serde_json::json!({
+                "sequence": sequence,
+                "event_id": format!("event-{sequence}"),
+                "kind": kind,
+                "agent_id": "agent-worker",
+                "incarnation_id": "inc-worker",
+                "turn_id": turn,
+                "observed_at": "2026-10-16T12:00:00Z",
+            });
+            for (key, field) in extra.as_object().unwrap() {
+                value[key] = field.clone();
+            }
+            serde_json::from_value::<crate::wakterm::EventRecord>(value).unwrap()
+        };
+        let agents = vec![RouteAgent {
+            route_id: worker.id,
+            agent: AgentBinding {
+                agent_id: "agent-worker".into(),
+                incarnation_id: "inc-worker".into(),
+                harness: "claude".into(),
+                pane_id: Some(2),
+            },
+        }];
+        // The request's turn ends with a progress note and no tag, long ago.
+        store
+            .ingest_agent_events(
+                100,
+                102,
+                vec![
+                    event(
+                        101,
+                        "turn_started",
+                        "turn-1",
+                        serde_json::json!({"input_sha256": "request"}),
+                    ),
+                    event(
+                        102,
+                        "turn_final",
+                        "turn-1",
+                        serde_json::json!({"outcome": "completed"}),
+                    ),
+                ],
+                agents.clone(),
+                3,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(service.replies_once().await.unwrap(), 1);
+        let reminder = fs::read_to_string(&admitted).unwrap();
+        assert!(reminder.starts_with("[Panetone reply reminder]"));
+        assert!(reminder.contains("- request 1a2b3c4d from asker: \"run the trials\""));
+        // The same turn is not reminded twice.
+        assert_eq!(service.replies_once().await.unwrap(), 0);
+
+        // The reminder's own turn ends without a reply: no further reminder.
+        let reminder_hash = DeliveryProof::input_sha256(&reminder);
+        store
+            .ingest_agent_events(
+                102,
+                104,
+                vec![
+                    event(
+                        103,
+                        "turn_started",
+                        "turn-2",
+                        serde_json::json!({"input_sha256": reminder_hash}),
+                    ),
+                    event(
+                        104,
+                        "turn_final",
+                        "turn-2",
+                        serde_json::json!({"outcome": "completed"}),
+                    ),
+                ],
+                agents.clone(),
+                3,
+            )
+            .await
+            .unwrap();
+        assert_eq!(service.replies_once().await.unwrap(), 0);
+
+        // A background task wakes the agent, which answers with a tag.
+        store
+            .ingest_agent_events(
+                104,
+                107,
+                vec![
+                    event(
+                        105,
+                        "turn_started",
+                        "turn-3",
+                        serde_json::json!({"input_sha256": "task"}),
+                    ),
+                    event(
+                        106,
+                        "assistant_message",
+                        "turn-3",
+                        serde_json::json!({"text": "All 23 trials passed.\n[panetone:reply]"}),
+                    ),
+                    event(
+                        107,
+                        "turn_final",
+                        "turn-3",
+                        serde_json::json!({"outcome": "completed"}),
+                    ),
+                ],
+                agents,
+                3,
+            )
+            .await
+            .unwrap();
+        assert_eq!(service.replies_once().await.unwrap(), 1);
+        let calls = workflows.wakterm().calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].binding.agent_id, "agent-asker");
+        assert!(calls[0].prompt.contains(&format!(
+            "Reply to your request {request_id} (\"run the trials\"):\n\nAll 23 trials passed."
+        )));
+        assert!(store.open_reply_debts().await.unwrap().is_empty());
+        assert_eq!(service.replies_once().await.unwrap(), 0);
+        drop(service);
+        drop(workflows);
         store.shutdown().await.unwrap();
     }
 
@@ -3024,6 +3547,7 @@ fi
             message: format!("request {id}"),
             return_final: false,
             steer: false,
+            reply: false,
             timeout_ms: 0,
         };
         let failed_id = WorkflowId::new(Uuid::from_u128(903));
@@ -3321,7 +3845,10 @@ fi
         assert_eq!(telegram_output_topic(&both, None), None);
         assert_eq!(telegram_output_topic(&both, Some("sig")), None);
         assert_eq!(telegram_output_topic(&both, Some("tg")), Some(10));
-        assert_eq!(telegram_output_topic(&route(vec![signal]), Some("tg")), None);
+        assert_eq!(
+            telegram_output_topic(&route(vec![signal]), Some("tg")),
+            None
+        );
     }
 
     #[tokio::test]
@@ -3402,7 +3929,10 @@ fi
             .ingest_agent_events(
                 10,
                 12,
-                vec![event(11, "agent-other", body), event(12, "agent-route", "hi")],
+                vec![
+                    event(11, "agent-other", body),
+                    event(12, "agent-route", "hi"),
+                ],
                 Vec::new(),
                 1,
             )

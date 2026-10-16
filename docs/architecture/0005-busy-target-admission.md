@@ -16,7 +16,7 @@ Messages are delivered when they are sent. Local control `send` and authorized T
 
 A local sender that wants its message to start a turn after the current work sets `queue`, which waits durably for the target to become idle. A message from a sender outside Wakterm always waits, because that sender reads the answer from the turn its message starts.
 
-`return_final` states that the sender wants a reply, and Panetone chooses how it travels. An idle target starts a turn whose final response Wakterm correlates and Panetone returns. A busy target is steered with a reply mode that asks it to answer with its own `panetone send`, quoting the request ID; Panetone awaits no terminal for that request, and the acknowledgement reports `reply_mode: "message"`.
+A request that wants a reply is delivered the same way, idle or busy; the target answers with a tagged message, as [ADR 0006](0006-tagged-replies.md) describes.
 
 The local control admission sequence is:
 
@@ -28,7 +28,7 @@ The local control admission sequence is:
    persist the delivery attempt boundary, and submit once through Wakterm
 6. edit the audit from queued to submitted, or visibly mark a definitive or indeterminate failure
 
-The structured queued acknowledgement is successful registration, not delivery confirmation. It includes `delivery_state: "queued"` and `submitted: false`. `reply_pending` continues to describe the optional final callback, not whether target delivery is pending.
+The structured queued acknowledgement is successful registration, not delivery confirmation. It includes `delivery_state: "queued"` and `submitted: false`. `reply_pending` says whether the sender is owed a reply, not whether target delivery is pending.
 
 The structured steering acknowledgement uses `delivery_state: "steered"`, `submitted: true`, and `steering_acknowledged` to report whether Wakterm observed the submitted input. A same-content, same-mode UUID retry returns the stored acknowledgement without another pane write. Reusing the UUID with a different delivery mode is an idempotency conflict.
 

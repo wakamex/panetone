@@ -35,6 +35,8 @@ enum Command {
     Send(SendArgs),
     /// Inspect durable daemon health and backlogs.
     Status(StatusArgs),
+    /// Withdraw a request's reply, so its target is no longer reminded.
+    Cancel(CancelArgs),
     /// Inspect or establish durable workspace routes.
     Route(RouteArgs),
     /// Wait for durable routing of exact Wakterm agent output.
@@ -110,7 +112,7 @@ struct SendArgs {
     #[arg(
         long = "as",
         value_name = "NAME",
-        conflicts_with_all = ["source_pane_id", "return_final"],
+        conflicts_with_all = ["source_pane_id", "reply"],
         help = "Send one-way as a named sender outside Wakterm, such as a remote assistant"
     )]
     sender: Option<String>,
@@ -131,9 +133,10 @@ struct SendArgs {
     source_pane_id: Option<u64>,
     #[arg(
         long,
-        help = "Ask for the target's reply: its final response returns when it was idle, and a busy target is asked to reply by message"
+        visible_alias = "return-final",
+        help = "Ask for a reply: the target owes one until it tags a message [panetone:reply], is reminded after its turns until then, and its reply arrives as a separate message"
     )]
-    return_final: bool,
+    reply: bool,
     #[arg(
         long,
         help = "Wait for a busy target to become idle instead of delivering into its active turn"
@@ -145,6 +148,14 @@ struct SendArgs {
     #[command(flatten)]
     control: ControlSocketArgs,
     message: String,
+}
+
+#[derive(Args)]
+struct CancelArgs {
+    /// The request ID of the send that asked for a reply.
+    request_id: Uuid,
+    #[command(flatten)]
+    control: ControlSocketArgs,
 }
 
 #[derive(Args)]
@@ -263,6 +274,7 @@ async fn main() -> Result<()> {
         Command::Daemon(args) => run_production_daemon(*args).await,
         Command::Send(args) => run_send(args).await,
         Command::Status(args) => run_status(args).await,
+        Command::Cancel(args) => run_cancel(args).await,
         Command::Route(args) => run_route(args).await,
         Command::Output(args) => run_output(args).await,
         Command::Doctor(args) => run_doctor(args).await,
@@ -279,6 +291,7 @@ enum ProductionWorker {
     Inbox,
     RouteHealth,
     Typing,
+    Replies,
 }
 
 async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
@@ -394,6 +407,7 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
         ("inbox", ProductionWorker::Inbox),
         ("route-health", ProductionWorker::RouteHealth),
         ("typing", ProductionWorker::Typing),
+        ("replies", ProductionWorker::Replies),
     ] {
         let service = handler.clone();
         let shutdown = supervisor.shutdown_receiver();
@@ -403,6 +417,9 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
             ProductionWorker::RouteHealth => Duration::from_secs(60),
             // Telegram clears a typing indicator after about five seconds.
             ProductionWorker::Typing => Duration::from_secs(4),
+            // Reminders wait 30 seconds after a turn, so a coarse period loses
+            // nothing and keeps Wakterm calls down while replies are owed.
+            ProductionWorker::Replies => Duration::from_secs(5),
             _ => worker_period,
         };
         supervisor.spawn(name, TaskPolicy::Critical, async move {
@@ -526,7 +543,8 @@ fn production_channels(args: &ProductionArgs, deadline: Duration) -> Result<Prod
     };
     let mut signal = signal;
     for pair in &args.signal_extra_accounts {
-        let (Some((account, rest)), Some((_, _, owner, _))) = (pair.split_once('='), signal.first())
+        let (Some((account, rest)), Some((_, _, owner, _))) =
+            (pair.split_once('='), signal.first())
         else {
             bail!(
                 "WAK_SIG_EXTRA_ACCOUNTS takes ACCOUNT=SOCKET[=DATA_DIR] entries and requires the default Signal account"
@@ -605,6 +623,7 @@ async fn run_production_worker(
         ProductionWorker::PendingReturns => service.pending_return_once().await?,
         ProductionWorker::Inbox => service.inbox_once().await?,
         ProductionWorker::RouteHealth => service.route_health_once().await?,
+        ProductionWorker::Replies => service.replies_once().await?,
         // The indicator is cosmetic, so a failed pass is not a daemon problem.
         ProductionWorker::Typing => service.typing_once().await.unwrap_or_else(|error| {
             tracing::debug!(error = %error, "typing indicator pass failed");
@@ -901,7 +920,8 @@ async fn run_send(args: SendArgs) -> Result<()> {
         source_pane_id: args.source_pane_id,
         source_agent,
         sender: args.sender,
-        return_final: args.return_final,
+        return_final: false,
+        reply: args.reply,
         queue: args.queue,
         timeout_ms: 0,
     };
@@ -945,6 +965,26 @@ async fn wakterm_caller() -> Result<SourceAgent> {
         .context("wakterm agent caller returned invalid JSON")?;
     serde_json::from_value(caller["agent"].clone())
         .context("wakterm agent caller returned no agent identity")
+}
+
+async fn run_cancel(args: CancelArgs) -> Result<()> {
+    let socket = control_socket(args.control.socket)?;
+    let response = request(
+        &socket,
+        &ControlRequest {
+            schema: CONTROL_SCHEMA.into(),
+            id: Uuid::new_v4(),
+            method: "reply.cancel".into(),
+            params: json!({"request_id": args.request_id}),
+        },
+    )
+    .await?;
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    if response.ok {
+        Ok(())
+    } else {
+        bail!("cancel was rejected")
+    }
 }
 
 async fn run_status(args: StatusArgs) -> Result<()> {

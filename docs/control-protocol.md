@@ -201,7 +201,7 @@ disposition, and exits nonzero after its local timeout while still pending.
       "agent_id": "8a6c0e8e-0d5f-4b52-9b63-2f0b4a6c9d10",
       "incarnation_id": "c3f1d2a4-7b9e-4e1a-8f60-5d2c7b1e9a34"
     },
-    "return_final": false,
+    "reply": false,
     "queue": false,
     "timeout_ms": 0
   }
@@ -256,27 +256,17 @@ tombstones from the initial claim.
 
 A successful response (`ok: true`, which the CLI reports with exit status 0) always carries `accepted: true` and means Panetone holds the message durably and will deliver it or report its failure in the target's channel; a caller stops retrying on it, whatever `delivery_state` and `submitted` say. Any other response means the message may not be held. A caller that retries with the same request UUID, such as `panetone send --id`, can never cause a second delivery, so a notifier can retry until it succeeds without keeping its own record of what it sent; a version 5 UUID of its own event ID makes a suitable request ID. A send to a title with no route, or to a route with no live agent, is rejected and is not held for a session that starts later.
 
-## Asynchronous final return
+## Replies
 
-`return_final: true` asks for the target's reply. How the reply travels depends on the target's state at delivery.
+`reply: true` (or `return_final: true`, its older name) asks for a reply. When the message reaches the target, Panetone records that the target owes the sender a reply, and the message header tells the target how to answer. The acknowledgement has `reply_mode: "tagged_reply"`, `reply_pending: true` and a `reply_detail` describing the path. A sender outside Wakterm cannot ask for a reply.
 
-A busy target cannot give a correlated final response, because a steered message has no turn of its own. Panetone steers the message in with `Reply mode: reply by message`, which tells the target to answer with its own `panetone send --to SOURCE` and quote the request ID. The acknowledgement has `delivery_state: "steered"`, `reply_pending: false`, `reply_mode: "message"`, and a `reply_detail` saying no final callback follows. The reply then arrives as an ordinary cross-agent message, and Panetone tracks no terminal for the request.
+The target answers in any turn by writing the answer as normal output with a standalone `[panetone:reply]` line outside fenced or indented code, or `[panetone:reply ID]` with the request ID or an unambiguous prefix of it when it owes several replies. Panetone removes the tag and sends that message to the sender as a cross-agent message that opens with the request ID and the first line of the request; this closes the debt. `[panetone:progress]` sends the message the same way as an update and keeps the debt open. A tag that matches no open debt delivers nothing and is reported in the next reminder. A tagged message is posted to the target's route without the tag, except to a Signal group whose route admits members other than the owner; it then goes to the route's Telegram topic, or nowhere.
 
-For an idle target, Panetone requests a correlated Wakterm terminal result. It stores the exact source and target incarnations, then returns immediately after target admission with `reply_pending: true`, `reply_mode: "asynchronous_final_callback"`, and a `reply_detail` explaining the delivery path. The control response is an admission acknowledgement, not the target's final response.
+When a turn of the target ends while it owes a reply, and nothing starts another turn within 30 seconds, Panetone admits one reminder listing every reply it owes. No reminder follows a turn that a reminder started, so reminders never wake an agent on their own.
 
-When Wakterm emits the terminal result, Panetone verifies it against the exact
-submitted target and persists it before:
+`reply.cancel` takes `{"request_id": UUID}` and withdraws an open debt; the CLI form is `panetone cancel REQUEST_ID`. Its result reports `cancelled` and `previous_state`, which is `open`, `replied` or `cancelled`. A request that did not ask for a reply fails with `reply_not_found`. Debts do not expire.
 
-- mirroring it to the source route's channel
-- admitting a structured callback to the exact calling agent when it remains live, otherwise resolving the explicit or derived source route's current agent
-
-Each destination has independent durable state. A possibly accepted callback
-becomes indeterminate and is not retried. A definitive busy callback remains
-pending until the source is idle.
-
-The terminal watcher calls Wakterm only while a `return-final` workflow has a
-submitted target and no stored terminal result. Ordinary operation therefore
-does not run an idle terminal poll.
+Requests that Wakterm correlated with a provider turn before replies were tagged still return that turn's final response through the terminal stream. The terminal watcher calls Wakterm only while such a request has no stored terminal result.
 
 ## Status
 
@@ -284,6 +274,7 @@ The `status` method takes null parameters. Its result includes:
 
 - package version, production mode, and uptime
 - durable workflow, inbox, outbox, return, tombstone, and cursor counts
+- `replies_owed`: each open reply debt with its request ID, sender, target, age and the first line of the request
 - Wakterm socket and startup capabilities
 - configured channel availability
 - control socket path

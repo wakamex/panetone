@@ -45,4 +45,4 @@ A definitively busy target is not a failed or indeterminate prompt. It enters th
 Imported tombstones retain their hash provenance so old request UUIDs remain
 reserved. New requests use the normalized Rust hash.
 
-One-way `send` remains the default. `--return-final` registers an asynchronous callback with an idle target and returns immediately; a busy target is asked to reply by message, as ADR 0005 describes. An explicit second `panetone send` back to the source remains the reliable semantic report-back pattern when the target should decide when work is complete.
+One-way `send` remains the default. `--reply` records that the target owes a reply and returns immediately; the target answers with a tagged message, as [ADR 0006](0006-tagged-replies.md) describes.

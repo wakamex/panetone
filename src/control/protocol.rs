@@ -32,6 +32,8 @@ pub struct SendParams {
     pub sender: Option<String>,
     #[serde(default)]
     pub return_final: bool,
+    #[serde(default)]
+    pub reply: bool,
     /// Wait for a busy target to become idle instead of steering its active
     /// turn.
     #[serde(default)]
@@ -87,7 +89,10 @@ impl SendParams {
             source,
             target: self.target,
             message: self.message,
-            return_final: self.return_final,
+            // A reply is asked for with `reply`; `return_final` is its older
+            // name, and Wakterm's turn correlation is no longer requested.
+            return_final: false,
+            reply: self.reply || self.return_final,
             // An outside sender reads the answer from the turn its message
             // starts, so its message waits for an idle target.
             steer: !self.queue && self.sender.is_none(),

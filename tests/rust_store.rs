@@ -39,6 +39,7 @@ fn command(request_id: WorkflowId, message: &str) -> SendCommand {
         message: message.into(),
         return_final: false,
         steer: false,
+        reply: false,
         timeout_ms: 30_000,
     }
 }
@@ -87,7 +88,7 @@ async fn store_is_private_and_rejects_newer_schemas() {
         StoreHandle::open(&path),
         Err(StoreError::NewerSchema {
             found: 99,
-            supported: 7
+            supported: 8
         })
     ));
 }
@@ -104,7 +105,7 @@ async fn version_five_is_rejected() {
         StoreHandle::open(&path),
         Err(StoreError::OlderSchema {
             found: 5,
-            supported: 7
+            supported: 8
         })
     ));
 }
@@ -153,7 +154,7 @@ async fn version_six_routes_drop_persisted_runtime_bindings() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     let route_json: serde_json::Value = serde_json::from_str(
         &connection
             .query_row(

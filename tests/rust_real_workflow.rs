@@ -148,6 +148,7 @@ fi
         message: "perform the review".into(),
         return_final: false,
         steer: false,
+        reply: false,
         timeout_ms: 0,
     };
     let first = service
@@ -242,6 +243,7 @@ fi
         message: "perform the review".into(),
         return_final: false,
         steer: false,
+        reply: false,
         timeout_ms: 0,
     };
     assert!(matches!(
@@ -347,6 +349,7 @@ fi
         message: "must remain audit-first".into(),
         return_final: false,
         steer: false,
+        reply: false,
         timeout_ms: 0,
     };
     assert!(matches!(

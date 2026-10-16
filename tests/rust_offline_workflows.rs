@@ -46,6 +46,7 @@ fn command(value: u128, return_final: bool) -> SendCommand {
         message: "do the work".into(),
         return_final,
         steer: false,
+        reply: false,
         timeout_ms: 0,
     }
 }
@@ -484,30 +485,34 @@ async fn crash_after_durable_steering_receipt_finishes_with_the_same_acknowledge
 }
 
 #[tokio::test]
-async fn a_reply_request_to_a_busy_target_is_steered_and_answered_by_message() {
+async fn a_reply_request_is_steered_into_a_busy_target_and_opens_a_reply_debt() {
     let directory = tempdir().unwrap();
     let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
     let wakterm = FakeWakterm::new(contract());
     wakterm.script_receipts([AdmissionStatus::Busy]);
     let service = OfflineService::new(store.clone(), wakterm, RecordingChannels::default());
     let (source, target) = routes();
-    let mut request = command(122, true);
+    let mut request = command(122, false);
     request.steer = true;
+    request.reply = true;
 
     let ack = service
         .submit(request.clone(), &source, &target, 100)
         .await
         .unwrap();
     assert_eq!(ack.delivery_state, "steered");
-    assert_eq!(ack.reply_mode, "message");
-    assert!(!ack.reply_pending);
-    assert!(ack.reply_detail.unwrap().contains("no final callback"));
+    assert_eq!(ack.reply_mode, "tagged_reply");
+    assert!(ack.reply_pending);
+    assert!(ack.reply_detail.unwrap().contains("[panetone:reply]"));
     let steered = &service.wakterm().steering_calls()[0].prompt;
-    assert!(steered.contains("Reply mode: reply by message."));
-    assert!(steered.contains(&format!("panetone send --to {}", source.title)));
-    assert!(service.wakterm().calls().is_empty());
-    // No terminal is awaited for a request answered by message.
+    assert!(steered.contains("Reply mode: reply requested."));
+    assert!(steered.contains("[panetone:reply]"));
+    // Wakterm is not asked to correlate the request with a turn.
     assert!(!store.has_unresolved_terminal().await.unwrap());
+    let debt = store.reply_debt(request.id).await.unwrap().unwrap();
+    assert_eq!(debt.state, "open");
+    assert_eq!(debt.source, source.title);
+    assert_eq!(debt.summary, request.message);
     drop(service);
     store.shutdown().await.unwrap();
 }

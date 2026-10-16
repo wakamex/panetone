@@ -26,8 +26,8 @@ than a rollback target.
   live agent pane.
 - Treat Debate group chats as ordinary routes with Signal bindings.
 - Send one-way local messages between routes.
-- Support durable `--return-final` callbacks when Wakterm advertises the
-  required capability.
+- Let a request ask for a reply that the target sends by tagging a message
+  `[panetone:reply]`, with reminders until it does.
 - Preserve accepted input, explicit pending output, event cursors, request
   UUIDs, and return state in one SQLite database.
 
@@ -176,7 +176,7 @@ target/release/panetone send --queue \
   "When you finish, rerun the benchmark on the corrected data"
 ```
 
-Add `--return-final` when a reply is wanted. The send command exits after target admission. For an idle target, Panetone mirrors the turn's final response to the source route's channel when it arrives and delivers the agent callback when the source agent is idle. A busy target is instead asked, in the message header, to reply with its own `panetone send`, and the acknowledgement says so with `reply_mode: "message"`. A stable `--id UUID` makes a retry idempotent. Panetone permanently reserves completed UUIDs and never automatically retries a prompt whose admission became uncertain.
+Add `--reply` (or its older name `--return-final`) when a reply is wanted. The target then owes the sender a reply: it answers in any turn by writing the answer as normal output with `[panetone:reply]` on its own line, and Panetone delivers that message to the sender as a cross-agent message. `[panetone:progress]` sends an update and keeps the request open. After each turn of the target that ends with a reply still owed, Panetone reminds it once, except after a turn the reminder itself started. `panetone cancel REQUEST_ID` withdraws the request, and `panetone status` lists replies still owed. A tagged reply is never posted to a Signal group that admits other members. [ADR 0006](docs/architecture/0006-tagged-replies.md) gives the design. A stable `--id UUID` makes a retry idempotent. Panetone permanently reserves completed UUIDs and never automatically retries a prompt whose admission became uncertain.
 
 A sender outside Wakterm, such as a remote assistant with shell access, names itself with `--as NAME`, for example `panetone send --as orch --to wakterm "..."`. The target sees `From: orch (external)`, and such a send is one-way, since there is no agent to return a final to. A script that sends notifications this way should follow the [retry rules](docs/control-protocol.md#idempotency-and-retries): stop on exit status 0, and reuse one `--id` per event so a retry never delivers twice. Use `--from ROUTE` to override the calling pane's route for the shared channel mirror and audit identity. A final callback still returns to the exact calling agent while it remains live. If that agent has exited, Panetone falls back to the selected source route's current agent.
 

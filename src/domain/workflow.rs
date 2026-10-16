@@ -14,6 +14,10 @@ pub struct SendCommand {
     pub return_final: bool,
     #[serde(default)]
     pub steer: bool,
+    /// The sender wants a reply: the target owes one until it sends a message
+    /// tagged `[panetone:reply]` or the sender cancels the request.
+    #[serde(default)]
+    pub reply: bool,
     #[serde(default)]
     pub timeout_ms: u64,
 }
@@ -41,6 +45,10 @@ pub fn semantic_request_hash(command: &SendCommand) -> String {
     if command.steer {
         digest.update([0]);
         digest.update(b"steer");
+    }
+    if command.reply {
+        digest.update([0]);
+        digest.update(b"reply");
     }
     format!("{:x}", digest.finalize())
 }
@@ -332,6 +340,7 @@ mod tests {
             message: "hello".into(),
             return_final: false,
             steer: false,
+            reply: false,
             timeout_ms: 0,
         };
         let explicit = omitted.clone();
