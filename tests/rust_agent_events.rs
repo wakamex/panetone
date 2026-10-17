@@ -1467,7 +1467,11 @@ async fn output_observed_long_before_ingest_is_a_replay_and_is_not_posted() {
             100,
             102,
             vec![
-                message(101, "2026-10-13T20:51:57.889Z", "an answer from three days ago"),
+                message(
+                    101,
+                    "2026-10-13T20:51:57.889Z",
+                    "an answer from three days ago",
+                ),
                 message(102, "2026-10-16T22:19:20.000Z", "a new answer"),
             ],
             live_agents(&route),

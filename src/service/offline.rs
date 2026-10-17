@@ -1045,15 +1045,36 @@ fn available_agent(route: &Route) -> Result<AgentBinding, ServiceError> {
         .ok_or_else(|| ServiceError::RouteUnavailable(route.title.clone()))
 }
 
+/// Where Panetone's own notices about a route go: its first channel that only
+/// the owner reads, or its first channel when every one is shared.
 pub(crate) fn channel_destination(route: &Route) -> Result<(ChannelKind, String), ServiceError> {
+    private_destination(route)
+        .or_else(|| route.channels.first().map(binding_destination))
+        .ok_or_else(|| ServiceError::MissingChannel(route.title.clone()))
+}
+
+/// The route's first channel that admits no one but the owner.
+pub(crate) fn private_destination(route: &Route) -> Option<(ChannelKind, String)> {
     route
         .channels
-        .first()
-        .map(|binding| match binding {
-            ChannelBinding::Telegram { topic_id } => (ChannelKind::Telegram, topic_id.to_string()),
-            ChannelBinding::Signal { group_id, .. } => (ChannelKind::Signal, group_id.clone()),
+        .iter()
+        .find(|binding| {
+            !matches!(
+                binding,
+                ChannelBinding::Signal {
+                    allow_members: true,
+                    ..
+                }
+            )
         })
-        .ok_or_else(|| ServiceError::MissingChannel(route.title.clone()))
+        .map(binding_destination)
+}
+
+fn binding_destination(binding: &ChannelBinding) -> (ChannelKind, String) {
+    match binding {
+        ChannelBinding::Telegram { topic_id } => (ChannelKind::Telegram, topic_id.to_string()),
+        ChannelBinding::Signal { group_id, .. } => (ChannelKind::Signal, group_id.clone()),
+    }
 }
 
 fn callback_envelope_from_value(workflow: &StoredWorkflow, returned: &ReturnDelivery) -> String {

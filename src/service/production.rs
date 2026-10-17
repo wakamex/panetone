@@ -1041,15 +1041,19 @@ impl ProductionService {
                         Ok(steering) => steering,
                         // Nothing was written; a later pass retries.
                         Err(WaktermCliError::TargetBlocked(detail)) => {
-                            if now_ms() - item.created_at_ms >= INBOX_WAITING_NOTICE_MS {
-                                self.notify_waiting(&item, route, &detail).await?;
-                            }
                             item.state = "pending".into();
                             item.receipt = None;
                             self.store
-                                .save_inbox(item, "admission_prepared", None)
+                                .save_inbox(item.clone(), "admission_prepared", None)
                                 .await
                                 .map_err(error_string)?;
+                            // The message is pending again before the notice,
+                            // so a failed notice cannot strand it.
+                            if now_ms() - item.created_at_ms >= INBOX_WAITING_NOTICE_MS
+                                && let Err(error) = self.notify_waiting(&item, route, &detail).await
+                            {
+                                tracing::warn!(error = %error, "waiting notice was not posted");
+                            }
                             continue;
                         }
                         Err(error) => {
@@ -1263,13 +1267,39 @@ impl ProductionService {
             &Uuid::NAMESPACE_URL,
             format!("https://panetone.dev/inbox/{kind}/v1").as_bytes(),
         );
+        let id = EffectId::new(Uuid::new_v5(&namespace, item.id.to_string().as_bytes()));
+        // A notice about one message is posted once, even when its reason
+        // changes on a later attempt.
+        if self.store.outbox_exists(id).await.map_err(error_string)? {
+            return Ok(());
+        }
+        // A notice about Panetone's own delivery is for the owner, so a
+        // message from a shared group is answered in a private channel.
+        let shared = route.channels.iter().any(|binding| {
+            matches!(
+                binding,
+                ChannelBinding::Signal {
+                    group_id,
+                    allow_members: true,
+                    ..
+                } if group_id.trim_end_matches('=') == item.destination.trim_end_matches('=')
+            )
+        });
+        let (kind, destination) = if shared {
+            match crate::service::offline::private_destination(route) {
+                Some(private) => private,
+                None => return Ok(()),
+            }
+        } else {
+            (item.channel, item.destination.clone())
+        };
         let notice = OutboxItem {
-            id: EffectId::new(Uuid::new_v5(&namespace, item.id.to_string().as_bytes())),
+            id,
             route_id: Some(route.id),
             sender_harness: None,
             source_agent: None,
-            kind: item.channel,
-            destination: item.destination.clone(),
+            kind,
+            destination,
             body,
             attachments: Vec::new(),
             actions: Vec::new(),
@@ -3993,7 +4023,15 @@ fi
                 Route {
                     id: RouteId::new(Uuid::new_v4()),
                     title: "route".into(),
-                    channels: vec![ChannelBinding::Telegram { topic_id: 10 }],
+                    channels: vec![
+                        ChannelBinding::Telegram { topic_id: 10 },
+                        ChannelBinding::Signal {
+                            group_id: "shared-group".into(),
+                            allow_members: true,
+                            account: None,
+                            direct: false,
+                        },
+                    ],
                     agent: None,
                 },
                 1,
@@ -4042,9 +4080,10 @@ fi
         store
             .accept_inbox(InboxItem {
                 id: EffectId::new(Uuid::from_u128(127)),
-                channel: ChannelKind::Telegram,
                 external_id: "update-4".into(),
-                destination: "10".into(),
+                // From the shared group, so the notice goes to the owner's topic.
+                channel: ChannelKind::Signal,
+                destination: "shared-group".into(),
                 sender_id: Some("42".into()),
                 sender: Some("Mihai".into()),
                 reply_to_external_id: None,
@@ -4061,6 +4100,8 @@ fi
             assert_eq!(service.inbox_once().await.unwrap(), 2);
             let notices = store.pending_outbox().await.unwrap();
             assert_eq!(notices.len(), 1);
+            assert_eq!(notices[0].kind, ChannelKind::Telegram);
+            assert_eq!(notices[0].destination, "10");
             assert_eq!(
                 notices[0].body,
                 "[waiting] route cannot take your message yet: input_blocked: the target is waiting for dialog open. Panetone delivers it when the pane can take input; do not resend."

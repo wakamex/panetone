@@ -434,6 +434,20 @@ impl StoreHandle {
             .await
     }
 
+    pub async fn outbox_exists(&self, id: EffectId) -> StoreResult<bool> {
+        self.run(move |connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT 1 FROM outbox WHERE effect_id = ?1",
+                    params![id.to_string()],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some())
+        })
+        .await
+    }
+
     pub async fn reply_debt(&self, request_id: WorkflowId) -> StoreResult<Option<ReplyDebt>> {
         self.run(move |connection| replies::debt(connection, request_id))
             .await
