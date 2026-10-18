@@ -705,7 +705,11 @@ async fn telegram_loop(
                         error = %error,
                         "Telegram approval response was rejected"
                     );
-                    "This approval is stale or unavailable".to_string()
+                    // Wakterm's reason says what happened to the menu, such as
+                    // which row its cursor was left on.
+                    let reason = error.rsplit("reason: \"").next().unwrap_or(&error);
+                    let reason = reason.split('"').next().unwrap_or(reason);
+                    format!("Not applied: {}", truncate_chars(reason, 180))
                 }
             };
             poller
@@ -867,6 +871,13 @@ async fn signal_loop(
                 }
             }
         }
+    }
+}
+
+fn truncate_chars(text: &str, limit: usize) -> String {
+    match text.char_indices().nth(limit) {
+        Some((end, _)) => format!("{}...", &text[..end]),
+        None => text.to_owned(),
     }
 }
 

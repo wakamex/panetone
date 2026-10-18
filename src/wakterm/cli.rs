@@ -26,6 +26,9 @@ const ADMISSION_CONFIRMATION_WINDOW: Duration = Duration::from_secs(15);
 /// How long Wakterm waits for the target to record a steer before reporting it
 /// unacknowledged (`wakterm agent send`'s default).
 const STEER_ACK_WINDOW: Duration = Duration::from_secs(10);
+/// How long Wakterm may take to answer a menu: up to 20 seconds per row the
+/// cursor moves and 20 more for the menu to close.
+const APPROVAL_RESOLUTION_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct AgentApiCapabilities {
@@ -690,7 +693,12 @@ impl WaktermCli {
             }
             args.extend(["--answers", answers]);
         }
-        let resolution: ApprovalResolution = self.run_json(&args, None).await?;
+        // Wakterm moves a menu's cursor one row at a time and waits for a slow
+        // pane to redraw before each key, so a tap can take a while.
+        let output = self
+            .run_command(&args, None, true, self.deadline + APPROVAL_RESOLUTION_WINDOW)
+            .await?;
+        let resolution: ApprovalResolution = serde_json::from_slice(&output)?;
         if resolution.schema != "wakterm.agent-approval.v1"
             || resolution.request_id != request_id
             || resolution.agent_id != agent_id
