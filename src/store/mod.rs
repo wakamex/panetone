@@ -1582,10 +1582,14 @@ fn ingest_agent_events(
             // A message tagged as a reply settles or reports the debt it
             // names, and is shown without its tag.
             let tagged = match (&approval, visible_body.as_deref()) {
-                (None, Some(body)) if event.kind == "assistant_message" => replies::find_tag(body),
+                (None, Some(body)) if event.kind == "assistant_message" => replies::find_tags(body),
                 _ => None,
             };
-            if let Some((kind, named, rest)) = &tagged {
+            for (index, (kind, named, section)) in tagged
+                .iter()
+                .flat_map(|tagged| tagged.sections.iter())
+                .enumerate()
+            {
                 let namespace = Uuid::new_v5(
                     &Uuid::NAMESPACE_URL,
                     b"https://panetone.dev/replies/tagged/v1",
@@ -1594,13 +1598,13 @@ fn ingest_agent_events(
                     &transaction,
                     EffectId::new(Uuid::new_v5(
                         &namespace,
-                        format!("{}\0{}", event.incarnation_id, event.event_id).as_bytes(),
+                        format!("{}\0{}\0{index}", event.incarnation_id, event.event_id).as_bytes(),
                     )),
                     &event.agent_id,
                     route.id,
                     *kind,
                     named.as_deref(),
-                    rest,
+                    section,
                     now_ms,
                 )?;
             }
@@ -1641,7 +1645,7 @@ fn ingest_agent_events(
             // A reply never appears in a group whose other members are not
             // its audience; the route's Telegram topic shows it instead.
             let destination = match (&tagged, destination) {
-                (Some((_, _, rest)), _) if rest.is_empty() => None,
+                (Some(tagged), _) if tagged.clean.is_empty() => None,
                 (Some(_), Some((ChannelKind::Signal, group))) if shared_group(route, &group) => {
                     route.channels.iter().find_map(|binding| match binding {
                         crate::domain::ChannelBinding::Telegram { topic_id } => {
@@ -1725,7 +1729,7 @@ fn ingest_agent_events(
                 }
                 None => {
                     let text = match tagged {
-                        Some((_, _, rest)) => rest,
+                        Some(tagged) => tagged.clean,
                         None => visible_body.expect("visible output was checked"),
                     };
                     let (body, attachments) = visible_attachments(text);

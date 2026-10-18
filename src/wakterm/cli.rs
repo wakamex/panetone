@@ -696,7 +696,12 @@ impl WaktermCli {
         // Wakterm moves a menu's cursor one row at a time and waits for a slow
         // pane to redraw before each key, so a tap can take a while.
         let output = self
-            .run_command(&args, None, true, self.deadline + APPROVAL_RESOLUTION_WINDOW)
+            .run_command(
+                &args,
+                None,
+                true,
+                self.deadline + APPROVAL_RESOLUTION_WINDOW,
+            )
             .await?;
         let resolution: ApprovalResolution = serde_json::from_slice(&output)?;
         if resolution.schema != "wakterm.agent-approval.v1"

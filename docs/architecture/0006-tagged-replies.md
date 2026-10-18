@@ -27,6 +27,8 @@ The target writes its answer as normal output and puts `[panetone:reply]` on its
 
 `[panetone:progress]` or `[panetone:progress ID]` delivers the message as an update and keeps the debt open.
 
+One message can answer several requests: with more than one tag, each tag takes the text since the previous tag, and the last also takes any text after it.
+
 The reply reaches the sender as a cross-agent message from the target, opening with the request ID and the first line of the request, so a sender that asked several agents, or whose context was compacted, knows what the answer is for. It is delivered like any other send: into the sender's active turn when it is busy, or as a new turn.
 
 A tag that names no open debt, or a bare tag while several are open, delivers nothing; the next reminder reports it.

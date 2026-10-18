@@ -175,12 +175,24 @@ pub(super) enum TagKind {
     Progress,
 }
 
-/// Finds a standalone reply or progress tag outside code in a message.
-/// Returns the tag, the request ID or prefix it names, and the message
-/// without the tag line.
-pub(super) fn find_tag(body: &str) -> Option<(TagKind, Option<String>, String)> {
-    let mut found = None;
+/// The reply and progress tags in one message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct Tagged {
+    /// Each tag with the request ID or prefix it names and the text it
+    /// answers. One tag answers with the whole message. With several, each
+    /// takes the text since the previous tag, and the last also takes any
+    /// text after it.
+    pub sections: Vec<(TagKind, Option<String>, String)>,
+    /// The message without its tag lines, as shown in the agent's chat.
+    pub clean: String,
+}
+
+/// Finds the standalone reply and progress tags outside code in a message.
+pub(super) fn find_tags(body: &str) -> Option<Tagged> {
+    let mut tags = Vec::new();
     let mut retained = Vec::new();
+    // The retained lines before each tag, so each section can be cut out.
+    let mut boundaries = Vec::new();
     let mut fence: Option<&str> = None;
     for line in body.split('\n') {
         let trimmed = line.trim();
@@ -211,12 +223,42 @@ pub(super) fn find_tag(body: &str) -> Option<(TagKind, Option<String>, String)> 
                 Some((kind, (!id.is_empty()).then(|| id.to_owned())))
             });
         match tag {
-            Some(tag) if !indented && found.is_none() => found = Some(tag),
+            Some(tag) if !indented => {
+                tags.push(tag);
+                boundaries.push(retained.len());
+            }
             _ => retained.push(line),
         }
     }
-    let (kind, id) = found?;
-    Some((kind, id, retained.join("\n").trim().to_owned()))
+    if tags.is_empty() {
+        return None;
+    }
+    let text = |lines: &[&str]| lines.join("\n").trim().to_owned();
+    // A removed tag line leaves no extra blank lines behind.
+    let mut clean = text(&retained);
+    while clean.contains("\n\n\n") {
+        clean = clean.replace("\n\n\n", "\n\n");
+    }
+    let sections = if tags.len() == 1 {
+        tags.into_iter()
+            .map(|(kind, id)| (kind, id, clean.clone()))
+            .collect()
+    } else {
+        let count = tags.len();
+        tags.into_iter()
+            .enumerate()
+            .map(|(index, (kind, id))| {
+                let start = if index == 0 { 0 } else { boundaries[index - 1] };
+                let end = if index + 1 == count {
+                    retained.len()
+                } else {
+                    boundaries[index]
+                };
+                (kind, id, text(&retained[start..end]))
+            })
+            .collect()
+    };
+    Some(Tagged { sections, clean })
 }
 
 /// Settles or reports a tag an agent wrote, in the event ingest transaction.
@@ -461,7 +503,11 @@ pub(super) fn record_reminder(
 
 #[cfg(test)]
 mod tests {
-    use super::{TagKind, find_tag};
+    use super::{TagKind, find_tags};
+
+    fn find_tag(body: &str) -> Option<(TagKind, Option<String>, String)> {
+        find_tags(body).map(|tagged| tagged.sections[0].clone())
+    }
 
     #[test]
     fn a_standalone_tag_outside_code_is_found_and_removed() {
@@ -486,5 +532,32 @@ mod tests {
         ] {
             assert_eq!(find_tag(text), None, "{text:?}");
         }
+    }
+
+    #[test]
+    fn several_tags_each_answer_the_text_before_them() {
+        let tagged = find_tags(
+            "It shipped as gs_update.\n\n[panetone:reply a85a1456]\n\nThe same answer covers your follow-up.\n\n[panetone:reply d2e9a870]",
+        )
+        .unwrap();
+        assert_eq!(
+            tagged.sections,
+            [
+                (
+                    TagKind::Final,
+                    Some("a85a1456".into()),
+                    "It shipped as gs_update.".into()
+                ),
+                (
+                    TagKind::Final,
+                    Some("d2e9a870".into()),
+                    "The same answer covers your follow-up.".into()
+                ),
+            ]
+        );
+        assert_eq!(
+            tagged.clean,
+            "It shipped as gs_update.\n\nThe same answer covers your follow-up."
+        );
     }
 }
