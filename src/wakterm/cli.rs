@@ -13,7 +13,7 @@ use tokio::sync::{Mutex, OnceCell};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::domain::{AdmissionReceipt, AgentBinding, EffectId};
+use crate::domain::{AdmissionReceipt, AdmissionStatus, AgentBinding, EffectId};
 
 use super::{AgentCatalog, ContractError, EventRead, EventRecord, join_catalog_binding};
 
@@ -329,6 +329,18 @@ impl LiveRouteSnapshot {
         &self.routes
     }
 
+    /// Makes `agent` the only agent of the route titled `title`, replacing any
+    /// Wakterm agents with that title, as for a route an endchat profile
+    /// serves.
+    pub fn serve_route(&mut self, title: &str, agent: AgentBinding) {
+        self.routes
+            .retain(|route| !route.title.eq_ignore_ascii_case(title));
+        self.routes.push(LiveRoute {
+            title: title.into(),
+            agents: vec![agent],
+        });
+    }
+
     /// Whether the agent is working on a turn rather than waiting for input.
     pub fn is_working(&self, agent: &AgentBinding) -> bool {
         self.working.contains(&agent.agent_id)
@@ -592,6 +604,9 @@ impl WaktermCli {
     ) -> Result<AdmissionReceipt, WaktermCliError> {
         if prompt.len() > MAX_PROMPT_BYTES {
             return Err(WaktermCliError::InputTooLarge(MAX_PROMPT_BYTES));
+        }
+        if let Some(profile) = crate::endchat::profile(binding) {
+            return endchat_admit(request_id, binding, profile, prompt).await;
         }
         self.capabilities().await?;
         let _writing = self.pane_write(binding).await;
@@ -981,6 +996,36 @@ fn parse_event_page(
             "event page status or payload is invalid",
         )),
     }
+}
+
+/// Delivers a prompt to an endchat profile, which takes every message: one
+/// sent during a turn joins that turn. A connection that fails before anything
+/// is written is reported as unavailable so the message can be offered again.
+async fn endchat_admit(
+    request_id: EffectId,
+    binding: &AgentBinding,
+    profile: &str,
+    prompt: &str,
+) -> Result<AdmissionReceipt, WaktermCliError> {
+    let (status, definitive, prompt_written, detail) =
+        match crate::endchat::say(profile, prompt).await {
+            Ok(()) => (AdmissionStatus::Accepted, true, true, None),
+            Err(crate::endchat::SayError::NotSent(detail)) => {
+                (AdmissionStatus::Unavailable, true, false, Some(detail))
+            }
+            Err(crate::endchat::SayError::Uncertain(detail)) => {
+                (AdmissionStatus::Indeterminate, false, true, Some(detail))
+            }
+        };
+    Ok(AdmissionReceipt {
+        request_id,
+        status,
+        definitive,
+        prompt_written: Some(prompt_written),
+        agent_id: Some(binding.agent_id.clone()),
+        incarnation_id: Some(binding.incarnation_id.clone()),
+        detail,
+    })
 }
 
 fn validate_live_events(

@@ -216,6 +216,12 @@ struct RouteEnsureArgs {
         help = "Give this route the owner's direct messages to the serving Signal account"
     )]
     signal_direct: bool,
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Serve this existing route from an endchat profile directory instead of a Wakterm agent, or `none` to return it to Wakterm"
+    )]
+    endchat_profile: Option<String>,
     #[command(flatten)]
     control: ControlSocketArgs,
 }
@@ -292,6 +298,7 @@ enum ProductionWorker {
     RouteHealth,
     Typing,
     Replies,
+    Endchat,
 }
 
 async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
@@ -408,6 +415,7 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
         ("route-health", ProductionWorker::RouteHealth),
         ("typing", ProductionWorker::Typing),
         ("replies", ProductionWorker::Replies),
+        ("endchat", ProductionWorker::Endchat),
     ] {
         let service = handler.clone();
         let shutdown = supervisor.shutdown_receiver();
@@ -624,6 +632,7 @@ async fn run_production_worker(
         ProductionWorker::Inbox => service.inbox_once().await?,
         ProductionWorker::RouteHealth => service.route_health_once().await?,
         ProductionWorker::Replies => service.replies_once().await?,
+        ProductionWorker::Endchat => service.endchat_once().await?,
         // The indicator is cosmetic, so a failed pass is not a daemon problem.
         ProductionWorker::Typing => service.typing_once().await.unwrap_or_else(|error| {
             tracing::debug!(error = %error, "typing indicator pass failed");
@@ -1044,6 +1053,7 @@ async fn run_route(args: RouteArgs) -> Result<()> {
                 signal_allow_members: args.signal_allow_members,
                 signal_account: args.signal_account,
                 signal_direct: args.signal_direct,
+                endchat_profile: args.endchat_profile,
             })?,
         ),
     };

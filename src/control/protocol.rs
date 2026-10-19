@@ -71,6 +71,10 @@ pub struct RouteEnsureParams {
     /// Send the owner's direct messages to the serving account to this route.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub signal_direct: bool,
+    /// The endchat profile directory that serves an existing route instead of
+    /// a Wakterm agent, or `none` to return it to Wakterm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endchat_profile: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

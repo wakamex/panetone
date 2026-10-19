@@ -8,7 +8,7 @@ use std::thread::{self, JoinHandle};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -444,6 +444,31 @@ impl StoreHandle {
                 )
                 .optional()?
                 .is_some())
+        })
+        .await
+    }
+
+    /// Records an endchat profile's agent messages as that route's output and
+    /// saves where the log reader stopped, in one transaction.
+    pub async fn ingest_endchat_messages(
+        &self,
+        route_id: RouteId,
+        agent: AgentBinding,
+        messages: Vec<crate::endchat::AgentMessage>,
+        cursor_key: String,
+        cursor: String,
+        now_ms: i64,
+    ) -> StoreResult<EventIngestOutcome> {
+        self.run(move |connection| {
+            ingest_endchat_messages(
+                connection,
+                route_id,
+                agent,
+                &messages,
+                &cursor_key,
+                &cursor,
+                now_ms,
+            )
         })
         .await
     }
@@ -1438,6 +1463,377 @@ fn get_approval(connection: &Connection, request_id: &str) -> StoreResult<Option
     .transpose()
 }
 
+/// Records one agent event and projects any visible output or approval it
+/// carries to its route's channel.
+fn ingest_event(
+    transaction: &Transaction<'_>,
+    event: &EventRecord,
+    routes: &[Route],
+    route_agents: &[RouteAgent],
+    preferences: &std::collections::BTreeMap<String, String>,
+    now_ms: i64,
+    outcome: &mut EventIngestOutcome,
+) -> StoreResult<()> {
+    let record_json = serde_json::to_string(event)?;
+    if let Some((stored_id, stored_json)) = transaction
+        .query_row(
+            "SELECT event_id, record_json FROM agent_events WHERE sequence = ?1",
+            params![event.sequence],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+    {
+        if stored_id != event.event_id || stored_json != record_json {
+            return Err(StoreError::Conflict(format!(
+                "Wakterm event sequence {} changed content",
+                event.sequence
+            )));
+        }
+        return Ok(());
+    }
+    if transaction
+        .query_row(
+            "SELECT 1 FROM agent_events WHERE event_id = ?1 AND incarnation_id = ?2",
+            params![event.event_id, event.incarnation_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some()
+    {
+        return Err(StoreError::Conflict(format!(
+            "Wakterm event ID {:?} appeared at another sequence",
+            event.event_id
+        )));
+    }
+
+    let matching = route_agents
+        .iter()
+        .filter(|candidate| {
+            candidate.agent.agent_id == event.agent_id
+                && candidate.agent.incarnation_id == event.incarnation_id
+        })
+        .collect::<Vec<_>>();
+    if matching.len() > 1 {
+        return Err(StoreError::Conflict(format!(
+            "Wakterm event {:?} matches more than one durable route",
+            event.event_id
+        )));
+    }
+    let route_agent = matching.first().copied();
+    let route = route_agent
+        .and_then(|candidate| routes.iter().find(|route| route.id == candidate.route_id));
+    if route_agent.is_some() && route.is_none() {
+        return Err(StoreError::Conflict(
+            "live agent projection references a missing route".into(),
+        ));
+    }
+
+    let mut state = "recorded";
+    let route_id = route.map(|route| route.id);
+    let approval = event
+        .approval()
+        .map_err(|detail| StoreError::Conflict(detail.into()))?;
+    let visible_body = event
+        .visible_output_body()
+        .map_err(|detail| StoreError::Conflict(detail.into()))?
+        .map(|body| strip_memory_citations(&body))
+        .filter(|body| !body.trim().is_empty());
+    // Output an agent produced long before Panetone saw it is a replay of
+    // its history, such as a new incarnation reporting its transcript
+    // again; it was shown when it was new.
+    if visible_body.is_some()
+        && approval.is_none()
+        && event
+            .observed_at_ms()
+            .is_some_and(|observed| now_ms - observed > STALE_OUTPUT_MS)
+    {
+        insert_agent_event(transaction, event, route_id, "stale", &record_json, now_ms)?;
+        outcome.recorded += 1;
+        return Ok(());
+    }
+    if approval.is_some() || visible_body.is_some() {
+        let Some(route) = route else {
+            state = "unrouted";
+            outcome.unrouted += 1;
+            insert_agent_event(transaction, event, None, state, &record_json, now_ms)?;
+            outcome.recorded += 1;
+            return Ok(());
+        };
+        if event.kind == "assistant_message"
+            && visible_body
+                .as_deref()
+                .is_some_and(|body| body.trim() == NO_REPLY)
+        {
+            state = "suppressed";
+            if let Some(candidate) = route_agent {
+                outcome.remember_last_agent(candidate);
+            }
+            insert_agent_event(
+                transaction,
+                event,
+                Some(route.id),
+                state,
+                &record_json,
+                now_ms,
+            )?;
+            outcome.recorded += 1;
+            return Ok(());
+        }
+        // A message tagged as a reply settles or reports the debt it
+        // names, and is shown without its tag.
+        let tagged = match (&approval, visible_body.as_deref()) {
+            (None, Some(body)) if event.kind == "assistant_message" => replies::find_tags(body),
+            _ => None,
+        };
+        for (index, (kind, named, section)) in tagged
+            .iter()
+            .flat_map(|tagged| tagged.sections.iter())
+            .enumerate()
+        {
+            let namespace = Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                b"https://panetone.dev/replies/tagged/v1",
+            );
+            replies::record_tag(
+                transaction,
+                EffectId::new(Uuid::new_v5(
+                    &namespace,
+                    format!("{}\0{}\0{index}", event.incarnation_id, event.event_id).as_bytes(),
+                )),
+                &event.agent_id,
+                route.id,
+                *kind,
+                named.as_deref(),
+                section,
+                now_ms,
+            )?;
+        }
+        let destination = if approval.is_some() {
+            route.channels.iter().find_map(|binding| match binding {
+                crate::domain::ChannelBinding::Telegram { topic_id } => {
+                    Some((ChannelKind::Telegram, topic_id.to_string()))
+                }
+                crate::domain::ChannelBinding::Signal { .. } => None,
+            })
+        } else {
+            let preference = preferences.get(&route.id.to_string()).map(String::as_str);
+            // Where a turn's output goes follows the message that started
+            // it, so a reply to a direct message can never reach the
+            // group because a group message arrived meanwhile, and a
+            // reply to the group never goes to a direct chat.
+            let origin = turn_origin(transaction, event)?;
+            let preference = match &origin {
+                Some((ChannelKind::Signal, destination))
+                    if destination.starts_with(crate::domain::SIGNAL_DIRECT_PREFIX) =>
+                {
+                    Some(format!("sig:{destination}"))
+                }
+                Some((ChannelKind::Signal, _))
+                    if preference.is_some_and(|value| value.starts_with("sig:")) =>
+                {
+                    Some("sig".to_owned())
+                }
+                Some((ChannelKind::Telegram, _))
+                    if preference.is_some_and(|value| value.starts_with("sig:")) =>
+                {
+                    Some("tg".to_owned())
+                }
+                _ => preference.map(str::to_owned),
+            };
+            output_destination(route, preference.as_deref())
+        };
+        // A reply never appears in a group whose other members are not
+        // its audience; the route's Telegram topic shows it instead.
+        let destination = match (&tagged, destination) {
+            (Some(tagged), _) if tagged.clean.is_empty() => None,
+            (Some(_), Some((ChannelKind::Signal, group))) if shared_group(route, &group) => {
+                route.channels.iter().find_map(|binding| match binding {
+                    crate::domain::ChannelBinding::Telegram { topic_id } => {
+                        Some((ChannelKind::Telegram, topic_id.to_string()))
+                    }
+                    crate::domain::ChannelBinding::Signal { .. } => None,
+                })
+            }
+            (_, destination) => destination,
+        };
+        let Some((kind, destination)) = destination else {
+            state = "unrouted";
+            outcome.unrouted += 1;
+            insert_agent_event(
+                transaction,
+                event,
+                Some(route.id),
+                state,
+                &record_json,
+                now_ms,
+            )?;
+            outcome.recorded += 1;
+            return Ok(());
+        };
+        let (body, attachments, actions) = match approval {
+            Some(approval) if crate::wakterm::form::answerable(&approval) => {
+                let state = crate::wakterm::form::FormState::default();
+                (
+                    crate::wakterm::form::text(&approval, &state),
+                    Vec::new(),
+                    crate::wakterm::form::actions(&approval, &state),
+                )
+            }
+            Some(approval) => {
+                // Only a command approval asks to approve something; every
+                // other kind, including ones Panetone does not know, is a
+                // choice the agent is waiting on.
+                let mut body = if approval.kind == "command_approval" {
+                    "Approval needed".to_string()
+                } else {
+                    "Input needed".to_string()
+                };
+                if let Some(prompt) = approval.prompt.as_deref() {
+                    body.push_str("\n\n");
+                    body.push_str(prompt);
+                }
+                if let Some(command) = approval.command.as_deref() {
+                    body.push_str("\n\nCommand:\n");
+                    body.push_str(command);
+                }
+                if let Some(reason) = approval.reason.as_deref() {
+                    body.push_str("\n\nReason: ");
+                    body.push_str(reason);
+                }
+                if approval.kind == "user_question_form" {
+                    body.push_str(
+                        "\n\nThis form has several questions, so answer it in the agent's pane.",
+                    );
+                }
+                if approval.kind == "user_question" {
+                    for (index, choice) in approval.choices.iter().enumerate() {
+                        if let Some(description) = choice.description.as_deref() {
+                            body.push_str(&format!(
+                                "\n\n{}. {}: {}",
+                                index + 1,
+                                choice.label,
+                                description
+                            ));
+                        }
+                    }
+                }
+                let actions = approval
+                    .choices
+                    .into_iter()
+                    .map(|choice| crate::domain::OutboxAction {
+                        id: format!("wakap:{}:{}", approval.request_id, choice.id),
+                        label: choice.label,
+                    })
+                    .collect();
+                (body, Vec::new(), actions)
+            }
+            None => {
+                let text = match tagged {
+                    Some(tagged) => tagged.clean,
+                    None => visible_body.expect("visible output was checked"),
+                };
+                let (body, attachments) = visible_attachments(text);
+                (body, attachments, Vec::new())
+            }
+        };
+        let namespace = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            b"https://panetone.dev/wakterm/events/v1",
+        );
+        let item = OutboxItem {
+            id: EffectId::new(Uuid::new_v5(
+                &namespace,
+                format!("{}\0{}", event.incarnation_id, event.event_id).as_bytes(),
+            )),
+            route_id: Some(route.id),
+            // Interactive callbacks must use the one Telegram bot that owns
+            // the inbound update cursor. Harness-specific bots remain
+            // appropriate for ordinary one-way output.
+            sender_harness: if actions.is_empty() {
+                route_agent.map(|candidate| candidate.agent.harness.clone())
+            } else {
+                None
+            },
+            source_agent: route_agent.map(|candidate| candidate.agent.clone()),
+            kind,
+            destination,
+            body,
+            attachments,
+            actions,
+            state: OutboxState::Pending,
+            attempts: 0,
+            last_error: None,
+            external_receipt: None,
+            uncertain_attempts: 0,
+        };
+        for chunk in crate::domain::chunk_outbox(item) {
+            enqueue_outbox(transaction, None, &chunk, now_ms)?;
+        }
+        state = "projected";
+        outcome.visible_outputs += 1;
+        if let Some(candidate) = route_agent {
+            outcome.remember_last_agent(candidate);
+        }
+    }
+    insert_agent_event(transaction, event, route_id, state, &record_json, now_ms)?;
+    outcome.recorded += 1;
+    Ok(())
+}
+
+/// Endchat messages are kept beside Wakterm's events under sequence numbers
+/// far above any Wakterm uses, each tagged with its endchat agent.
+const ENDCHAT_SEQUENCE_BASE: u64 = 1 << 60;
+
+#[allow(clippy::too_many_arguments)]
+fn ingest_endchat_messages(
+    connection: &mut Connection,
+    route_id: RouteId,
+    agent: AgentBinding,
+    messages: &[crate::endchat::AgentMessage],
+    cursor_key: &str,
+    cursor: &str,
+    now_ms: i64,
+) -> StoreResult<EventIngestOutcome> {
+    let transaction = connection.transaction()?;
+    let routes = list_routes(&transaction)?;
+    let preferences = route_preferences(&transaction)?;
+    let route_agents = [RouteAgent { route_id, agent }];
+    let mut outcome = EventIngestOutcome::default();
+    let mut count = get_metadata(&transaction, "endchat_event_count")?
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    for message in messages {
+        count += 1;
+        let mut fields = serde_json::Map::new();
+        fields.insert("text".into(), message.text.clone().into());
+        fields.insert("observed_at".into(), message.date.clone().into());
+        if let Some(run) = &message.run {
+            fields.insert("turn_id".into(), run.clone().into());
+        }
+        let event = EventRecord {
+            sequence: ENDCHAT_SEQUENCE_BASE + count,
+            event_id: format!("endchat-{}", message.i),
+            kind: "assistant_message".into(),
+            agent_id: route_agents[0].agent.agent_id.clone(),
+            incarnation_id: route_agents[0].agent.incarnation_id.clone(),
+            fields,
+        };
+        ingest_event(
+            &transaction,
+            &event,
+            &routes,
+            &route_agents,
+            &preferences,
+            now_ms,
+            &mut outcome,
+        )?;
+    }
+    set_metadata(&transaction, "endchat_event_count", &count.to_string())?;
+    set_metadata(&transaction, cursor_key, cursor)?;
+    transaction.commit()?;
+    Ok(outcome)
+}
+
 fn ingest_agent_events(
     connection: &mut Connection,
     expected: u64,
@@ -1474,309 +1870,15 @@ fn ingest_agent_events(
     };
 
     for event in events {
-        let record_json = serde_json::to_string(event)?;
-        if let Some((stored_id, stored_json)) = transaction
-            .query_row(
-                "SELECT event_id, record_json FROM agent_events WHERE sequence = ?1",
-                params![event.sequence],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?
-        {
-            if stored_id != event.event_id || stored_json != record_json {
-                return Err(StoreError::Conflict(format!(
-                    "Wakterm event sequence {} changed content",
-                    event.sequence
-                )));
-            }
-            continue;
-        }
-        if transaction
-            .query_row(
-                "SELECT 1 FROM agent_events WHERE event_id = ?1 AND incarnation_id = ?2",
-                params![event.event_id, event.incarnation_id],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some()
-        {
-            return Err(StoreError::Conflict(format!(
-                "Wakterm event ID {:?} appeared at another sequence",
-                event.event_id
-            )));
-        }
-
-        let matching = route_agents
-            .iter()
-            .filter(|candidate| {
-                candidate.agent.agent_id == event.agent_id
-                    && candidate.agent.incarnation_id == event.incarnation_id
-            })
-            .collect::<Vec<_>>();
-        if matching.len() > 1 {
-            return Err(StoreError::Conflict(format!(
-                "Wakterm event {:?} matches more than one durable route",
-                event.event_id
-            )));
-        }
-        let route_agent = matching.first().copied();
-        let route = route_agent
-            .and_then(|candidate| routes.iter().find(|route| route.id == candidate.route_id));
-        if route_agent.is_some() && route.is_none() {
-            return Err(StoreError::Conflict(
-                "live agent projection references a missing route".into(),
-            ));
-        }
-
-        let mut state = "recorded";
-        let route_id = route.map(|route| route.id);
-        let approval = event
-            .approval()
-            .map_err(|detail| StoreError::Conflict(detail.into()))?;
-        let visible_body = event
-            .visible_output_body()
-            .map_err(|detail| StoreError::Conflict(detail.into()))?
-            .map(|body| strip_memory_citations(&body))
-            .filter(|body| !body.trim().is_empty());
-        // Output an agent produced long before Panetone saw it is a replay of
-        // its history, such as a new incarnation reporting its transcript
-        // again; it was shown when it was new.
-        if visible_body.is_some()
-            && approval.is_none()
-            && event
-                .observed_at_ms()
-                .is_some_and(|observed| now_ms - observed > STALE_OUTPUT_MS)
-        {
-            insert_agent_event(&transaction, event, route_id, "stale", &record_json, now_ms)?;
-            outcome.recorded += 1;
-            continue;
-        }
-        if approval.is_some() || visible_body.is_some() {
-            let Some(route) = route else {
-                state = "unrouted";
-                outcome.unrouted += 1;
-                insert_agent_event(&transaction, event, None, state, &record_json, now_ms)?;
-                outcome.recorded += 1;
-                continue;
-            };
-            if event.kind == "assistant_message"
-                && visible_body
-                    .as_deref()
-                    .is_some_and(|body| body.trim() == NO_REPLY)
-            {
-                state = "suppressed";
-                if let Some(candidate) = route_agent {
-                    outcome.remember_last_agent(candidate);
-                }
-                insert_agent_event(
-                    &transaction,
-                    event,
-                    Some(route.id),
-                    state,
-                    &record_json,
-                    now_ms,
-                )?;
-                outcome.recorded += 1;
-                continue;
-            }
-            // A message tagged as a reply settles or reports the debt it
-            // names, and is shown without its tag.
-            let tagged = match (&approval, visible_body.as_deref()) {
-                (None, Some(body)) if event.kind == "assistant_message" => replies::find_tags(body),
-                _ => None,
-            };
-            for (index, (kind, named, section)) in tagged
-                .iter()
-                .flat_map(|tagged| tagged.sections.iter())
-                .enumerate()
-            {
-                let namespace = Uuid::new_v5(
-                    &Uuid::NAMESPACE_URL,
-                    b"https://panetone.dev/replies/tagged/v1",
-                );
-                replies::record_tag(
-                    &transaction,
-                    EffectId::new(Uuid::new_v5(
-                        &namespace,
-                        format!("{}\0{}\0{index}", event.incarnation_id, event.event_id).as_bytes(),
-                    )),
-                    &event.agent_id,
-                    route.id,
-                    *kind,
-                    named.as_deref(),
-                    section,
-                    now_ms,
-                )?;
-            }
-            let destination = if approval.is_some() {
-                route.channels.iter().find_map(|binding| match binding {
-                    crate::domain::ChannelBinding::Telegram { topic_id } => {
-                        Some((ChannelKind::Telegram, topic_id.to_string()))
-                    }
-                    crate::domain::ChannelBinding::Signal { .. } => None,
-                })
-            } else {
-                let preference = preferences.get(&route.id.to_string()).map(String::as_str);
-                // Where a turn's output goes follows the message that started
-                // it, so a reply to a direct message can never reach the
-                // group because a group message arrived meanwhile, and a
-                // reply to the group never goes to a direct chat.
-                let origin = turn_origin(&transaction, event)?;
-                let preference = match &origin {
-                    Some((ChannelKind::Signal, destination))
-                        if destination.starts_with(crate::domain::SIGNAL_DIRECT_PREFIX) =>
-                    {
-                        Some(format!("sig:{destination}"))
-                    }
-                    Some((ChannelKind::Signal, _))
-                        if preference.is_some_and(|value| value.starts_with("sig:")) =>
-                    {
-                        Some("sig".to_owned())
-                    }
-                    Some((ChannelKind::Telegram, _))
-                        if preference.is_some_and(|value| value.starts_with("sig:")) =>
-                    {
-                        Some("tg".to_owned())
-                    }
-                    _ => preference.map(str::to_owned),
-                };
-                output_destination(route, preference.as_deref())
-            };
-            // A reply never appears in a group whose other members are not
-            // its audience; the route's Telegram topic shows it instead.
-            let destination = match (&tagged, destination) {
-                (Some(tagged), _) if tagged.clean.is_empty() => None,
-                (Some(_), Some((ChannelKind::Signal, group))) if shared_group(route, &group) => {
-                    route.channels.iter().find_map(|binding| match binding {
-                        crate::domain::ChannelBinding::Telegram { topic_id } => {
-                            Some((ChannelKind::Telegram, topic_id.to_string()))
-                        }
-                        crate::domain::ChannelBinding::Signal { .. } => None,
-                    })
-                }
-                (_, destination) => destination,
-            };
-            let Some((kind, destination)) = destination else {
-                state = "unrouted";
-                outcome.unrouted += 1;
-                insert_agent_event(
-                    &transaction,
-                    event,
-                    Some(route.id),
-                    state,
-                    &record_json,
-                    now_ms,
-                )?;
-                outcome.recorded += 1;
-                continue;
-            };
-            let (body, attachments, actions) = match approval {
-                Some(approval) if crate::wakterm::form::answerable(&approval) => {
-                    let state = crate::wakterm::form::FormState::default();
-                    (
-                        crate::wakterm::form::text(&approval, &state),
-                        Vec::new(),
-                        crate::wakterm::form::actions(&approval, &state),
-                    )
-                }
-                Some(approval) => {
-                    // Only a command approval asks to approve something; every
-                    // other kind, including ones Panetone does not know, is a
-                    // choice the agent is waiting on.
-                    let mut body = if approval.kind == "command_approval" {
-                        "Approval needed".to_string()
-                    } else {
-                        "Input needed".to_string()
-                    };
-                    if let Some(prompt) = approval.prompt.as_deref() {
-                        body.push_str("\n\n");
-                        body.push_str(prompt);
-                    }
-                    if let Some(command) = approval.command.as_deref() {
-                        body.push_str("\n\nCommand:\n");
-                        body.push_str(command);
-                    }
-                    if let Some(reason) = approval.reason.as_deref() {
-                        body.push_str("\n\nReason: ");
-                        body.push_str(reason);
-                    }
-                    if approval.kind == "user_question_form" {
-                        body.push_str(
-                            "\n\nThis form has several questions, so answer it in the agent's pane.",
-                        );
-                    }
-                    if approval.kind == "user_question" {
-                        for (index, choice) in approval.choices.iter().enumerate() {
-                            if let Some(description) = choice.description.as_deref() {
-                                body.push_str(&format!(
-                                    "\n\n{}. {}: {}",
-                                    index + 1,
-                                    choice.label,
-                                    description
-                                ));
-                            }
-                        }
-                    }
-                    let actions = approval
-                        .choices
-                        .into_iter()
-                        .map(|choice| crate::domain::OutboxAction {
-                            id: format!("wakap:{}:{}", approval.request_id, choice.id),
-                            label: choice.label,
-                        })
-                        .collect();
-                    (body, Vec::new(), actions)
-                }
-                None => {
-                    let text = match tagged {
-                        Some(tagged) => tagged.clean,
-                        None => visible_body.expect("visible output was checked"),
-                    };
-                    let (body, attachments) = visible_attachments(text);
-                    (body, attachments, Vec::new())
-                }
-            };
-            let namespace = Uuid::new_v5(
-                &Uuid::NAMESPACE_URL,
-                b"https://panetone.dev/wakterm/events/v1",
-            );
-            let item = OutboxItem {
-                id: EffectId::new(Uuid::new_v5(
-                    &namespace,
-                    format!("{}\0{}", event.incarnation_id, event.event_id).as_bytes(),
-                )),
-                route_id: Some(route.id),
-                // Interactive callbacks must use the one Telegram bot that owns
-                // the inbound update cursor. Harness-specific bots remain
-                // appropriate for ordinary one-way output.
-                sender_harness: if actions.is_empty() {
-                    route_agent.map(|candidate| candidate.agent.harness.clone())
-                } else {
-                    None
-                },
-                source_agent: route_agent.map(|candidate| candidate.agent.clone()),
-                kind,
-                destination,
-                body,
-                attachments,
-                actions,
-                state: OutboxState::Pending,
-                attempts: 0,
-                last_error: None,
-                external_receipt: None,
-                uncertain_attempts: 0,
-            };
-            for chunk in crate::domain::chunk_outbox(item) {
-                enqueue_outbox(&transaction, None, &chunk, now_ms)?;
-            }
-            state = "projected";
-            outcome.visible_outputs += 1;
-            if let Some(candidate) = route_agent {
-                outcome.remember_last_agent(candidate);
-            }
-        }
-        insert_agent_event(&transaction, event, route_id, state, &record_json, now_ms)?;
-        outcome.recorded += 1;
+        ingest_event(
+            &transaction,
+            event,
+            &routes,
+            route_agents,
+            &preferences,
+            now_ms,
+            &mut outcome,
+        )?;
     }
     let changed = transaction.execute(
         "UPDATE metadata SET value = ?2

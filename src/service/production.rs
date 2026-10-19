@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -41,6 +41,8 @@ const INBOX_PROOF_WINDOW_MS: i64 = 120_000;
 /// How long after an agent's turn ends a reminder waits, so that a turn
 /// something else starts meanwhile is checked instead.
 const REPLY_REMINDER_DELAY_MS: i64 = 30_000;
+/// Metadata naming the endchat profile that serves a route, by route ID.
+const ENDCHAT_PROFILES_KEY: &str = "endchat_profiles_v1";
 /// How long a channel message waits on a blocked pane before its sender is told why.
 const INBOX_WAITING_NOTICE_MS: i64 = 60_000;
 
@@ -390,7 +392,7 @@ impl ProductionService {
                             || event.kind == "approval_requested"
                             || event.visible_output_body().is_ok_and(|body| body.is_some())
                     }) {
-                        let live = self.wakterm.live_routes().await.map_err(error_string)?;
+                        let live = self.live_routes().await.map_err(error_string)?;
                         self.reconcile_live_routes(&live).await?;
                         let routes = self.store.list_routes().await.map_err(error_string)?;
                         project_live_routes(&routes, &live)?
@@ -574,7 +576,7 @@ impl ProductionService {
         if workflows.is_empty() {
             return Ok(0);
         }
-        let live = self.wakterm.live_routes().await.map_err(error_string)?;
+        let live = self.live_routes().await.map_err(error_string)?;
         let mut attempted = 0;
         // The store lists queued work oldest first, and each pass offers an
         // agent only its oldest message, so a target receives them in order.
@@ -711,6 +713,118 @@ impl ProductionService {
         Ok(processed)
     }
 
+    /// Projects new agent messages from each endchat profile's log to the
+    /// route it serves. A route's first read starts at the end of the log, so
+    /// earlier history is not posted.
+    pub async fn endchat_once(&self) -> Result<usize, String> {
+        let profiles = self.endchat_profiles().await?;
+        let mut projected = 0;
+        for (route_id, profile) in profiles {
+            let Ok(route_id) = Uuid::parse_str(&route_id).map(RouteId::new) else {
+                continue;
+            };
+            let key = format!("endchat_log_cursor:{route_id}");
+            let stored = self
+                .store
+                .get_metadata(key.clone())
+                .await
+                .map_err(error_string)?;
+            let Some(cursor) = stored
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<crate::endchat::LogCursor>(json).ok())
+            else {
+                let start = crate::endchat::end_of_log(&profile);
+                self.store
+                    .set_metadata(key, serde_json::to_string(&start).map_err(error_string)?)
+                    .await
+                    .map_err(error_string)?;
+                continue;
+            };
+            let (messages, next) = crate::endchat::read_agent_messages(&profile, &cursor)
+                .map_err(|error| format!("cannot read the endchat log in {profile}: {error}"))?;
+            if next == cursor {
+                continue;
+            }
+            let outcome = self
+                .store
+                .ingest_endchat_messages(
+                    route_id,
+                    crate::endchat::binding(&profile),
+                    messages,
+                    key,
+                    serde_json::to_string(&next).map_err(error_string)?,
+                    now_ms(),
+                )
+                .await
+                .map_err(error_string)?;
+            projected += outcome.visible_outputs as usize;
+        }
+        Ok(projected)
+    }
+
+    /// Wakterm's live routes, with each route an endchat profile serves bound to
+    /// that profile instead of any Wakterm agent.
+    async fn live_routes(&self) -> Result<LiveRouteSnapshot, WaktermCliError> {
+        let mut live = self.wakterm.live_routes().await?;
+        let profiles = self
+            .endchat_profiles()
+            .await
+            .map_err(WaktermCliError::Rejected)?;
+        if !profiles.is_empty() {
+            let routes = self
+                .store
+                .list_routes()
+                .await
+                .map_err(|error| WaktermCliError::Rejected(error.to_string()))?;
+            for route in routes {
+                if let Some(profile) = profiles.get(&route.id.to_string()) {
+                    live.serve_route(&route.title, crate::endchat::binding(profile));
+                }
+            }
+        }
+        Ok(live)
+    }
+
+    /// Makes an endchat profile serve a route, or with `none` hands the route
+    /// back to Wakterm.
+    async fn set_endchat_profile(&self, route_id: RouteId, profile: &str) -> Result<(), String> {
+        let mut profiles = self.endchat_profiles().await?;
+        if profile == "none" {
+            profiles.remove(&route_id.to_string());
+        } else {
+            let path = Path::new(profile);
+            if !path.is_absolute() || !path.join("main").is_dir() {
+                return Err(format!(
+                    "{profile} is not an endchat profile directory: it needs to be an absolute path holding main/"
+                ));
+            }
+            profiles.insert(
+                route_id.to_string(),
+                profile.trim_end_matches('/').to_owned(),
+            );
+        }
+        self.store
+            .set_metadata(
+                ENDCHAT_PROFILES_KEY.into(),
+                serde_json::to_string(&profiles).map_err(error_string)?,
+            )
+            .await
+            .map_err(error_string)
+    }
+
+    /// Endchat profile directories by the ID of the route each serves.
+    async fn endchat_profiles(&self) -> Result<BTreeMap<String, String>, String> {
+        match self
+            .store
+            .get_metadata(ENDCHAT_PROFILES_KEY.into())
+            .await
+            .map_err(error_string)?
+        {
+            Some(json) => serde_json::from_str(&json).map_err(error_string),
+            None => Ok(BTreeMap::new()),
+        }
+    }
+
     /// Sends tagged replies to their senders, then reminds agents that still
     /// owe a reply after a turn that something else started (ADR 0006).
     pub async fn replies_once(&self) -> Result<usize, String> {
@@ -723,7 +837,7 @@ impl ProductionService {
         if messages.is_empty() && debts.is_empty() {
             return Ok(0);
         }
-        let live = self.wakterm.live_routes().await.map_err(error_string)?;
+        let live = self.live_routes().await.map_err(error_string)?;
         let mut done = 0;
         for message in messages {
             done += usize::from(self.send_reply(&live, message).await?);
@@ -922,7 +1036,7 @@ impl ProductionService {
         if pending.is_empty() {
             return Ok(0);
         }
-        let live = self.wakterm.live_routes().await.map_err(error_string)?;
+        let live = self.live_routes().await.map_err(error_string)?;
         let mut attempted = 0;
         for returned in pending {
             let workflow = self
@@ -967,7 +1081,7 @@ impl ProductionService {
         }
         let after_sequence = self.event_cursor().await?;
         let routes = self.store.list_routes().await.map_err(error_string)?;
-        let live = self.wakterm.live_routes().await.map_err(error_string)?;
+        let live = self.live_routes().await.map_err(error_string)?;
         let mut attempted = 0;
         for mut item in pending {
             let matching = routes
@@ -1161,7 +1275,7 @@ impl ProductionService {
         if self.channels.telegram.is_none() {
             return Ok(0);
         }
-        let live = self.wakterm.live_routes().await.map_err(error_string)?;
+        let live = self.live_routes().await.map_err(error_string)?;
         let routes = self.store.list_routes().await.map_err(error_string)?;
         let preferences: HashMap<String, String> = self
             .store
@@ -1500,7 +1614,7 @@ impl ProductionService {
             Ok(routes) => routes,
             Err(error) => return internal(id, error),
         };
-        let live = match self.wakterm.live_routes().await {
+        let live = match self.live_routes().await {
             Ok(live) => live,
             Err(error) => {
                 return error_response(id, "route_resolution_failed", error.to_string(), None);
@@ -1755,7 +1869,7 @@ impl ProductionService {
             Ok(routes) => routes,
             Err(error) => return internal(id, error),
         };
-        let live = match self.wakterm.live_routes().await {
+        let live = match self.live_routes().await {
             Ok(live) => live,
             Err(error) => {
                 return error_response(id, "route_resolution_failed", error.to_string(), None);
@@ -1829,10 +1943,23 @@ impl ProductionService {
             Ok(routes) => routes,
             Err(error) => return internal(id, error),
         };
+        if let Some(profile) = params.endchat_profile.as_deref() {
+            let Ok(route) = exact_route(&routes, &params.title) else {
+                return error_response(
+                    id,
+                    "route_not_found",
+                    "an endchat profile can serve only an existing route",
+                    None,
+                );
+            };
+            if let Err(detail) = self.set_endchat_profile(route.id, profile).await {
+                return error_response(id, "invalid_params", detail, None);
+            }
+        }
         let mut route = match exact_route(&routes, &params.title) {
             Ok(route) => route.clone(),
             Err("not_found") => {
-                let live = match self.wakterm.live_routes().await {
+                let live = match self.live_routes().await {
                     Ok(live) => live,
                     Err(error) => {
                         return error_response(
@@ -1969,7 +2096,7 @@ impl ProductionService {
     ) -> ControlResponse {
         let live = match live {
             Some(live) => live,
-            None => match self.wakterm.live_routes().await {
+            None => match self.live_routes().await {
                 Ok(live) => live,
                 Err(error) => {
                     return error_response(id, "route_resolution_failed", error.to_string(), None);
@@ -3497,6 +3624,134 @@ fi
         assert_eq!(service.replies_once().await.unwrap(), 0);
         drop(service);
         drop(workflows);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_endchat_profile_serves_its_route_in_and_out() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let directory = tempdir().unwrap();
+        let binary = directory.path().join("wakterm-fake");
+        // Wakterm has no agent for the route.
+        fs::write(
+            &binary,
+            r#"#!/bin/bash
+set -euo pipefail
+operation="$*"
+if [[ "$operation" == *"agent capabilities"* ]]; then
+  printf '%s\n' '{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}'
+elif [[ "$operation" == *"agent catalog"* ]]; then
+  printf '%s\n' '{"schema":"wakterm.agent-api.v1","as_of_event_sequence":10,"agents":[]}'
+elif [[ "$operation" == *"list --format json"* ]]; then
+  printf '%s\n' '[]'
+else
+  echo "unexpected fake invocation: $operation" >&2
+  exit 9
+fi
+"#,
+        )
+        .unwrap();
+        crate::test_support::seal_executable(&binary);
+        let profile = directory.path().join("profile");
+        fs::create_dir_all(profile.join("main")).unwrap();
+        let log = profile.join("main/2026-10-19.jsonl");
+        fs::write(&log, "").unwrap();
+        let listener = tokio::net::UnixListener::bind(profile.join("control.sock")).unwrap();
+        let said = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let server_said = said.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut line = String::new();
+            tokio::io::BufReader::new(reader)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["cmd"], "say");
+            server_said
+                .lock()
+                .unwrap()
+                .push(request["text"].as_str().unwrap().to_owned());
+            writer.write_all(b"{\"event\":\"queued\"}\n").await.unwrap();
+        });
+
+        let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        let route = Route {
+            id: RouteId::new(Uuid::from_u128(500)),
+            title: "debate".into(),
+            channels: vec![ChannelBinding::Telegram { topic_id: 50 }],
+            agent: None,
+        };
+        store.save_route(route.clone(), 1).await.unwrap();
+        store.initialize_event_cursor(10).await.unwrap();
+        let service = ProductionService::new(
+            store.clone(),
+            WaktermCli::new(
+                binary,
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            RealChannels::default(),
+            SupervisorHandle::default(),
+            vec!["event_stream.v1".into()],
+            directory.path().join("control.sock"),
+        );
+        service
+            .set_endchat_profile(route.id, profile.to_str().unwrap())
+            .await
+            .unwrap();
+
+        // A chat message reaches the profile through its control socket.
+        store
+            .accept_inbox(InboxItem {
+                id: EffectId::new(Uuid::from_u128(501)),
+                channel: ChannelKind::Telegram,
+                external_id: "update-1".into(),
+                destination: "50".into(),
+                sender_id: Some("42".into()),
+                sender: Some("Mihai".into()),
+                reply_to_external_id: None,
+                body: "who won?".into(),
+                state: "pending".into(),
+                created_at_ms: now_ms(),
+                receipt: None,
+                steering_acknowledged: None,
+                proof: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(service.inbox_once().await.unwrap(), 1);
+        server.await.unwrap();
+        assert_eq!(*said.lock().unwrap(), ["who won?"]);
+        assert_eq!(store.status().await.unwrap().pending_inbox, 0);
+
+        // The first read starts at the end of the log; replies after it are
+        // posted, and the no-reply token is honored.
+        assert_eq!(service.endchat_once().await.unwrap(), 0);
+        let record = |i: u64, kind: &str, text: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({"i": i, "kind": kind, "text": text, "size": 1,
+                    "date": "2026-10-19T12:00:00Z", "run": "r1"})
+            )
+        };
+        // A date after now, so the messages are never taken for history.
+        let now = "2099-01-01T00:00:00Z";
+        let mut text = fs::read_to_string(&log).unwrap();
+        text.push_str(&record(0, "user", "who won?").replace("2026-10-19T12:00:00Z", now));
+        text.push_str(&record(1, "agent", "Andrew did.").replace("2026-10-19T12:00:00Z", now));
+        text.push_str(
+            &record(2, "agent", "<panetone:no-reply>").replace("2026-10-19T12:00:00Z", now),
+        );
+        fs::write(&log, text).unwrap();
+        assert_eq!(service.endchat_once().await.unwrap(), 1);
+        let posts = store.pending_outbox().await.unwrap();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].body, "Andrew did.");
+        assert_eq!(posts[0].destination, "50");
+        assert_eq!(service.endchat_once().await.unwrap(), 0);
+        drop(service);
         store.shutdown().await.unwrap();
     }
 

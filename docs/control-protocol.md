@@ -123,6 +123,8 @@ The title must contain 1 to 128 characters without surrounding whitespace. A new
 
 `signal_account` names the Signal account that serves the group, either the daemon's default account or one listed in `WAK_SIG_EXTRA_ACCOUNTS`; an account the daemon is not configured with is rejected as `invalid_params`. Omitted, an existing binding keeps its account and a new binding uses the default account. Messages for the group are accepted only from the bound account's subscription, and posts to the group go through it. `signal_direct` gives the route the owner's direct messages to that account; it stays set once given.
 
+`endchat_profile` makes an endchat profile directory serve an existing route instead of a Wakterm agent; `none` hands the route back. The directory must be absolute and hold the profile's `main/` log. While a profile serves a route, messages for it, from its channels or from other agents, go to the profile's `say` control request, and any Wakterm agent with the route's title is ignored.
+
 The result is:
 
 ```json

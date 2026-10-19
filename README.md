@@ -95,6 +95,8 @@ The value holds comma-separated `ACCOUNT=SOCKET=DATA_DIR` entries, where `DATA_D
 
 A route bound with `--signal-direct` also takes the direct messages that `WAK_SIG_OWNER` sends to the account serving its group. Such a message reaches the agent with `[direct message]` before it, and the agent's output goes back to the owner as a direct message from that account until a group or Telegram message arrives for the route. Direct messages from anyone else are dropped, and direct messages are left out of chat archives.
 
+A route can be served by an [endchat](https://github.com/wakamex/endchat) profile instead of a Wakterm agent: `panetone route ensure TITLE --endchat-profile /absolute/profile/dir` (or `none` to undo it). Panetone then hands the route's channel messages and other agents' sends to `endchat serve` through the profile's control socket, and posts each agent message the profile appends to its `main/` log, honoring `[panetone:attach PATH]`, `[panetone:reply]` tags and `<panetone:no-reply>` as for a Wakterm agent. Reading starts at the end of the log when the route is switched, so earlier history is not posted. An endchat route gets no reply reminders, since its log does not mark when a turn ends.
+
 Signal subscription timeouts and transport disconnects reconnect inside the inbound worker, so a signal-cli restart does not take down Panetone's control, Telegram, or outbound workers.
 
 After authorization and routing, Panetone sends the message body unchanged except for sender labels on member-enabled Signal groups and attachment paths. An idle agent receives a normal admitted prompt. A busy agent receives immediate active-turn steering after Wakterm definitively confirms that admission did not write the prompt.
