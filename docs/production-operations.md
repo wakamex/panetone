@@ -163,8 +163,7 @@ Telegram sends through each bot token are serialized at one message every 3.1
 seconds, below Telegram's 20-per-minute group limit. A Telegram 429 response
 extends the pause by the returned `retry_after` interval. Each outbox worker
 pass attempts one item, so a flood cannot monopolize shutdown or other workers.
-Visible agent output is split before persistence using Telegram's UTF-16 limit
-or Signal's text limit. Every chunk has a deterministic effect ID and is
+Visible agent output is split before persistence: for Telegram at its UTF-16 message limit, or its 1,024-character caption limit when files are attached; for Signal only beyond 16,000 characters, since signal-cli sends long text as a text attachment that Signal's apps show as one message, with any files in the same message. Every chunk has a deterministic effect ID and is
 committed with the source event cursor, so restart resumes at the first unsent
 chunk.
 

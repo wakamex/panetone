@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use super::{EffectId, RouteId};
 
 const TELEGRAM_TEXT_UNITS: usize = 3900;
-const SIGNAL_TEXT_CHARS: usize = 4000;
+// signal-cli sends text past 2,000 bytes as a text/x-signal-plain attachment,
+// which Signal's apps show as one message, so a Signal message is split only
+// to stay well inside the 64 KiB body Signal's apps accept.
+const SIGNAL_TEXT_CHARS: usize = 16_000;
 // Telegram allows 1,024 caption characters; room is left for RESEND_PREFIX.
 const ATTACHMENT_CAPTION_CHARS: usize = 1024 - RESEND_PREFIX.len();
 pub const MAX_CHANNEL_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
@@ -331,7 +334,11 @@ impl OutboxItem {
 
 pub fn chunk_outbox(mut item: OutboxItem) -> Vec<OutboxItem> {
     if !item.attachments.is_empty() {
-        let chunks = split_by_chars(&item.body, ATTACHMENT_CAPTION_CHARS);
+        // Only Telegram limits the text sent with files, as a caption.
+        let chunks = match item.kind {
+            ChannelKind::Telegram => split_by_chars(&item.body, ATTACHMENT_CAPTION_CHARS),
+            ChannelKind::Signal => split_text(item.kind, &item.body),
+        };
         if chunks.len() == 1 {
             return vec![item];
         }
@@ -477,7 +484,7 @@ mod tests {
 
     #[test]
     fn long_attachment_caption_sends_the_file_once() {
-        let mut original = item(ChannelKind::Signal, "x".repeat(1025));
+        let mut original = item(ChannelKind::Telegram, "x".repeat(1025));
         original.attachments.push(ChannelAttachment {
             file_name: "scene.png".into(),
             media_type: "image/png".into(),
@@ -493,6 +500,22 @@ mod tests {
         // A resent caption still fits Telegram's 1,024-character limit.
         chunks[0].uncertain_attempts = 1;
         assert_eq!(chunks[0].attempt_body().chars().count(), 1024);
+    }
+
+    #[test]
+    fn a_signal_reply_with_files_and_long_text_is_one_message() {
+        let mut original = item(ChannelKind::Signal, "x".repeat(5_000));
+        original.attachments.push(ChannelAttachment {
+            file_name: "chart.png".into(),
+            media_type: "image/png".into(),
+            size: 1,
+            sha256: "hash".into(),
+            data_base64: "eA==".into(),
+        });
+        assert_eq!(chunk_outbox(original.clone()), vec![original.clone()]);
+        // Text alone is not split at Telegram's sizes either.
+        original.attachments.clear();
+        assert_eq!(chunk_outbox(original.clone()), vec![original]);
     }
 }
 
