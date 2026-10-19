@@ -86,7 +86,15 @@ pub struct TurnEnd {
 }
 
 pub(super) fn open_debt(connection: &mut Connection, mut debt: ReplyDebt) -> StoreResult<()> {
-    debt.after_sequence = event_cursor(connection)?.unwrap_or(0);
+    // An endchat agent's events are numbered apart from Wakterm's.
+    debt.after_sequence = if debt.target_agent_id.starts_with("endchat:") {
+        super::ENDCHAT_SEQUENCE_BASE
+            + super::get_metadata(connection, "endchat_event_count")?
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0)
+    } else {
+        event_cursor(connection)?.unwrap_or(0)
+    };
     debt.state = "open".into();
     connection.execute(
         "INSERT OR IGNORE INTO reply_debts(

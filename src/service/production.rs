@@ -740,7 +740,7 @@ impl ProductionService {
                     .map_err(error_string)?;
                 continue;
             };
-            let (messages, next) = crate::endchat::read_agent_messages(&profile, &cursor)
+            let (messages, next) = crate::endchat::read(&profile, &cursor)
                 .map_err(|error| format!("cannot read the endchat log in {profile}: {error}"))?;
             if next == cursor {
                 continue;
@@ -3659,21 +3659,26 @@ fi
         let listener = tokio::net::UnixListener::bind(profile.join("control.sock")).unwrap();
         let said = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let server_said = said.clone();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (reader, mut writer) = stream.into_split();
-            let mut line = String::new();
-            tokio::io::BufReader::new(reader)
-                .read_line(&mut line)
-                .await
-                .unwrap();
-            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(request["cmd"], "say");
-            server_said
-                .lock()
-                .unwrap()
-                .push(request["text"].as_str().unwrap().to_owned());
-            writer.write_all(b"{\"event\":\"queued\"}\n").await.unwrap();
+        let _server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                tokio::io::BufReader::new(reader)
+                    .read_line(&mut line)
+                    .await
+                    .unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["cmd"], "say");
+                server_said
+                    .lock()
+                    .unwrap()
+                    .push(request["text"].as_str().unwrap().to_owned());
+                writer
+                    .write_all(b"{\"event\":\"accepted\",\"i\":0}\n")
+                    .await
+                    .unwrap();
+            }
         });
 
         let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
@@ -3722,7 +3727,6 @@ fi
             .await
             .unwrap();
         assert_eq!(service.inbox_once().await.unwrap(), 1);
-        server.await.unwrap();
         assert_eq!(*said.lock().unwrap(), ["who won?"]);
         assert_eq!(store.status().await.unwrap().pending_inbox, 0);
 
@@ -3751,6 +3755,43 @@ fi
         assert_eq!(posts[0].body, "Andrew did.");
         assert_eq!(posts[0].destination, "50");
         assert_eq!(service.endchat_once().await.unwrap(), 0);
+
+        // A request that owes a reply, whose turn ends without one, draws a
+        // reminder through the same socket.
+        let agent = crate::endchat::binding(profile.to_str().unwrap());
+        store
+            .open_reply_debt(ReplyDebt {
+                request_id: WorkflowId::new(Uuid::from_u128(0x2b2b_2b2b_u128 << 96)),
+                source: "asker".into(),
+                source_route_id: RouteId::new(Uuid::from_u128(9)),
+                source_agent: agent.clone(),
+                target: "debate".into(),
+                target_route_id: route.id,
+                target_agent_id: agent.agent_id.clone(),
+                summary: "check the sources".into(),
+                after_sequence: 0,
+                created_at_ms: 1,
+                state: "open".into(),
+            })
+            .await
+            .unwrap();
+        let mut text = fs::read_to_string(&log).unwrap();
+        text.push_str(&record(3, "user", "check the sources").replace("2026-10-19T12:00:00Z", now));
+        text.push_str(&record(4, "agent", "On it.").replace("2026-10-19T12:00:00Z", now));
+        fs::write(&log, text).unwrap();
+        fs::write(
+            profile.join("turns.jsonl"),
+            "{\"end\": 5, \"ok\": true, \"date\": \"2099-01-01T00:00:00Z\"}\n",
+        )
+        .unwrap();
+        service.endchat_once().await.unwrap();
+        let turn = store
+            .last_turn_end(agent.agent_id.clone(), 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn.turn_id, "endchat-3");
+        assert!(!turn.superseded && !turn.started_by_reminder);
         drop(service);
         store.shutdown().await.unwrap();
     }

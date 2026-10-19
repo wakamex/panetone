@@ -454,7 +454,7 @@ impl StoreHandle {
         &self,
         route_id: RouteId,
         agent: AgentBinding,
-        messages: Vec<crate::endchat::AgentMessage>,
+        messages: Vec<crate::endchat::Entry>,
         cursor_key: String,
         cursor: String,
         now_ms: i64,
@@ -1789,7 +1789,7 @@ fn ingest_endchat_messages(
     connection: &mut Connection,
     route_id: RouteId,
     agent: AgentBinding,
-    messages: &[crate::endchat::AgentMessage],
+    messages: &[crate::endchat::Entry],
     cursor_key: &str,
     cursor: &str,
     now_ms: i64,
@@ -1802,18 +1802,40 @@ fn ingest_endchat_messages(
     let mut count = get_metadata(&transaction, "endchat_event_count")?
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
-    for message in messages {
+    // A turn is named by the message that started it, so its end and its
+    // replies can be matched with its start, as Wakterm events are.
+    let turn_key = format!("endchat_turn:{}", route_agents[0].agent.agent_id);
+    let mut turn = get_metadata(&transaction, &turn_key)?.unwrap_or_default();
+    for entry in messages {
         count += 1;
         let mut fields = serde_json::Map::new();
-        fields.insert("text".into(), message.text.clone().into());
-        fields.insert("observed_at".into(), message.date.clone().into());
-        if let Some(run) = &message.run {
-            fields.insert("turn_id".into(), run.clone().into());
-        }
+        let (kind, event_id, date) = match entry {
+            crate::endchat::Entry::User { i, text, date } => {
+                turn = format!("endchat-{i}");
+                fields.insert(
+                    "input_sha256".into(),
+                    DeliveryProof::input_sha256(text).into(),
+                );
+                ("turn_started", format!("endchat-{i}"), date)
+            }
+            crate::endchat::Entry::Agent { i, text, date } => {
+                fields.insert("text".into(), text.clone().into());
+                ("assistant_message", format!("endchat-{i}"), date)
+            }
+            crate::endchat::Entry::TurnEnd { end, ok, date } => {
+                fields.insert(
+                    "outcome".into(),
+                    if *ok { "completed" } else { "aborted" }.into(),
+                );
+                ("turn_final", format!("endchat-end-{end}"), date)
+            }
+        };
+        fields.insert("observed_at".into(), date.clone().into());
+        fields.insert("turn_id".into(), turn.clone().into());
         let event = EventRecord {
             sequence: ENDCHAT_SEQUENCE_BASE + count,
-            event_id: format!("endchat-{}", message.i),
-            kind: "assistant_message".into(),
+            event_id,
+            kind: kind.into(),
             agent_id: route_agents[0].agent.agent_id.clone(),
             incarnation_id: route_agents[0].agent.incarnation_id.clone(),
             fields,
@@ -1829,6 +1851,7 @@ fn ingest_endchat_messages(
         )?;
     }
     set_metadata(&transaction, "endchat_event_count", &count.to_string())?;
+    set_metadata(&transaction, &turn_key, &turn)?;
     set_metadata(&transaction, cursor_key, cursor)?;
     transaction.commit()?;
     Ok(outcome)
