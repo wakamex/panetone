@@ -4,8 +4,6 @@
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use rustyline::ExternalPrinter;
 use rustyline::error::ReadlineError;
 use serde_json::{Value, json};
@@ -15,29 +13,23 @@ use crate::control::{CONTROL_SCHEMA, ControlRequest, request};
 
 const POLL_WAIT_MS: u64 = 20_000;
 
-/// The icons that mark who is speaking, as small PNGs.
-const ICON_YOU: &[u8] = include_bytes!("../assets/icons/you.png");
-const ICON_CLAUDE: &[u8] = include_bytes!("../assets/icons/claude.png");
-const ICON_CODEX: &[u8] = include_bytes!("../assets/icons/codex.png");
-const ICON_GEMINI: &[u8] = include_bytes!("../assets/icons/gemini.png");
-
 const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 
 struct Style {
-    /// The terminal draws inline images (the iTerm2 protocol Wakterm speaks).
-    images: bool,
+    /// The terminal is Wakterm, which draws its harness icons for the
+    /// private-use characters in [`harness_icon`].
+    icons: bool,
     me: String,
 }
 
 impl Style {
     fn detect(me: String) -> Self {
-        let program = std::env::var("TERM_PROGRAM").unwrap_or_default();
-        let images = std::io::stdout().is_terminal()
+        let icons = std::io::stdout().is_terminal()
             && std::env::var_os("PANETONE_CHAT_PLAIN").is_none()
-            && matches!(program.as_str(), "wakterm" | "WezTerm" | "iTerm.app");
-        Self { images, me }
+            && std::env::var("TERM_PROGRAM").is_ok_and(|program| program == "wakterm");
+        Self { icons, me }
     }
 
     fn colour(harness: &str) -> &'static str {
@@ -45,28 +37,17 @@ impl Style {
             "claude" => "\x1b[38;5;208m",
             "codex" => "\x1b[38;5;41m",
             "agy" | "gemini" => "\x1b[38;5;33m",
+            "opencode" | "zcode" => "\x1b[38;5;250m",
             "" => "\x1b[38;5;180m",
             _ => "\x1b[38;5;177m",
         }
     }
 
-    /// The speaker's mark: an inline icon where the terminal draws images, a
-    /// coloured dot elsewhere.
+    /// The speaker's mark: the harness icon Wakterm shows in its tab bar,
+    /// drawn as one cell in the speaker's colour, or a coloured dot elsewhere.
     fn mark(&self, harness: &str) -> String {
-        let icon = match harness {
-            "claude" => Some(ICON_CLAUDE),
-            "codex" => Some(ICON_CODEX),
-            "agy" | "gemini" => Some(ICON_GEMINI),
-            "" => Some(ICON_YOU),
-            _ => None,
-        };
-        match icon {
-            Some(png) if self.images => format!(
-                "\x1b]1337;File=inline=1;width=2;height=1;preserveAspectRatio=1:{}\x07",
-                BASE64.encode(png)
-            ),
-            _ => format!("{}●{RESET} ", Self::colour(harness)),
-        }
+        let glyph = harness_icon(harness).filter(|_| self.icons).unwrap_or('●');
+        format!("{}{glyph}{RESET} ", Self::colour(harness))
     }
 
     fn message(&self, message: &Value) -> String {
@@ -123,6 +104,20 @@ impl Style {
             .collect::<Vec<_>>()
             .join("  ")
     }
+}
+
+/// The private-use characters Wakterm renders as its harness icons
+/// (`HARNESS_ICON_*` in wakterm-gui/src/customglyph.rs).
+fn harness_icon(harness: &str) -> Option<char> {
+    Some(match harness {
+        "claude" => '\u{e000}',
+        "codex" => '\u{e001}',
+        "gemini" => '\u{e002}',
+        "opencode" => '\u{e003}',
+        "agy" => '\u{e004}',
+        "zcode" => '\u{e006}',
+        _ => return None,
+    })
 }
 
 async fn call(socket: &Path, method: &str, params: Value) -> anyhow::Result<Value> {
@@ -288,7 +283,7 @@ mod tests {
     #[test]
     fn your_lines_read_as_prompts_and_others_carry_a_mark_and_name() {
         let style = Style {
-            images: false,
+            icons: false,
             me: "Mihai".into(),
         };
         let mine = style.message(&json!({"kind": "user", "name": "Mihai", "text": "hi\nthere"}));
@@ -299,11 +294,11 @@ mod tests {
         assert!(theirs.contains("●"));
         assert!(theirs.contains("game_claude"));
         assert!(theirs.ends_with("\n  one\n  two"));
-        let images = Style {
-            images: true,
+        let icons = Style {
+            icons: true,
             me: "Mihai".into(),
         };
-        assert!(images.mark("codex").starts_with("\x1b]1337;File=inline=1;"));
-        assert!(images.mark("opencode").contains("●"));
+        assert!(icons.mark("codex").contains('\u{e001}'));
+        assert!(icons.mark("").contains("●"));
     }
 }
