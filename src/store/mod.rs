@@ -25,10 +25,12 @@ use crate::domain::{
 use crate::wakterm::{AgentCatalog, ApprovalRequest, EventRecord};
 
 mod replies;
+mod rooms;
 
 pub use replies::{ReplyDebt, ReplyMessage, TurnEnd};
+pub use rooms::{RoomDelivery, RoomMessage, RoomSettings};
 
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 const COMMAND_CAPACITY: usize = 128;
 /// Output observed this long before it is ingested is not posted.
 const STALE_OUTPUT_MS: i64 = 15 * 60 * 1000;
@@ -471,6 +473,67 @@ impl StoreHandle {
             )
         })
         .await
+    }
+
+    pub async fn rooms(&self) -> StoreResult<std::collections::BTreeMap<String, RoomSettings>> {
+        self.run(|connection| rooms::rooms(connection)).await
+    }
+
+    /// Makes a route a room with these settings, or with `None` an ordinary
+    /// route again.
+    pub async fn set_room(
+        &self,
+        route_id: RouteId,
+        settings: Option<RoomSettings>,
+    ) -> StoreResult<()> {
+        self.run(move |connection| rooms::set_room(connection, route_id, settings))
+            .await
+    }
+
+    /// Adds a message to a room's transcript and queues it for `recipients`.
+    pub async fn post_room_message(
+        &self,
+        route_id: RouteId,
+        message: RoomMessage,
+        recipients: Vec<String>,
+    ) -> StoreResult<RoomMessage> {
+        self.run(move |connection| {
+            let transaction = connection.transaction()?;
+            let posted = rooms::post(&transaction, route_id, message, &recipients)?;
+            transaction.commit()?;
+            Ok(posted)
+        })
+        .await
+    }
+
+    /// Room messages after `after`, or the last `limit` when `after` is negative.
+    pub async fn room_messages(
+        &self,
+        route_id: RouteId,
+        after: i64,
+        limit: usize,
+    ) -> StoreResult<Vec<RoomMessage>> {
+        self.run(move |connection| rooms::messages_after(connection, route_id, after, limit))
+            .await
+    }
+
+    pub async fn latest_room_message(&self, route_id: RouteId) -> StoreResult<i64> {
+        self.run(move |connection| rooms::latest_message_id(connection, route_id))
+            .await
+    }
+
+    pub async fn pending_room_deliveries(&self) -> StoreResult<Vec<RoomDelivery>> {
+        self.run(|connection| rooms::pending_deliveries(connection))
+            .await
+    }
+
+    pub async fn set_room_delivery(
+        &self,
+        delivery: RoomDelivery,
+        state: String,
+    ) -> StoreResult<()> {
+        self.run(move |connection| rooms::set_delivery(connection, &delivery, &state))
+            .await
     }
 
     pub async fn reply_debt(&self, request_id: WorkflowId) -> StoreResult<Option<ReplyDebt>> {
@@ -1136,6 +1199,12 @@ pub(crate) fn migrate_schema(connection: &mut Connection) -> StoreResult<()> {
         transaction.pragma_update(None, "user_version", 8)?;
         transaction.commit()?;
     }
+    if version < 9 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(rooms::SCHEMA)?;
+        transaction.pragma_update(None, "user_version", 9)?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 
@@ -1465,12 +1534,14 @@ fn get_approval(connection: &Connection, request_id: &str) -> StoreResult<Option
 
 /// Records one agent event and projects any visible output or approval it
 /// carries to its route's channel.
+#[allow(clippy::too_many_arguments)]
 fn ingest_event(
     transaction: &Transaction<'_>,
     event: &EventRecord,
     routes: &[Route],
     route_agents: &[RouteAgent],
     preferences: &std::collections::BTreeMap<String, String>,
+    rooms: &std::collections::BTreeMap<String, RoomSettings>,
     now_ms: i64,
     outcome: &mut EventIngestOutcome,
 ) -> StoreResult<()> {
@@ -1607,6 +1678,48 @@ fn ingest_event(
                 section,
                 now_ms,
             )?;
+        }
+        // In a room, an agent's message joins the transcript and goes to the
+        // room's other agents.
+        if let (Some(settings), true, Some(body)) = (
+            rooms.get(&route.id.to_string()),
+            event.kind == "assistant_message" && approval.is_none(),
+            visible_body.as_deref(),
+        ) {
+            let text = tagged
+                .as_ref()
+                .map_or(body, |tagged| tagged.clean.as_str())
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("[panetone:attach "))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !text.trim().is_empty() {
+                let recipients = if settings.paused {
+                    Vec::new()
+                } else {
+                    route_agents
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.route_id == route.id
+                                && candidate.agent.agent_id != event.agent_id
+                        })
+                        .map(|candidate| candidate.agent.agent_id.clone())
+                        .collect()
+                };
+                rooms::post(
+                    transaction,
+                    route.id,
+                    RoomMessage {
+                        id: 0,
+                        kind: "agent".into(),
+                        speaker: event.agent_id.clone(),
+                        harness: route_agent.map(|candidate| candidate.agent.harness.clone()),
+                        text: text.trim().to_owned(),
+                        created_at_ms: now_ms,
+                    },
+                    &recipients,
+                )?;
+            }
         }
         let destination = if approval.is_some() {
             route.channels.iter().find_map(|binding| match binding {
@@ -1797,6 +1910,7 @@ fn ingest_endchat_messages(
     let transaction = connection.transaction()?;
     let routes = list_routes(&transaction)?;
     let preferences = route_preferences(&transaction)?;
+    let rooms = rooms::rooms(&transaction)?;
     let route_agents = [RouteAgent { route_id, agent }];
     let mut outcome = EventIngestOutcome::default();
     let mut count = get_metadata(&transaction, "endchat_event_count")?
@@ -1846,6 +1960,7 @@ fn ingest_endchat_messages(
             &routes,
             &route_agents,
             &preferences,
+            &rooms,
             now_ms,
             &mut outcome,
         )?;
@@ -1887,6 +2002,7 @@ fn ingest_agent_events(
     }
     let routes = list_routes(&transaction)?;
     let preferences = route_preferences(&transaction)?;
+    let rooms = rooms::rooms(&transaction)?;
     let mut outcome = EventIngestOutcome {
         next_after_sequence: next,
         ..EventIngestOutcome::default()
@@ -1899,6 +2015,7 @@ fn ingest_agent_events(
             &routes,
             route_agents,
             &preferences,
+            &rooms,
             now_ms,
             &mut outcome,
         )?;

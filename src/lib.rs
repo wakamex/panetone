@@ -1,5 +1,6 @@
 pub mod archive;
 pub mod channels;
+pub mod chat;
 pub mod control;
 pub mod domain;
 pub mod endchat;

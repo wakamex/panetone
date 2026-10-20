@@ -20,8 +20,8 @@ use crate::domain::{
     signal_group_account,
 };
 use crate::store::{
-    DeliveryProof, EventCursorGap, InboxItem, ReplyDebt, ReplyMessage, RouteAgent, StoreHandle,
-    StoredApproval,
+    DeliveryProof, EventCursorGap, InboxItem, ReplyDebt, ReplyMessage, RoomMessage, RoomSettings,
+    RouteAgent, StoreHandle, StoredApproval,
 };
 use crate::supervisor::SupervisorHandle;
 use crate::wakterm::form::{self, FormAction, FormState};
@@ -43,6 +43,8 @@ const INBOX_PROOF_WINDOW_MS: i64 = 120_000;
 const REPLY_REMINDER_DELAY_MS: i64 = 30_000;
 /// Metadata naming the endchat profile that serves a route, by route ID.
 const ENDCHAT_PROFILES_KEY: &str = "endchat_profiles_v1";
+/// Metadata remembering each room speaker's display name, by agent ID.
+const ROOM_NAMES_KEY: &str = "room_names_v1";
 /// How long a channel message waits on a blocked pane before its sender is told why.
 const INBOX_WAITING_NOTICE_MS: i64 = 60_000;
 
@@ -713,6 +715,210 @@ impl ProductionService {
         Ok(processed)
     }
 
+    /// Adds a person's message to a room's transcript and queues it for every
+    /// agent in the room.
+    async fn post_to_room(
+        &self,
+        live: &LiveRouteSnapshot,
+        route: &Route,
+        speaker: String,
+        text: String,
+    ) -> Result<RoomMessage, String> {
+        let recipients = live
+            .route(&route.title)
+            .map(|live_route| {
+                live_route
+                    .agents
+                    .iter()
+                    .map(|agent| agent.agent_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.store
+            .post_room_message(
+                route.id,
+                RoomMessage {
+                    id: 0,
+                    kind: "user".into(),
+                    speaker,
+                    harness: None,
+                    text,
+                    created_at_ms: now_ms(),
+                },
+                recipients,
+            )
+            .await
+            .map_err(error_string)
+    }
+
+    /// Names to show for room speakers, remembered so an agent that has gone
+    /// keeps its name in the transcript.
+    async fn room_names(
+        &self,
+        live: &LiveRouteSnapshot,
+    ) -> Result<BTreeMap<String, String>, String> {
+        let mut names: BTreeMap<String, String> = match self
+            .store
+            .get_metadata(ROOM_NAMES_KEY.into())
+            .await
+            .map_err(error_string)?
+        {
+            Some(json) => serde_json::from_str(&json).map_err(error_string)?,
+            None => BTreeMap::new(),
+        };
+        let mut changed = false;
+        for live_route in live.routes() {
+            for agent in &live_route.agents {
+                let name = live
+                    .agent_name(agent)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("{}_{}", live_route.title, agent.harness));
+                if names.get(&agent.agent_id) != Some(&name) {
+                    names.insert(agent.agent_id.clone(), name);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.store
+                .set_metadata(
+                    ROOM_NAMES_KEY.into(),
+                    serde_json::to_string(&names).map_err(error_string)?,
+                )
+                .await
+                .map_err(error_string)?;
+        }
+        Ok(names)
+    }
+
+    /// Delivers queued room messages to their agents, each labelled with its
+    /// speaker. An agent's first room message also explains the room.
+    pub async fn rooms_once(&self) -> Result<usize, String> {
+        let deliveries = self
+            .store
+            .pending_room_deliveries()
+            .await
+            .map_err(error_string)?;
+        if deliveries.is_empty() {
+            return Ok(0);
+        }
+        let live = self.live_routes().await.map_err(error_string)?;
+        let names = self.room_names(&live).await?;
+        let rooms = self.store.rooms().await.map_err(error_string)?;
+        let mut done = 0;
+        for mut delivery in deliveries {
+            let Some(route) = self
+                .store
+                .get_route(delivery.route_id)
+                .await
+                .map_err(error_string)?
+            else {
+                self.store
+                    .set_room_delivery(delivery, "dropped".into())
+                    .await
+                    .map_err(error_string)?;
+                continue;
+            };
+            if !rooms.contains_key(&route.id.to_string()) {
+                self.store
+                    .set_room_delivery(delivery, "dropped".into())
+                    .await
+                    .map_err(error_string)?;
+                continue;
+            }
+            let Some(binding) = live.route(&route.title).ok().and_then(|live_route| {
+                live_route
+                    .agents
+                    .iter()
+                    .find(|agent| agent.agent_id == delivery.agent_id)
+                    .cloned()
+            }) else {
+                continue;
+            };
+            let speaker = if delivery.speaker_is_agent {
+                names
+                    .get(&delivery.speaker)
+                    .cloned()
+                    .unwrap_or_else(|| delivery.speaker.clone())
+            } else {
+                delivery.speaker.clone()
+            };
+            let intro_key = format!("room_intro:{}:{}", route.id, binding.agent_id);
+            let introduced = self
+                .store
+                .get_metadata(intro_key.clone())
+                .await
+                .map_err(error_string)?
+                .is_some();
+            let mut text = String::new();
+            if !introduced {
+                let members = live
+                    .route(&route.title)
+                    .map(|live_route| {
+                        live_route
+                            .agents
+                            .iter()
+                            .filter(|agent| agent.agent_id != binding.agent_id)
+                            .map(|agent| {
+                                names
+                                    .get(&agent.agent_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| agent.agent_id.clone())
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                text.push_str(&room_intro(&route.title, &members));
+                text.push_str("\n\n");
+            }
+            text.push_str(&format!("{speaker} says: {}", delivery.text));
+            let namespace = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"https://panetone.dev/rooms/v1");
+            let id = EffectId::new(Uuid::new_v5(
+                &namespace,
+                format!("{}\0{}", delivery.id, delivery.attempts).as_bytes(),
+            ));
+            delivery.attempts += 1;
+            let receipt = match self.wakterm.admit(id, &binding, &text, false, 0).await {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    tracing::warn!(error = %error, agent = %binding.agent_id, "room message was not delivered");
+                    self.store
+                        .set_room_delivery(delivery, "indeterminate".into())
+                        .await
+                        .map_err(error_string)?;
+                    continue;
+                }
+            };
+            let state = match receipt.status {
+                AdmissionStatus::Accepted => "delivered",
+                AdmissionStatus::Busy => match self.wakterm.steer(&binding, &text).await {
+                    Ok(_) => "delivered",
+                    // Nothing was written; the next pass offers it again.
+                    Err(WaktermCliError::TargetBlocked(_)) => continue,
+                    Err(error) => {
+                        tracing::warn!(error = %error, agent = %binding.agent_id, "room message was not steered");
+                        "indeterminate"
+                    }
+                },
+                _ if receipt.definitive && receipt.prompt_written != Some(true) => continue,
+                _ => "indeterminate",
+            };
+            if !introduced {
+                self.store
+                    .set_metadata(intro_key, "1".into())
+                    .await
+                    .map_err(error_string)?;
+            }
+            self.store
+                .set_room_delivery(delivery, state.into())
+                .await
+                .map_err(error_string)?;
+            done += 1;
+        }
+        Ok(done)
+    }
+
     /// Projects new agent messages from each endchat profile's log to the
     /// route it serves. A route's first read starts at the end of the log, so
     /// earlier history is not posted.
@@ -1082,6 +1288,7 @@ impl ProductionService {
         let after_sequence = self.event_cursor().await?;
         let routes = self.store.list_routes().await.map_err(error_string)?;
         let live = self.live_routes().await.map_err(error_string)?;
+        let rooms = self.store.rooms().await.map_err(error_string)?;
         let mut attempted = 0;
         for mut item in pending {
             let matching = routes
@@ -1091,6 +1298,29 @@ impl ProductionService {
             let [route] = matching.as_slice() else {
                 continue;
             };
+            // In a room a chat message joins the transcript and goes to every
+            // agent there.
+            if rooms.contains_key(&route.id.to_string()) {
+                let speaker = item
+                    .sender
+                    .as_deref()
+                    .and_then(|name| name.split_whitespace().next())
+                    .unwrap_or("Someone")
+                    .to_owned();
+                let text = item
+                    .body
+                    .strip_prefix(&format!("{speaker} says: "))
+                    .unwrap_or(&item.body)
+                    .to_owned();
+                self.post_to_room(&live, route, speaker, text).await?;
+                item.state = "delivered".into();
+                self.store
+                    .save_inbox(item.clone(), "pending", Some((route.id, item.channel)))
+                    .await
+                    .map_err(error_string)?;
+                attempted += 1;
+                continue;
+            }
             let reply_agent = match item.reply_to_external_id.as_ref() {
                 Some(receipt) => self
                     .store
@@ -1775,6 +2005,169 @@ impl ProductionService {
         }
     }
 
+    /// The control methods behind `panetone chat`: open a room, post to it,
+    /// wait for new messages, and change its settings.
+    async fn handle_room(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let title = params
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("a room request needs a title")?;
+        let routes = self.store.list_routes().await.map_err(error_string)?;
+        let route = exact_route(&routes, title)
+            .map_err(|_| format!("no route is titled {title:?}"))?
+            .clone();
+        let live = self.live_routes().await.map_err(error_string)?;
+        let names = self.room_names(&live).await?;
+        let rooms = self.store.rooms().await.map_err(error_string)?;
+        let mut settings = rooms.get(&route.id.to_string()).cloned();
+        match method {
+            "room.open" => {
+                if settings.is_none() {
+                    settings = Some(RoomSettings::default());
+                    self.store
+                        .set_room(route.id, settings.clone())
+                        .await
+                        .map_err(error_string)?;
+                }
+            }
+            "room.say" => {
+                let speaker = params
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or("Someone");
+                let text = params
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                    .ok_or("room.say needs text")?;
+                if settings.is_none() {
+                    return Err(format!("{title} is not a room; open it first"));
+                }
+                self.post_to_room(&live, &route, speaker.to_owned(), text.to_owned())
+                    .await?;
+                // The route's private chat mirrors the room.
+                if let Some((kind, destination)) =
+                    crate::service::offline::private_destination(&route)
+                {
+                    let namespace = Uuid::new_v5(
+                        &Uuid::NAMESPACE_URL,
+                        b"https://panetone.dev/rooms/mirror/v1",
+                    );
+                    self.store
+                        .enqueue_outbox(
+                            None,
+                            OutboxItem {
+                                id: EffectId::new(Uuid::new_v5(
+                                    &namespace,
+                                    format!("{}\0{}\0{}", route.id, now_ms(), text).as_bytes(),
+                                )),
+                                route_id: Some(route.id),
+                                sender_harness: None,
+                                source_agent: None,
+                                kind,
+                                destination,
+                                body: format!("{speaker}: {text}"),
+                                attachments: Vec::new(),
+                                actions: Vec::new(),
+                                state: OutboxState::Pending,
+                                attempts: 0,
+                                last_error: None,
+                                external_receipt: None,
+                                uncertain_attempts: 0,
+                            },
+                            now_ms(),
+                        )
+                        .await
+                        .map_err(error_string)?;
+                }
+            }
+            "room.set" => {
+                if params.get("off").and_then(serde_json::Value::as_bool) == Some(true) {
+                    settings = None;
+                } else if let Some(paused) =
+                    params.get("paused").and_then(serde_json::Value::as_bool)
+                {
+                    settings = Some(RoomSettings { paused });
+                }
+                self.store
+                    .set_room(route.id, settings.clone())
+                    .await
+                    .map_err(error_string)?;
+            }
+            _ => {}
+        }
+        let after = params
+            .get("after")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(-1);
+        let wait_ms = params
+            .get("wait_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            .min(25_000);
+        let deadline = now_ms() + wait_ms as i64;
+        let messages = loop {
+            let messages = self
+                .store
+                .room_messages(route.id, after, 50)
+                .await
+                .map_err(error_string)?;
+            if !messages.is_empty() || method != "room.poll" || now_ms() >= deadline {
+                break messages;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        };
+        let members = live
+            .route(&route.title)
+            .map(|live_route| {
+                live_route
+                    .agents
+                    .iter()
+                    .map(|agent| {
+                        json!({
+                            "name": names.get(&agent.agent_id).cloned().unwrap_or_else(|| agent.agent_id.clone()),
+                            "harness": agent.harness,
+                            "working": live.is_working(agent),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let messages = messages
+            .into_iter()
+            .map(|message| {
+                let name = if message.kind == "agent" {
+                    names
+                        .get(&message.speaker)
+                        .cloned()
+                        .unwrap_or(message.speaker)
+                } else {
+                    message.speaker
+                };
+                json!({
+                    "id": message.id,
+                    "kind": message.kind,
+                    "name": name,
+                    "harness": message.harness,
+                    "text": message.text,
+                    "at_ms": message.created_at_ms,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "room": route.title,
+            "open": settings.is_some(),
+            "paused": settings.as_ref().is_some_and(|settings| settings.paused),
+            "members": members,
+            "messages": messages,
+        }))
+    }
+
     async fn handle_reply_cancel(&self, id: Uuid, request_id: Uuid) -> ControlResponse {
         match self
             .store
@@ -2222,6 +2615,13 @@ impl ControlHandler for ProductionService {
             }
             match request.method.as_str() {
                 "status" => self.status_response(request.id).await,
+                "room.open" | "room.say" | "room.poll" | "room.set" => {
+                    let method = request.method.clone();
+                    match self.handle_room(&method, &request.params).await {
+                        Ok(result) => success_response(request.id, result),
+                        Err(detail) => error_response(request.id, "room_failed", detail, None),
+                    }
+                }
                 "reply.cancel" => match request
                     .params
                     .get("request_id")
@@ -2364,6 +2764,18 @@ fn reminder_body(owed: &[ReplyDebt], invalid: &[ReplyMessage]) -> String {
         "\nWhen you have the answer, write it in your normal output with [panetone:reply] on its own line outside code, adding the request ID when you owe several, for example [panetone:reply 1a2b3c4d]. A reply that you cannot do it counts as an answer. [panetone:progress] sends an update and keeps the request open. If the work is still running, send a progress update or nothing; you are reminded again only after something else wakes you.",
     );
     body
+}
+
+/// What an agent is told the first time a room message reaches it.
+fn room_intro(title: &str, members: &str) -> String {
+    let others = if members.is_empty() {
+        "the people in this chat".to_owned()
+    } else {
+        format!("{members} and the people in this chat")
+    };
+    format!(
+        "[Panetone room {title}] You are in a group chat with {others}. Everything you write in your replies is shown to everyone: it goes to the other agents as \"<your name> says: ...\", and their messages and the people's reach you the same way. Talk to the others by name when you mean them. When a message needs nothing from you, reply with exactly <panetone:no-reply> so the room stays quiet."
+    )
 }
 
 fn resolve_live(
@@ -3792,6 +4204,137 @@ fi
             .unwrap();
         assert_eq!(turn.turn_id, "endchat-3");
         assert!(!turn.superseded && !turn.started_by_reminder);
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn everyone_in_a_room_hears_everyone_else() {
+        let directory = tempdir().unwrap();
+        let binary = directory.path().join("wakterm-fake");
+        let admitted = directory.path().join("admitted.log");
+        fs::write(
+            &binary,
+            format!(
+                r#"#!/bin/bash
+set -euo pipefail
+operation="$*"
+if [[ "$operation" == *"agent capabilities"* ]]; then
+  printf '%s\n' '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
+elif [[ "$operation" == *"agent catalog"* ]]; then
+  printf '%s\n' '{{"schema":"wakterm.agent-api.v1","as_of_event_sequence":10,"agents":[{{"agent_id":"agent-claude","incarnation_id":"inc-claude","pane_id":1,"name":"game_claude","harness":"claude","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-10-20T00:00:00Z"}},{{"agent_id":"agent-agy","incarnation_id":"inc-agy","pane_id":2,"name":"game_agy","harness":"agy","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-10-20T00:00:00Z"}}]}}'
+elif [[ "$operation" == *"list --format json"* ]]; then
+  printf '%s\n' '[{{"pane_id":1,"tab_id":1,"window_id":1,"effective_title":"game"}},{{"pane_id":2,"tab_id":2,"window_id":1,"effective_title":"game"}}]'
+elif [[ "$operation" == *"agent admit"* ]]; then
+  agent=$(printf '%s\n' "$@" | grep -m1 '^agent-')
+  request_id=""
+  while (($#)); do
+    if [[ "$1" == "--request-id" ]]; then request_id=$2; break; fi
+    shift
+  done
+  {{ echo "== $agent"; cat; echo; }} >> '{log}'
+  incarnation=inc-${{agent#agent-}}
+  printf '{{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"accepted","definitive":true,"prompt_written":true,"agent_id":"%s","incarnation_id":"%s","detail":null}}\n' "$request_id" "$agent" "$incarnation"
+else
+  echo "unexpected fake invocation: $operation" >&2
+  exit 9
+fi
+"#,
+                log = admitted.display()
+            ),
+        )
+        .unwrap();
+        crate::test_support::seal_executable(&binary);
+        let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        let route = Route {
+            id: RouteId::new(Uuid::from_u128(700)),
+            title: "game".into(),
+            channels: vec![ChannelBinding::Telegram { topic_id: 70 }],
+            agent: None,
+        };
+        store.save_route(route.clone(), 1).await.unwrap();
+        store.initialize_event_cursor(100).await.unwrap();
+        let service = ProductionService::new(
+            store.clone(),
+            WaktermCli::new(
+                binary,
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            RealChannels::default(),
+            SupervisorHandle::default(),
+            vec!["event_stream.v1".into()],
+            directory.path().join("control.sock"),
+        );
+
+        let opened = service
+            .handle_room("room.open", &json!({"title": "game"}))
+            .await
+            .unwrap();
+        assert_eq!(opened["members"].as_array().unwrap().len(), 2);
+        service
+            .handle_room(
+                "room.say",
+                &json!({"title": "game", "name": "Mihai", "text": "let's design the boss"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(service.rooms_once().await.unwrap(), 2);
+        let log = fs::read_to_string(&admitted).unwrap();
+        // Each agent gets the message once, and the room explained the first time.
+        assert_eq!(log.matches("Mihai says: let's design the boss").count(), 2);
+        assert_eq!(log.matches("[Panetone room game]").count(), 2);
+        assert!(log.contains("group chat with game_agy and the people"));
+
+        // An agent's reply joins the room and goes to the other agent only.
+        let reply: crate::wakterm::EventRecord = serde_json::from_value(json!({
+            "sequence": 101,
+            "event_id": "event-101",
+            "kind": "assistant_message",
+            "agent_id": "agent-claude",
+            "incarnation_id": "inc-claude",
+            "turn_id": "turn-1",
+            "observed_at": "2099-01-01T00:00:00Z",
+            "text": "A tide-based boss?",
+        }))
+        .unwrap();
+        let live = service.live_routes().await.unwrap();
+        let agents = project_live_routes(std::slice::from_ref(&route), &live).unwrap();
+        store
+            .ingest_agent_events(100, 101, vec![reply], agents, now_ms())
+            .await
+            .unwrap();
+        fs::write(&admitted, "").unwrap();
+        assert_eq!(service.rooms_once().await.unwrap(), 1);
+        let log = fs::read_to_string(&admitted).unwrap();
+        assert!(
+            log.starts_with("== agent-agy\ngame_claude says: A tide-based boss?"),
+            "{log}"
+        );
+
+        let transcript = service
+            .handle_room("room.poll", &json!({"title": "game", "after": 0}))
+            .await
+            .unwrap();
+        let lines = transcript["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| {
+                format!(
+                    "{}: {}",
+                    message["name"].as_str().unwrap(),
+                    message["text"].as_str().unwrap()
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            [
+                "Mihai: let's design the boss",
+                "game_claude: A tide-based boss?"
+            ]
+        );
         drop(service);
         store.shutdown().await.unwrap();
     }

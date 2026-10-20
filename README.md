@@ -182,6 +182,14 @@ Add `--reply` (or its older name `--return-final`) when a reply is wanted. The t
 
 A sender outside Wakterm, such as a remote assistant with shell access, names itself with `--as NAME`, for example `panetone send --as orch --to wakterm "..."`. The target sees `From: orch (external)`, and such a send is one-way, since there is no agent to return a final to. A script that sends notifications this way should follow the [retry rules](docs/control-protocol.md#idempotency-and-retries): stop on exit status 0, and reuse one `--id` per event so a retry never delivers twice. Use `--from ROUTE` to override the calling pane's route for the shared channel mirror and audit identity. A final callback still returns to the exact calling agent while it remains live. If that agent has exited, Panetone falls back to the selected source route's current agent.
 
+Chat with every agent on a route at once from a terminal:
+
+```sh
+target/release/panetone chat evilcorp
+```
+
+This makes the route a room. Everyone in a room sees every message: what you type goes to each of the route's agents, and each agent's output goes to the other agents, the terminal and the route's Telegram or Signal channel. Messages from the route's channel join the room too. The first message an agent gets explains the room and tells it to answer with exactly `<panetone:no-reply>` when it has nothing to add, which keeps the room quiet. Your name defaults to your login name; `--as NAME` sets another. In the chat, `/pause` stops passing agents' messages to each other while yours still reach everyone, `/resume` restarts that, `/off` turns the room back into an ordinary route, and `/quit` leaves with the room still open. In Wakterm, WezTerm or iTerm2 each speaker is marked with a small icon drawn through the iTerm2 inline image protocol; elsewhere, or with `PANETONE_CHAT_PLAIN` set, a coloured dot.
+
 Run a side-effect-free local check against the loaded Wakterm service:
 
 ```sh

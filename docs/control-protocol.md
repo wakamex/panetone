@@ -270,6 +270,17 @@ When a turn of the target ends while it owes a reply, and nothing starts another
 
 Requests that Wakterm correlated with a provider turn before replies were tagged still return that turn's final response through the terminal stream. The terminal watcher calls Wakterm only while such a request has no stored terminal result.
 
+## Rooms
+
+A room is a route whose agents and people all see every message. Each room method takes `{"title": ROUTE_TITLE}` plus the fields below and returns the room: `room` (the title), `open`, `paused`, `members` (each live agent's `name`, `harness` and whether it is `working`) and `messages` (each with `id`, `kind` (`user` or `agent`), `name`, `harness` for an agent, `text` and `at_ms`).
+
+- `room.open` makes the route a room if it is not one and returns the last 50 messages.
+- `room.say` takes `name` and `text`, adds the message to the room, queues it for every live agent on the route, and mirrors it to the route's private channel as `NAME: text`.
+- `room.poll` takes `after`, a message ID, and `wait_ms`, at most 25,000. It returns the messages after `after`, waiting up to `wait_ms` for one to arrive.
+- `room.set` takes `paused: bool` to stop or restart passing agents' messages to the other agents, or `off: true` to turn the room back into an ordinary route.
+
+An agent's visible output on a room route, without tags or attachment lines, joins the room and is queued for the route's other agents; it is also projected to the route's channel as usual. A message from the route's channel joins the room under the sender's first name and goes to every agent, instead of being admitted to one. Each queued message is admitted to an idle agent or steered into a busy one's turn as `NAME says: text`. The first message an agent receives in a room opens with an explanation of the room and the instruction to answer exactly `<panetone:no-reply>` when it has nothing to add; such an answer is not posted.
+
 ## Status
 
 The `status` method takes null parameters. Its result includes:

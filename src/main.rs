@@ -37,6 +37,8 @@ enum Command {
     Status(StatusArgs),
     /// Withdraw a request's reply, so its target is no longer reminded.
     Cancel(CancelArgs),
+    /// Chat in a room: a route whose agents and people all see every message.
+    Chat(ChatArgs),
     /// Inspect or establish durable workspace routes.
     Route(RouteArgs),
     /// Wait for durable routing of exact Wakterm agent output.
@@ -148,6 +150,17 @@ struct SendArgs {
     #[command(flatten)]
     control: ControlSocketArgs,
     message: String,
+}
+
+#[derive(Args)]
+struct ChatArgs {
+    /// The route to chat in. It becomes a room if it is not one already.
+    room: String,
+    /// The name others see for you (default: your login name, capitalized).
+    #[arg(long = "as")]
+    name: Option<String>,
+    #[command(flatten)]
+    control: ControlSocketArgs,
 }
 
 #[derive(Args)]
@@ -281,6 +294,17 @@ async fn main() -> Result<()> {
         Command::Send(args) => run_send(args).await,
         Command::Status(args) => run_status(args).await,
         Command::Cancel(args) => run_cancel(args).await,
+        Command::Chat(args) => {
+            let name = args.name.unwrap_or_else(|| {
+                let login = std::env::var("USER").unwrap_or_else(|_| "you".into());
+                let mut letters = login.chars();
+                letters
+                    .next()
+                    .map(|first| first.to_uppercase().chain(letters).collect())
+                    .unwrap_or(login)
+            });
+            panetone::chat::run(control_socket(args.control.socket)?, args.room, name).await
+        }
         Command::Route(args) => run_route(args).await,
         Command::Output(args) => run_output(args).await,
         Command::Doctor(args) => run_doctor(args).await,
@@ -299,6 +323,7 @@ enum ProductionWorker {
     Typing,
     Replies,
     Endchat,
+    Rooms,
 }
 
 async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
@@ -416,6 +441,7 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
         ("typing", ProductionWorker::Typing),
         ("replies", ProductionWorker::Replies),
         ("endchat", ProductionWorker::Endchat),
+        ("rooms", ProductionWorker::Rooms),
     ] {
         let service = handler.clone();
         let shutdown = supervisor.shutdown_receiver();
@@ -633,6 +659,7 @@ async fn run_production_worker(
         ProductionWorker::RouteHealth => service.route_health_once().await?,
         ProductionWorker::Replies => service.replies_once().await?,
         ProductionWorker::Endchat => service.endchat_once().await?,
+        ProductionWorker::Rooms => service.rooms_once().await?,
         // The indicator is cosmetic, so a failed pass is not a daemon problem.
         ProductionWorker::Typing => service.typing_once().await.unwrap_or_else(|error| {
             tracing::debug!(error = %error, "typing indicator pass failed");

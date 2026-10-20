@@ -88,7 +88,7 @@ async fn store_is_private_and_rejects_newer_schemas() {
         StoreHandle::open(&path),
         Err(StoreError::NewerSchema {
             found: 99,
-            supported: 8
+            supported: 9
         })
     ));
 }
@@ -105,7 +105,7 @@ async fn version_five_is_rejected() {
         StoreHandle::open(&path),
         Err(StoreError::OlderSchema {
             found: 5,
-            supported: 8
+            supported: 9
         })
     ));
 }
@@ -154,7 +154,7 @@ async fn version_six_routes_drop_persisted_runtime_bindings() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     let route_json: serde_json::Value = serde_json::from_str(
         &connection
             .query_row(
