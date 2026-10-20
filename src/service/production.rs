@@ -847,13 +847,27 @@ impl ProductionService {
             } else {
                 delivery.speaker.clone()
             };
+            // An agent alone with one person is in an ordinary conversation, so
+            // its prompt carries no room intro or speaker name; an endchat
+            // profile, for one, keeps every prompt in its log word for word.
+            let alone = live
+                .route(&route.title)
+                .is_ok_and(|live_route| live_route.agents.len() == 1);
+            let named = !alone
+                || self
+                    .store
+                    .room_people(route.id)
+                    .await
+                    .map_err(error_string)?
+                    > 1;
             let intro_key = format!("room_intro:{}:{}", route.id, binding.agent_id);
-            let introduced = self
-                .store
-                .get_metadata(intro_key.clone())
-                .await
-                .map_err(error_string)?
-                .is_some();
+            let introduced = alone
+                || self
+                    .store
+                    .get_metadata(intro_key.clone())
+                    .await
+                    .map_err(error_string)?
+                    .is_some();
             let mut text = String::new();
             if !introduced {
                 let members = live
@@ -876,7 +890,10 @@ impl ProductionService {
                 text.push_str(&room_intro(&route.title, &members));
                 text.push_str("\n\n");
             }
-            text.push_str(&format!("{speaker} says: {}", delivery.text));
+            if named {
+                text.push_str(&format!("{speaker} says: "));
+            }
+            text.push_str(&delivery.text);
             let namespace = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"https://panetone.dev/rooms/v1");
             let id = EffectId::new(Uuid::new_v5(
                 &namespace,
@@ -4236,11 +4253,14 @@ fi
         store.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn everyone_in_a_room_hears_everyone_else() {
-        let directory = tempdir().unwrap();
-        let binary = directory.path().join("wakterm-fake");
-        let admitted = directory.path().join("admitted.log");
+    /// A service whose fake Wakterm runs one agent per harness, all titled
+    /// `game`, and logs each admitted prompt to `admitted.log`.
+    async fn room_fixture(
+        directory: &std::path::Path,
+        harnesses: &[&str],
+    ) -> (ProductionService, StoreHandle, Route, std::path::PathBuf) {
+        let binary = directory.join("wakterm-fake");
+        let admitted = directory.join("admitted.log");
         fs::write(
             &binary,
             format!(
@@ -4250,9 +4270,9 @@ operation="$*"
 if [[ "$operation" == *"agent capabilities"* ]]; then
   printf '%s\n' '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
 elif [[ "$operation" == *"agent catalog"* ]]; then
-  printf '%s\n' '{{"schema":"wakterm.agent-api.v1","as_of_event_sequence":10,"agents":[{{"agent_id":"agent-claude","incarnation_id":"inc-claude","pane_id":1,"name":"game_claude","harness":"claude","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-10-20T00:00:00Z"}},{{"agent_id":"agent-agy","incarnation_id":"inc-agy","pane_id":2,"name":"game_agy","harness":"agy","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-10-20T00:00:00Z"}}]}}'
+  printf '%s\n' '{catalog}'
 elif [[ "$operation" == *"list --format json"* ]]; then
-  printf '%s\n' '[{{"pane_id":1,"tab_id":1,"window_id":1,"effective_title":"game"}},{{"pane_id":2,"tab_id":2,"window_id":1,"effective_title":"game"}}]'
+  printf '%s\n' '{panes}'
 elif [[ "$operation" == *"agent admit"* ]]; then
   agent=$(printf '%s\n' "$@" | grep -m1 '^agent-')
   request_id=""
@@ -4268,12 +4288,33 @@ else
   exit 9
 fi
 "#,
-                log = admitted.display()
+                log = admitted.display(),
+                catalog = json!({
+                    "schema": "wakterm.agent-api.v1",
+                    "as_of_event_sequence": 10,
+                    "agents": harnesses.iter().enumerate().map(|(index, harness)| json!({
+                        "agent_id": format!("agent-{harness}"),
+                        "incarnation_id": format!("inc-{harness}"),
+                        "pane_id": index + 1,
+                        "name": format!("game_{harness}"),
+                        "harness": harness,
+                        "status": "idle",
+                        "turn_state": "waiting_on_user",
+                        "alive": true,
+                        "observed_at": "2026-10-20T00:00:00Z",
+                    })).collect::<Vec<_>>(),
+                }),
+                panes = json!(harnesses.iter().enumerate().map(|(index, _)| json!({
+                    "pane_id": index + 1,
+                    "tab_id": index + 1,
+                    "window_id": 1,
+                    "effective_title": "game",
+                })).collect::<Vec<_>>()),
             ),
         )
         .unwrap();
         crate::test_support::seal_executable(&binary);
-        let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        let store = StoreHandle::open(directory.join("state.sqlite3")).unwrap();
         let route = Route {
             id: RouteId::new(Uuid::from_u128(700)),
             title: "game".into(),
@@ -4284,16 +4325,59 @@ fi
         store.initialize_event_cursor(100).await.unwrap();
         let service = ProductionService::new(
             store.clone(),
-            WaktermCli::new(
-                binary,
-                directory.path().join("mux.sock"),
-                Duration::from_secs(2),
-            ),
+            WaktermCli::new(binary, directory.join("mux.sock"), Duration::from_secs(2)),
             RealChannels::default(),
             SupervisorHandle::default(),
             vec!["event_stream.v1".into()],
-            directory.path().join("control.sock"),
+            directory.join("control.sock"),
         );
+        (service, store, route, admitted)
+    }
+
+    #[tokio::test]
+    async fn an_agent_alone_with_one_person_gets_plain_messages() {
+        let directory = tempdir().unwrap();
+        let (service, store, _route, admitted) = room_fixture(directory.path(), &["claude"]).await;
+        service
+            .handle_room("room.open", &json!({"title": "game"}))
+            .await
+            .unwrap();
+        service
+            .handle_room(
+                "room.say",
+                &json!({"title": "game", "name": "Mihai", "text": "what did I decide?"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(service.rooms_once().await.unwrap(), 1);
+        assert_eq!(
+            fs::read_to_string(&admitted).unwrap(),
+            "== agent-claude\nwhat did I decide?\n"
+        );
+
+        // A second person makes speakers worth naming.
+        fs::write(&admitted, "").unwrap();
+        service
+            .handle_room(
+                "room.say",
+                &json!({"title": "game", "name": "Andrew", "text": "and what did I decide?"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(service.rooms_once().await.unwrap(), 1);
+        assert_eq!(
+            fs::read_to_string(&admitted).unwrap(),
+            "== agent-claude\nAndrew says: and what did I decide?\n"
+        );
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn everyone_in_a_room_hears_everyone_else() {
+        let directory = tempdir().unwrap();
+        let (service, store, route, admitted) =
+            room_fixture(directory.path(), &["claude", "agy"]).await;
 
         let opened = service
             .handle_room("room.open", &json!({"title": "game"}))

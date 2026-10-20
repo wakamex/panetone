@@ -191,6 +191,16 @@ pub(super) fn set_delivery(
     Ok(())
 }
 
+/// How many different people have spoken in a room.
+pub(super) fn people(connection: &Connection, route_id: RouteId) -> StoreResult<usize> {
+    Ok(connection.query_row(
+        "SELECT COUNT(DISTINCT json_extract(record_json, '$.speaker')) FROM room_messages
+         WHERE route_id = ?1 AND json_extract(record_json, '$.kind') = 'user'",
+        params![route_id.to_string()],
+        |row| row.get::<_, i64>(0),
+    )? as usize)
+}
+
 pub(super) fn latest_message_id(connection: &Connection, route_id: RouteId) -> StoreResult<i64> {
     Ok(connection
         .query_row(

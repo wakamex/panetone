@@ -517,6 +517,11 @@ impl StoreHandle {
             .await
     }
 
+    pub async fn room_people(&self, route_id: RouteId) -> StoreResult<usize> {
+        self.run(move |connection| rooms::people(connection, route_id))
+            .await
+    }
+
     pub async fn latest_room_message(&self, route_id: RouteId) -> StoreResult<i64> {
         self.run(move |connection| rooms::latest_message_id(connection, route_id))
             .await
