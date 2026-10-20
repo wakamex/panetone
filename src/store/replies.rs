@@ -70,6 +70,10 @@ pub struct ReplyMessage {
     pub created_at_ms: i64,
     /// `pending`, then `sent` or `failed`; an invalid tag becomes `reported`.
     pub state: String,
+    /// Deliveries that failed before the sender was prompted, so the reply
+    /// stayed pending.
+    #[serde(default)]
+    pub attempts: u32,
 }
 
 /// How the last turn of an agent ended, for deciding on a reminder.
@@ -334,6 +338,7 @@ pub(super) fn record_tag(
         body: error.unwrap_or_else(|| body.to_owned()),
         created_at_ms: now_ms,
         state: "pending".into(),
+        attempts: 0,
     };
     transaction.execute(
         "INSERT OR IGNORE INTO reply_messages(
@@ -412,6 +417,28 @@ pub(super) fn set_message_state(
     connection.execute(
         "UPDATE reply_messages SET state = ?2, record_json = ?3 WHERE effect_id = ?1",
         params![id.to_string(), state, serde_json::to_string(&message)?],
+    )?;
+    Ok(())
+}
+
+/// Counts a delivery that failed before the sender was prompted; the reply
+/// stays pending.
+pub(super) fn count_attempt(connection: &mut Connection, id: EffectId) -> StoreResult<()> {
+    let Some(json) = connection
+        .query_row(
+            "SELECT record_json FROM reply_messages WHERE effect_id = ?1",
+            params![id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    else {
+        return Ok(());
+    };
+    let mut message: ReplyMessage = serde_json::from_str(&json)?;
+    message.attempts += 1;
+    connection.execute(
+        "UPDATE reply_messages SET record_json = ?2 WHERE effect_id = ?1",
+        params![id.to_string(), serde_json::to_string(&message)?],
     )?;
     Ok(())
 }

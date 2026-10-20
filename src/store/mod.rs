@@ -571,6 +571,11 @@ impl StoreHandle {
             .await
     }
 
+    pub async fn count_reply_attempt(&self, id: EffectId) -> StoreResult<()> {
+        self.run(move |connection| replies::count_attempt(connection, id))
+            .await
+    }
+
     pub async fn last_turn_end(
         &self,
         agent_id: String,

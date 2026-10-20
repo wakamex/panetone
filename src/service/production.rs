@@ -41,6 +41,10 @@ const INBOX_PROOF_WINDOW_MS: i64 = 120_000;
 /// How long after an agent's turn ends a reminder waits, so that a turn
 /// something else starts meanwhile is checked instead.
 const REPLY_REMINDER_DELAY_MS: i64 = 30_000;
+/// How often a reply whose channel post failed is tried again: at least half
+/// an hour at the reply worker's 5-second interval.
+const REPLY_ATTEMPTS: u32 = 360;
+
 /// Metadata naming the endchat profile that serves a route, by route ID.
 const ENDCHAT_PROFILES_KEY: &str = "endchat_profiles_v1";
 /// Metadata remembering each room speaker's display name, by agent ID.
@@ -1112,8 +1116,16 @@ impl ProductionService {
         } else {
             "Progress on your request"
         };
+        // Each new attempt is a new request, since a failed one stays failed.
+        let id = match message.attempts {
+            0 => message.id.as_uuid(),
+            attempt => Uuid::new_v5(
+                &message.id.as_uuid(),
+                format!("attempt-{attempt}").as_bytes(),
+            ),
+        };
         let command = SendCommand {
-            id: WorkflowId::new(message.id.as_uuid()),
+            id: WorkflowId::new(id),
             source: debt.target.clone(),
             target: debt.source.clone(),
             message: format!(
@@ -1137,6 +1149,16 @@ impl ProductionService {
         let state = match outcome {
             Ok(_) => "sent",
             Err(ServiceError::RouteUnavailable(_) | ServiceError::TargetBlocked(_)) => {
+                return Ok(false);
+            }
+            // The channel post that must precede the prompt failed, so the
+            // sender was not prompted; try again.
+            Err(ServiceError::AuditFailed(error)) if message.attempts < REPLY_ATTEMPTS => {
+                tracing::warn!(error = %error, request = %debt.request_id, attempt = message.attempts + 1, "reply will be retried");
+                self.store
+                    .count_reply_attempt(message.id)
+                    .await
+                    .map_err(error_string)?;
                 return Ok(false);
             }
             Err(error) => {
@@ -4025,6 +4047,12 @@ fi
             )
             .await
             .unwrap();
+        // While the channel post that precedes the prompt fails, the reply
+        // stays pending, and it is sent once the channel is back.
+        workflows.channels().fail(ChannelKind::Telegram);
+        assert_eq!(service.replies_once().await.unwrap(), 0);
+        assert!(workflows.wakterm().calls().is_empty());
+        workflows.channels().restore(ChannelKind::Telegram);
         assert_eq!(service.replies_once().await.unwrap(), 1);
         let calls = workflows.wakterm().calls();
         assert_eq!(calls.len(), 1);
