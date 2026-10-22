@@ -1053,3 +1053,93 @@ async fn current_live_profile_exposes_the_general_event_cursor_contract() {
     drop(service);
     store.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn an_unacknowledged_steer_waits_for_the_target_to_record_it() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+    let wakterm = FakeWakterm::new(contract());
+    wakterm.script_receipts([AdmissionStatus::Busy, AdmissionStatus::Busy]);
+    wakterm.leave_steering_unacknowledged();
+    let service = OfflineService::new(store.clone(), wakterm, RecordingChannels::default());
+    let (source, target) = routes();
+    let send = |value| {
+        let mut request = command(value, false);
+        request.steer = true;
+        request.reply = true;
+        request.message = format!("question {value}");
+        request
+    };
+    let taken = send(130);
+    let lost = send(131);
+    for request in [&taken, &lost] {
+        let ack = service
+            .submit(request.clone(), &source, &target, 100)
+            .await
+            .unwrap();
+        assert_eq!(ack.steering_acknowledged, Some(false));
+    }
+    let state = |id| {
+        let store = store.clone();
+        async move {
+            store
+                .get_workflow(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .workflow
+                .state
+        }
+    };
+    assert_eq!(state(taken.id).await, WorkflowState::Submitted);
+    assert_eq!(service.settle_steered_sends(200).await.unwrap(), 0);
+
+    // The target records taking the first message.
+    let typed = &service.wakterm().steering_calls()[0].prompt;
+    let event: panetone::wakterm::EventRecord = serde_json::from_value(serde_json::json!({
+        "sequence": 101,
+        "event_id": "input-event-101",
+        "kind": "input_accepted",
+        "agent_id": "agent-target",
+        "incarnation_id": "target-incarnation-1",
+        "turn_id": "turn-1",
+        "input_sha256": panetone::store::DeliveryProof::input_sha256(typed),
+    }))
+    .unwrap();
+    store.save_route(target.clone(), 1).await.unwrap();
+    let agents = vec![panetone::store::RouteAgent {
+        route_id: target.id,
+        agent: target.agent.clone().unwrap(),
+    }];
+    store
+        .ingest_agent_events(100, 101, vec![event], agents, 300)
+        .await
+        .unwrap();
+    assert_eq!(service.settle_steered_sends(300).await.unwrap(), 1);
+    assert_eq!(state(taken.id).await, WorkflowState::Completed);
+    assert_eq!(state(lost.id).await, WorkflowState::Submitted);
+
+    // The second is never recorded: its sender is told when the window ends.
+    assert_eq!(
+        service
+            .settle_steered_sends(100 + 10 * 60 * 1000)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(state(lost.id).await, WorkflowState::Indeterminate);
+    let notice = service.wakterm().calls().last().unwrap().clone();
+    assert_eq!(notice.binding.agent_id, "agent-source");
+    assert!(notice.prompt.starts_with(&format!(
+        "[Panetone unconfirmed send] Your message to target (request {}, \"question 131\") may not have arrived",
+        lost.id
+    )));
+    assert!(
+        notice
+            .prompt
+            .contains(&format!("panetone cancel {}", lost.id))
+    );
+    drop(service);
+    store.shutdown().await.unwrap();
+}

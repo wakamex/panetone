@@ -68,6 +68,10 @@ pub struct StoredWorkflow {
     pub response: Option<Value>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// For a message steered into a busy target without acknowledgement, what
+    /// shows that the target took it; the send stays submitted until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<DeliveryProof>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -660,6 +664,18 @@ impl StoreHandle {
             record: Box::new(record),
             expected,
             reply,
+        })
+        .await
+    }
+
+    /// Sends steered without acknowledgement, still waiting for the target to
+    /// record taking them.
+    pub async fn awaiting_send_proof(&self) -> StoreResult<Vec<StoredWorkflow>> {
+        self.run(|connection| {
+            Ok(workflows_by_state(connection, WorkflowState::Submitted)?
+                .into_iter()
+                .filter(|record| record.proof.is_some())
+                .collect())
         })
         .await
     }
@@ -1320,6 +1336,7 @@ fn claim(
         response: None,
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
+        proof: None,
     };
     let transaction = connection.transaction()?;
     transaction.execute(

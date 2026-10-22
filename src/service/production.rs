@@ -578,9 +578,14 @@ impl ProductionService {
     }
 
     pub async fn busy_once(&self) -> Result<usize, String> {
+        let settled = self
+            .workflows
+            .settle_steered_sends(now_ms())
+            .await
+            .map_err(error_string)?;
         let workflows = self.store.awaiting_target().await.map_err(error_string)?;
         if workflows.is_empty() {
-            return Ok(0);
+            return Ok(settled);
         }
         let live = self.live_routes().await.map_err(error_string)?;
         let mut attempted = 0;

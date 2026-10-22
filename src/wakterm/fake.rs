@@ -38,6 +38,8 @@ pub struct FakeWakterm {
     receipts: Mutex<VecDeque<AdmissionStatus>>,
     calls: Mutex<Vec<AdmissionCall>>,
     steering_calls: Mutex<Vec<SteeringCall>>,
+    /// Steers go unacknowledged, as when the agent records no input in time.
+    steering_unacknowledged: std::sync::atomic::AtomicBool,
 }
 
 impl FakeWakterm {
@@ -47,7 +49,13 @@ impl FakeWakterm {
             receipts: Mutex::new(VecDeque::new()),
             calls: Mutex::new(Vec::new()),
             steering_calls: Mutex::new(Vec::new()),
+            steering_unacknowledged: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    pub fn leave_steering_unacknowledged(&self) {
+        self.steering_unacknowledged
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn capabilities(&self) -> &std::collections::BTreeSet<String> {
@@ -123,7 +131,9 @@ impl FakeWakterm {
                 binding: binding.clone(),
                 prompt,
             });
-        true
+        !self
+            .steering_unacknowledged
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn steering_calls(&self) -> Vec<SteeringCall> {

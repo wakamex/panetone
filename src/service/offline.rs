@@ -11,9 +11,14 @@ use crate::domain::{
     signal_group_account,
 };
 use crate::store::{
-    ClaimResult, DestinationDelivery, ReplyDebt, ReturnDelivery, StoreError, StoreHandle,
-    StoredWorkflow,
+    ClaimResult, DeliveryProof, DestinationDelivery, ReplyDebt, ReturnDelivery, StoreError,
+    StoreHandle, StoredWorkflow,
 };
+
+/// How long a message steered into a busy target without acknowledgement
+/// waits for the target to record taking it. Wakterm submits a steer an agent
+/// left in its input box when the turn ends, following it for 10 minutes.
+const SEND_PROOF_WINDOW_MS: i64 = 10 * 60 * 1000;
 use crate::wakterm::{
     ContractError, EventRead, FakeWakterm, TerminalResult, WaktermCli, WaktermCliError,
 };
@@ -548,6 +553,14 @@ impl OfflineService {
         )
         .await?;
         self.faults.hit(FaultPoint::AfterAdmissionPrepared)?;
+        // Read before anything is typed, so the target's record of taking the
+        // message cannot come before it.
+        let after_sequence = self
+            .store
+            .get_metadata("wakterm_event_cursor".into())
+            .await?
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_default();
         let prompt = FakeWakterm::envelope(
             &record.command,
             &record.workflow.observed_source.harness,
@@ -588,7 +601,7 @@ impl OfflineService {
         // A target whose keyboard is held by a dialog cannot be steered; the
         // request then waits in the busy queue like an unsteered one.
         let steering = if receipt.status == AdmissionStatus::Busy && record.command.steer {
-            match self.wakterm.steer(&target, prompt).await {
+            match self.wakterm.steer(&target, prompt.clone()).await {
                 Err(ServiceError::TargetBlocked(_)) => None,
                 result => Some(result),
             }
@@ -619,6 +632,16 @@ impl OfflineService {
                 }
             };
             self.faults.hit(FaultPoint::AfterSteeringEffect)?;
+            if !acknowledged {
+                record.proof = Some(DeliveryProof {
+                    agent_id: target.agent_id.clone(),
+                    after_sequence,
+                    input_sha256: DeliveryProof::input_sha256(&prompt),
+                    tab_expanded_sha256: DeliveryProof::tab_expanded_sha256(&prompt),
+                    deadline_ms: now_ms + SEND_PROOF_WINDOW_MS,
+                    detail: "it was typed into the busy agent's turn, but the agent did not acknowledge it".into(),
+                });
+            }
             record.workflow.submitted_target = Some(target);
             let ack = ServiceAck::steered(acknowledged, &record.command);
             record.response = Some(serde_json::to_value(&ack)?);
@@ -713,7 +736,7 @@ impl OfflineService {
                 if ack.steering_acknowledged == Some(true) {
                     "active-turn steering submitted and observer acknowledged"
                 } else {
-                    "active-turn steering submitted without observer acknowledgement"
+                    "active-turn steering submitted without acknowledgement; waiting for the agent to record it"
                 },
             )
         } else {
@@ -722,8 +745,74 @@ impl OfflineService {
         self.post_target_status(&record, target_channel, purpose, detail, now_ms)
             .await?;
         record.response = Some(serde_json::to_value(&ack)?);
+        if record.proof.is_some() {
+            // Settled by settle_steered_sends once the target records it.
+            record.updated_at_ms = now_ms;
+            self.store
+                .save_workflow(record, WorkflowState::Submitted)
+                .await?;
+            return Ok(ack);
+        }
         transition(&self.store, &mut record, WorkflowState::Completed, now_ms).await?;
         Ok(ack)
+    }
+
+    /// Settles sends steered into a busy target without acknowledgement. One
+    /// completes once the target records taking the message; if the deadline
+    /// passes first, it becomes indeterminate and its sender is told the
+    /// message may not have arrived.
+    pub async fn settle_steered_sends(&self, now_ms: i64) -> Result<usize, ServiceError> {
+        let mut settled = 0;
+        for mut record in self.store.awaiting_send_proof().await? {
+            let Some(proof) = record.proof.clone() else {
+                continue;
+            };
+            let next = if self.store.input_recorded(proof.clone()).await? {
+                WorkflowState::Completed
+            } else if now_ms >= proof.deadline_ms {
+                self.notify_unconfirmed_send(&record, &proof).await;
+                WorkflowState::Indeterminate
+            } else {
+                continue;
+            };
+            transition(&self.store, &mut record, next, now_ms).await?;
+            settled += 1;
+        }
+        Ok(settled)
+    }
+
+    async fn notify_unconfirmed_send(&self, record: &StoredWorkflow, proof: &DeliveryProof) {
+        let command = &record.command;
+        let mut text = format!(
+            "[Panetone unconfirmed send] Your message to {} (request {}, \"{}\") may not have arrived: {}, and in {} minutes Wakterm recorded no sign of it taking the message. Resend it with a new request ID if it still matters.",
+            command.target,
+            command.id,
+            request_summary(&command.message),
+            proof.detail,
+            SEND_PROOF_WINDOW_MS / 60_000,
+        );
+        if command.reply {
+            text.push_str(&format!(
+                " The reply you asked for stays owed until you withdraw it with panetone cancel {}.",
+                command.id
+            ));
+        }
+        let source = &record.workflow.observed_source;
+        let id = EffectId::named(command.id, "unconfirmed-send-notice");
+        let notice = match self.wakterm.admit(id, source, text.clone(), false, 0).await {
+            Ok(receipt) if receipt.status == AdmissionStatus::Busy => {
+                self.wakterm.steer(source, text).await.map(|_| ())
+            }
+            Ok(receipt) if receipt.status == AdmissionStatus::Accepted => Ok(()),
+            Ok(receipt) => Err(ServiceError::Adapter(format!(
+                "the sender was not prompted: {:?}",
+                receipt.status
+            ))),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = notice {
+            tracing::warn!(error = %error, request = %command.id, "unconfirmed-send notice was not delivered");
+        }
     }
 
     async fn post_target_status(
