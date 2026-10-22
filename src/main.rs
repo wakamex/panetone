@@ -523,6 +523,11 @@ type SignalRuntime = (PathBuf, String, String, Option<PathBuf>);
 
 type ProductionChannels = (RealChannels, Option<TelegramRuntime>, Vec<SignalRuntime>);
 
+/// How long a Telegram request may take. Telegram sometimes stalls for tens of
+/// seconds; a shorter deadline abandons posts that would have gone through,
+/// leaving them possibly posted and inviting a duplicate on retry.
+const TELEGRAM_DEADLINE: Duration = Duration::from_secs(45);
+
 fn production_channels(args: &ProductionArgs, deadline: Duration) -> Result<ProductionChannels> {
     let mut channels = RealChannels::default();
     let tokens = [
@@ -544,7 +549,7 @@ fn production_channels(args: &ProductionArgs, deadline: Duration) -> Result<Prod
             {
                 channels.telegram_by_harness.insert(
                     harness.into(),
-                    TelegramClient::new(&args.telegram_api_base, token, chat, deadline)?,
+                    TelegramClient::new(&args.telegram_api_base, token, chat, TELEGRAM_DEADLINE)?,
                 );
             }
             channels.telegram = channels.telegram_by_harness.get("claude").cloned();

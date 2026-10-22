@@ -18,6 +18,8 @@ use crate::domain::{ChannelKind, OutboxItem, SIGNAL_DIRECT_PREFIX};
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const TELEGRAM_GROUP_INTERVAL: Duration = Duration::from_millis(3100);
 const TELEGRAM_RETRY_MARGIN: Duration = Duration::from_millis(100);
+/// A Telegram send slower than this is logged, to show how often Telegram stalls.
+const SLOW_TELEGRAM_SEND: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeliveryReceipt {
@@ -116,6 +118,7 @@ impl TelegramClient {
             .parse::<i64>()
             .map_err(|_| ChannelDeliveryError::InvalidDestination(item.kind))?;
         let mut next_send = self.wait_for_send().await;
+        let started = Instant::now();
         let result = if !item.attachments.is_empty() {
             telegram_send_attachments(
                 &self.http,
@@ -143,6 +146,15 @@ impl TelegramClient {
             }
             telegram_send(&self.http, &self.api_base, &self.token, payload, item).await
         };
+        let elapsed = started.elapsed();
+        if elapsed > SLOW_TELEGRAM_SEND {
+            tracing::warn!(
+                elapsed_ms = elapsed.as_millis() as u64,
+                topic_id,
+                ok = result.is_ok(),
+                "slow Telegram send"
+            );
+        }
         *next_send = Instant::now() + self.delay_after(result.as_ref().err());
         result
     }
