@@ -288,6 +288,7 @@ The `status` method takes null parameters. Its result includes:
 - package version, production mode, and uptime
 - durable workflow, inbox, outbox, return, tombstone, and cursor counts
 - `replies_owed`: each open reply debt with its request ID, sender, target, age and the first line of the request
+- `queued`: each send waiting for a busy target to become idle, with its request ID, sender, target, age, whether it asks for a reply, and the first line of the request. A reply is owed only once such a send is delivered
 - Wakterm socket and startup capabilities
 - configured channel availability
 - control socket path

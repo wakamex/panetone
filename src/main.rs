@@ -120,12 +120,13 @@ struct SendArgs {
     sender: Option<String>,
     #[arg(
         long = "to",
-        help = "Target route title, or an agent's Wakterm name when the route has several agents"
+        required = true,
+        help = "Target route title, or an agent's Wakterm name when the route has several agents; repeat it to send the message to several targets"
     )]
-    target: String,
+    targets: Vec<String>,
     #[arg(
         long,
-        help = "Request UUID, which makes a retry safe: resending the same message with the same ID returns the first acknowledgement and delivers nothing again, and a different message with that ID is rejected (default: a new random ID). A notifier can derive it from its own event ID, for example a version 5 UUID of a run ID"
+        help = "Request UUID, which makes a retry safe: resending the same message with the same ID returns the first acknowledgement and delivers nothing again, and a different message with that ID is rejected (default: a new random ID). A notifier can derive it from its own event ID, for example a version 5 UUID of a run ID. With several --to targets, each target's request ID is a version 5 UUID of this ID and the target"
     )]
     id: Option<Uuid>,
     #[arg(
@@ -960,34 +961,95 @@ async fn run_send(args: SendArgs) -> Result<()> {
         )?),
         (None, Some(_)) => wakterm_caller().await.ok(),
     };
-    let params = SendParams {
-        source: args.source,
-        target: args.target,
-        message: args.message,
-        source_pane_id: args.source_pane_id,
-        source_agent,
-        sender: args.sender,
-        return_final: false,
-        reply: args.reply,
-        queue: args.queue,
-        timeout_ms: 0,
-    };
-    let response = request(
-        &socket,
-        &ControlRequest {
-            schema: CONTROL_SCHEMA.into(),
-            id: args.id.unwrap_or_else(Uuid::new_v4),
-            method: "send".into(),
-            params: serde_json::to_value(params)?,
-        },
-    )
-    .await?;
-    println!("{}", serde_json::to_string_pretty(&response)?);
-    if response.ok {
-        Ok(())
-    } else {
-        bail!("send was rejected")
+    let several = args.targets.len() > 1;
+    let base_id = args.id.unwrap_or_else(Uuid::new_v4);
+    let sends = args.targets.iter().map(|target| {
+        let id = if several {
+            Uuid::new_v5(&base_id, target.as_bytes())
+        } else {
+            base_id
+        };
+        let params = SendParams {
+            source: args.source.clone(),
+            target: target.clone(),
+            message: args.message.clone(),
+            source_pane_id: args.source_pane_id,
+            source_agent: source_agent.clone(),
+            sender: args.sender.clone(),
+            return_final: false,
+            reply: args.reply,
+            queue: args.queue,
+            timeout_ms: 0,
+        };
+        let socket = &socket;
+        async move {
+            let response = request(
+                socket,
+                &ControlRequest {
+                    schema: CONTROL_SCHEMA.into(),
+                    id,
+                    method: "send".into(),
+                    params: serde_json::to_value(params)?,
+                },
+            )
+            .await;
+            anyhow::Ok((target, id, response))
+        }
+    });
+    let mut results = Vec::new();
+    for send in sends {
+        results.push(send.await);
     }
+    if !several {
+        let (_, _, response) = results.into_iter().next().expect("one target")?;
+        let response = response?;
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return if response.ok {
+            Ok(())
+        } else {
+            bail!("send was rejected")
+        };
+    }
+    // One line per target, in the order given.
+    let mut rejected = 0;
+    for result in results {
+        let (target, id, response) = result?;
+        let line = match response {
+            Ok(response) if response.ok => {
+                let result = response.result.unwrap_or_default();
+                json!({
+                    "target": target,
+                    "request_id": id,
+                    "accepted": result["accepted"],
+                    "delivery_state": result["delivery_state"],
+                    "reply_pending": result["reply_pending"],
+                })
+            }
+            Ok(response) => {
+                rejected += 1;
+                json!({
+                    "target": target,
+                    "request_id": id,
+                    "accepted": false,
+                    "error": response.error.map(|error| error.message),
+                })
+            }
+            Err(error) => {
+                rejected += 1;
+                json!({
+                    "target": target,
+                    "request_id": id,
+                    "accepted": false,
+                    "error": error.to_string(),
+                })
+            }
+        };
+        println!("{line}");
+    }
+    if rejected > 0 {
+        bail!("{rejected} of the sends were rejected or may not be held; retry with the same --id")
+    }
+    Ok(())
 }
 
 /// Asks Wakterm which live agent this command runs for. Wakterm resolves it

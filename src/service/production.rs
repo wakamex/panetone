@@ -2248,6 +2248,22 @@ impl ProductionService {
                 .collect::<Vec<_>>(),
             Err(error) => return internal(id, error),
         };
+        let queued = match self.store.awaiting_target().await {
+            Ok(workflows) => workflows
+                .into_iter()
+                .map(|record| {
+                    json!({
+                        "request_id": record.command.id,
+                        "from": record.command.source,
+                        "to": record.command.target,
+                        "age_ms": now - record.created_at_ms,
+                        "reply": record.command.reply,
+                        "request": crate::service::offline::request_summary(&record.command.message),
+                    })
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => return internal(id, error),
+        };
         let degraded_routes = match self.reported_problems().await {
             Ok(reported) => reported
                 .into_values()
@@ -2278,6 +2294,7 @@ impl ProductionService {
                     "tasks": self.health.snapshot(),
                     "degraded_routes": degraded_routes,
                     "replies_owed": replies_owed,
+                    "queued": queued,
                 }),
             ),
             Err(error) => internal(id, error),

@@ -418,3 +418,88 @@ async fn real_codex_workspace_sandbox_can_inspect_but_cannot_send() {
     shutdown.send(true).unwrap();
     task.await.unwrap().unwrap();
 }
+
+/// Accepts a send to any target but `missing`, reporting it queued.
+struct Sends;
+
+impl ControlHandler for Sends {
+    fn handle(
+        &self,
+        request: ControlRequest,
+    ) -> Pin<Box<dyn Future<Output = ControlResponse> + Send + '_>> {
+        Box::pin(async move {
+            if request.params["to"] == "missing" {
+                error_response(
+                    request.id,
+                    "route_not_found",
+                    "no route is titled missing",
+                    None,
+                )
+            } else {
+                success_response(
+                    request.id,
+                    json!({"accepted": true, "delivery_state": "queued", "reply_pending": true}),
+                )
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn one_send_reaches_several_targets_with_a_result_line_for_each() {
+    let directory = private_directory();
+    let socket = directory.path().join("control.sock");
+    let server = ControlServer::bind(&socket).await.unwrap();
+    let (shutdown, receiver) = watch::channel(false);
+    let task = tokio::spawn(server.run(Arc::new(Sends), receiver));
+    let id = Uuid::from_u128(7);
+    let send = |targets: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_panetone"));
+        command.args([
+            "send",
+            "--socket",
+            socket.to_str().unwrap(),
+            "--from",
+            "source",
+        ]);
+        command.args(["--reply", "--id", &id.to_string()]);
+        for target in targets {
+            command.args(["--to", target]);
+        }
+        command
+            .arg("which tool?")
+            .env("WAKTERM_BIN", "/nonexistent");
+        command.output()
+    };
+
+    let output = send(&["con-argon", "re-opus"]).await.unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines = String::from_utf8(output.stdout).unwrap();
+    let results = lines
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        [
+            json!({"target": "con-argon", "request_id": Uuid::new_v5(&id, b"con-argon"), "accepted": true, "delivery_state": "queued", "reply_pending": true}),
+            json!({"target": "re-opus", "request_id": Uuid::new_v5(&id, b"re-opus"), "accepted": true, "delivery_state": "queued", "reply_pending": true}),
+        ]
+    );
+
+    // A rejected target is reported on its line and fails the command.
+    let output = send(&["re-opus", "missing"]).await.unwrap();
+    assert!(!output.status.success());
+    let lines = String::from_utf8(output.stdout).unwrap();
+    let missing: Value = serde_json::from_str(lines.lines().nth(1).unwrap()).unwrap();
+    assert_eq!(missing["accepted"], false);
+    assert_eq!(missing["error"], "no route is titled missing");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("1 of the sends"));
+
+    shutdown.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
