@@ -940,6 +940,66 @@ async fn memory_citation_blocks_are_removed_before_posting() {
 }
 
 #[tokio::test]
+async fn a_devin_permission_prompt_asks_for_approval_with_its_two_choices() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let route = route();
+    store.save_route(route.clone(), 1).await.unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+    // The shape Wakterm emits under devin_permission.v1.
+    let event: EventRecord = serde_json::from_value(serde_json::json!({
+        "sequence": 101,
+        "event_id": "approval-event-101",
+        "kind": "approval_requested",
+        "agent_id": "agent-zola",
+        "incarnation_id": "incarnation-zola-7",
+        "turn_id": "turn-4",
+        "approval": {
+            "schema": "wakterm.agent-approval.v1",
+            "kind": "devin_permission",
+            "request_id": "fedcba9876543210fedcba98",
+            "agent_id": "agent-zola",
+            "incarnation_id": "incarnation-zola-7",
+            "turn_id": "turn-4",
+            "item_id": "fedcba9876543210fedcba98",
+            "observed_at": "2026-10-24T03:21:00Z",
+            "prompt": "Devin asks to run: cargo test --locked",
+            "reason": null,
+            "command": "cargo test --locked",
+            "cwd": "/code/concord",
+            "choices": [
+                {"id": "allow_once", "label": "Allow once"},
+                {"id": "deny", "label": "Deny"}
+            ],
+            "questions": []
+        }
+    }))
+    .unwrap();
+    store
+        .ingest_agent_events(100, 101, vec![event], live_agents(&route), 3)
+        .await
+        .unwrap();
+    let pending = store.pending_outbox().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].body,
+        "Approval needed\n\nDevin asks to run: cargo test --locked"
+    );
+    assert_eq!(
+        pending[0]
+            .actions
+            .iter()
+            .map(|action| (action.id.as_str(), action.label.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("wakap:fedcba9876543210fedcba98:allow_once", "Allow once"),
+            ("wakap:fedcba9876543210fedcba98:deny", "Deny"),
+        ]
+    );
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_claude_menu_raised_outside_a_turn_is_posted_with_numbered_buttons() {
     let directory = tempdir().unwrap();
     let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();

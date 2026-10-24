@@ -1820,10 +1820,13 @@ fn ingest_event(
                 )
             }
             Some(approval) => {
-                // Only a command approval asks to approve something; every
-                // other kind, including ones Panetone does not know, is a
-                // choice the agent is waiting on.
-                let mut body = if approval.kind == "command_approval" {
+                // Only a command approval or Devin's permission prompt asks to
+                // approve something; every other kind, including ones
+                // Panetone does not know, is a choice the agent is waiting on.
+                let mut body = if matches!(
+                    approval.kind.as_str(),
+                    "command_approval" | "devin_permission"
+                ) {
                     "Approval needed".to_string()
                 } else {
                     "Input needed".to_string()
@@ -1832,7 +1835,14 @@ fn ingest_event(
                     body.push_str("\n\n");
                     body.push_str(prompt);
                 }
-                if let Some(command) = approval.command.as_deref() {
+                // A prompt that already names the command, as Devin's
+                // does, is not followed by it again.
+                if let Some(command) = approval.command.as_deref().filter(|command| {
+                    !approval
+                        .prompt
+                        .as_deref()
+                        .is_some_and(|prompt| prompt.contains(command))
+                }) {
                     body.push_str("\n\nCommand:\n");
                     body.push_str(command);
                 }
