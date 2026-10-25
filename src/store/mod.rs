@@ -1823,12 +1823,12 @@ fn ingest_event(
                 )
             }
             Some(approval) => {
-                // Only a command approval or Devin's permission prompt asks to
-                // approve something; every other kind, including ones
+                // Only a command approval or a Devin or Muse permission prompt
+                // asks to approve something; every other kind, including ones
                 // Panetone does not know, is a choice the agent is waiting on.
                 let mut body = if matches!(
                     approval.kind.as_str(),
-                    "command_approval" | "devin_permission"
+                    "command_approval" | "devin_permission" | "muse_permission"
                 ) {
                     "Approval needed".to_string()
                 } else {

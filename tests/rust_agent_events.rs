@@ -1000,6 +1000,85 @@ async fn a_devin_permission_prompt_asks_for_approval_with_its_two_choices() {
 }
 
 #[tokio::test]
+async fn a_muse_permission_prompt_asks_for_approval_for_a_command_or_a_tool() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let route = route();
+    store.save_route(route.clone(), 1).await.unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+    // The shapes Wakterm emits under muse_permission.v1: a shell command, and
+    // another tool, which has no command.
+    let event = |sequence: u64, id: &str, prompt: &str, command: Option<&str>| -> EventRecord {
+        serde_json::from_value(serde_json::json!({
+            "sequence": sequence,
+            "event_id": format!("approval-event-{sequence}"),
+            "kind": "approval_requested",
+            "agent_id": "agent-zola",
+            "incarnation_id": "incarnation-zola-7",
+            "turn_id": "turn-5",
+            "approval": {
+                "schema": "wakterm.agent-approval.v1",
+                "kind": "muse_permission",
+                "request_id": id,
+                "agent_id": "agent-zola",
+                "incarnation_id": "incarnation-zola-7",
+                "turn_id": "turn-5",
+                "item_id": id,
+                "observed_at": "2026-10-25T03:21:00Z",
+                "prompt": prompt,
+                "reason": null,
+                "command": command,
+                "cwd": "/code/concord",
+                "choices": [
+                    {"id": "allow_once", "label": "Allow once"},
+                    {"id": "deny", "label": "Reject"}
+                ],
+                "questions": []
+            }
+        }))
+        .unwrap()
+    };
+    let shell = "01a17523-2b2f-7991-bbd7-b9cc04e06d7a";
+    let tool = "01a17523-2b2f-7991-bbd7-b9cc04e06d7b";
+    store
+        .ingest_agent_events(
+            100,
+            102,
+            vec![
+                event(101, shell, "Muse asks to run: ls", Some("ls")),
+                event(102, tool, "Muse asks permission to use web_fetch", None),
+            ],
+            live_agents(&route),
+            3,
+        )
+        .await
+        .unwrap();
+    let pending = store.pending_outbox().await.unwrap();
+    assert_eq!(
+        pending
+            .iter()
+            .map(|item| item.body.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "Approval needed\n\nMuse asks to run: ls",
+            "Approval needed\n\nMuse asks permission to use web_fetch",
+        ]
+    );
+    assert_eq!(
+        pending[0]
+            .actions
+            .iter()
+            .map(|action| (action.id.as_str(), action.label.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (format!("wakap:{shell}:allow_once").as_str(), "Allow once"),
+            (format!("wakap:{shell}:deny").as_str(), "Reject"),
+        ]
+    );
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_claude_menu_raised_outside_a_turn_is_posted_with_numbered_buttons() {
     let directory = tempdir().unwrap();
     let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
