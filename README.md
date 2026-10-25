@@ -101,8 +101,8 @@ Signal subscription timeouts and transport disconnects reconnect inside the inbo
 
 After authorization and routing, Panetone sends the message body unchanged except for sender labels on member-enabled Signal groups and attachment paths. An idle agent receives a normal admitted prompt. A busy agent receives immediate active-turn steering after Wakterm definitively confirms that admission did not write the prompt.
 Channel, topic, update, and reply metadata remain internal and do not alter what the harness sees. Local `panetone send` delivers into a busy target's active turn the same way by default; `--queue` waits for the target to become idle instead. Signal attachments are downloaded by signal-cli; Panetone appends their absolute local paths to the message so the harness can inspect them.
-Telegram documents up to 20 MB are downloaded into an `attachments/telegram`
-directory beside the database before the update cursor advances. Telegram
+Telegram documents, audio files, voice notes, videos and video notes up to 20 MB are downloaded into an `attachments/telegram`
+directory beside the database before the update cursor advances. A voice note is saved as `voice.ogg` (Ogg Opus) and a video note as `video-note.mp4`, since Telegram gives them no file name; agents transcribe them themselves. Telegram
 photos use the largest available image size and the same durable download path.
 Their absolute paths are appended to the message. Attachment-only Signal and
 Telegram messages are supported.

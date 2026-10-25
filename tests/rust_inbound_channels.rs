@@ -385,6 +385,57 @@ async fn telegram_document_is_downloaded_before_the_update_is_returned() {
 }
 
 #[tokio::test]
+async fn telegram_voice_note_is_downloaded_like_a_document() {
+    // The shape Telegram sends for a voice note: no file name.
+    let response = serde_json::json!({
+        "ok": true,
+        "result": [{
+            "update_id": 101,
+            "message": {
+                "chat": {"id": -1001},
+                "message_thread_id": 77,
+                "from": {"id": 42, "first_name": "Alice"},
+                "voice": {
+                    "file_id": "voice-file-id",
+                    "file_unique_id": "stable-voice-id",
+                    "duration": 4,
+                    "mime_type": "audio/ogg",
+                    "file_size": 9
+                }
+            }
+        }]
+    })
+    .to_string();
+    let contents = b"OggSvoice".to_vec();
+    let (base, requests) =
+        telegram_attachment_server(response, "voice/file_3.oga", contents.clone()).await;
+    let directory = tempdir().unwrap();
+    let attachment_directory = directory.path().join("attachments");
+    let poller = TelegramPoller::telegram(
+        &base,
+        "fake-token",
+        -1001,
+        &attachment_directory,
+        Duration::from_secs(2),
+    )
+    .unwrap();
+
+    let batch = poller.poll(101, 0).await.unwrap();
+    assert_eq!(batch.messages.len(), 1);
+    let attachment = attachment_directory.join("101-voice.ogg");
+    assert_eq!(
+        batch.messages[0].body,
+        format!("[attached audio/ogg: {}]", attachment.display())
+    );
+    assert_eq!(tokio::fs::read(&attachment).await.unwrap(), contents);
+    let requests = requests.await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&requests[1].1).unwrap()["file_id"],
+        "voice-file-id"
+    );
+}
+
+#[tokio::test]
 async fn telegram_photo_uses_the_largest_available_size() {
     let response = serde_json::json!({
         "ok": true,

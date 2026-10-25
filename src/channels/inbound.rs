@@ -234,7 +234,18 @@ impl TelegramPoller {
                 continue;
             };
             let mut body = message.text.or(message.caption).unwrap_or_default();
-            if let Some(document) = message.document {
+            // Telegram gives each kind of file its own field; a voice note
+            // or video note has no file name, so it gets a default one.
+            let file = [
+                (message.document, "document", "application/octet-stream"),
+                (message.audio, "audio", "audio/mpeg"),
+                (message.voice, "voice.ogg", "audio/ogg"),
+                (message.video, "video.mp4", "video/mp4"),
+                (message.video_note, "video-note.mp4", "video/mp4"),
+            ]
+            .into_iter()
+            .find_map(|(file, name, content_type)| file.map(|file| (file, name, content_type)));
+            if let Some((file, default_name, default_type)) = file {
                 if !body.is_empty() {
                     body.push('\n');
                 }
@@ -242,13 +253,10 @@ impl TelegramPoller {
                     &self
                         .attachment_line(
                             update.update_id,
-                            &document.file_id,
-                            document.file_name.as_deref().unwrap_or("document"),
-                            document
-                                .mime_type
-                                .as_deref()
-                                .unwrap_or("application/octet-stream"),
-                            document.file_size,
+                            &file.file_id,
+                            file.file_name.as_deref().unwrap_or(default_name),
+                            file.mime_type.as_deref().unwrap_or(default_type),
+                            file.file_size,
                         )
                         .await?,
                 );
@@ -796,10 +804,16 @@ struct TelegramMessage {
     text: Option<String>,
     caption: Option<String>,
     document: Option<TelegramDocument>,
+    audio: Option<TelegramDocument>,
+    voice: Option<TelegramDocument>,
+    video: Option<TelegramDocument>,
+    video_note: Option<TelegramDocument>,
     #[serde(default)]
     photo: Vec<TelegramPhoto>,
 }
 
+/// A document, audio file, voice note, video or video note: Telegram describes
+/// each with these fields, and only some carry a file name or type.
 #[derive(Deserialize)]
 struct TelegramDocument {
     file_id: String,
