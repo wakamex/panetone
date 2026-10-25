@@ -62,7 +62,17 @@ if ! systemctl --user is-active --quiet "$UNIT"; then
     journalctl --user -u "$UNIT" -n 20 --no-pager
     exit 1
 fi
-"$BIN" status >/dev/null || { echo "  daemon did not answer status"; exit 1; }
+# The daemon opens its control socket only after its Wakterm preflight, which
+# takes a few seconds with many agents, so wait for it to answer.
+answered=false
+for _ in $(seq 30); do
+    if "$BIN" status >/dev/null 2>&1; then
+        answered=true
+        break
+    fi
+    sleep 1
+done
+$answered || { "$BIN" status; echo "  daemon did not answer status within 30 seconds"; exit 1; }
 echo "  active and answering"
 echo ""
 
