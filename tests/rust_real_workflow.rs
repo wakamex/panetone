@@ -318,7 +318,8 @@ fi
     );
     let target = route(2, "Target", target_binding, 202);
 
-    let response = b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: 83\r\n\r\n{\"ok\":false,\"error_code\":429,\"description\":\"retry\",\"parameters\":{\"retry_after\":17}}";
+    // A wait longer than a send waits out, so the audit fails.
+    let response = b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: 83\r\n\r\n{\"ok\":false,\"error_code\":429,\"description\":\"retry\",\"parameters\":{\"retry_after\":61}}";
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let telegram_server = tokio::spawn(async move {
@@ -393,4 +394,109 @@ fi
     assert_eq!(report["checks"]["store"]["ok"], false);
     assert_eq!(report["checks"]["store"]["status"]["failed_workflows"], 1);
     assert_eq!(report["checks"]["store"]["status"]["failed_outbox"], 1);
+}
+
+#[tokio::test]
+async fn a_short_rate_limit_on_the_audit_is_waited_out() {
+    let directory = tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let admission_log = directory.path().join("admission.log");
+    let script = directory.path().join("wakterm-fake");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/bash
+set -euo pipefail
+if [[ "$*" == *"--version"* ]]; then
+  printf '%s\n' 'wakterm test-version-1'
+elif [[ "$*" == *"agent capabilities"* ]]; then
+  printf '%s\n' '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
+elif [[ "$*" == *"agent catalog"* ]]; then
+  printf '%s\n' '{{"schema":"wakterm.agent-api.v1","agents":[{{"agent_id":"agent-target","incarnation_id":"target-incarnation-1","pane_id":22,"name":"target","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-17T00:00:00Z"}}]}}'
+else
+  printf 'unexpected admission\n' >> '{}'
+  exit 9
+fi
+"#,
+            admission_log.display()
+        ),
+    )
+    .unwrap();
+    panetone::test_support::seal_executable(&script);
+    let wakterm = WaktermCli::new(
+        &script,
+        directory.path().join("dev-mux.sock"),
+        Duration::from_secs(2),
+    );
+    let target_binding = wakterm.resolve_stable_binding(22, || Ok(())).await.unwrap();
+    let source = route(
+        1,
+        "Source",
+        AgentBinding {
+            agent_id: "agent-source".into(),
+            incarnation_id: "source-incarnation-1".into(),
+            harness: "codex".into(),
+            pane_id: Some(11),
+        },
+        101,
+    );
+    let target = route(2, "Target", target_binding, 202);
+
+    // Telegram limits the first post for a second, then accepts it.
+    let limited = b"HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 82\r\n\r\n{\"ok\":false,\"error_code\":429,\"description\":\"retry\",\"parameters\":{\"retry_after\":1}}";
+    let posted = b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 37\r\n\r\n{\"ok\":true,\"result\":{\"message_id\":7}}";
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let telegram_server = tokio::spawn(async move {
+        for response in [&limited[..], &posted[..]] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream.write_all(response).await.unwrap();
+        }
+    });
+    let channels = RealChannels {
+        telegram: Some(
+            TelegramClient::new(
+                format!("http://{address}"),
+                "fake-token",
+                -1001,
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        ),
+        ..RealChannels::default()
+    };
+    let journal = directory.path().join("state.sqlite3");
+    let store = StoreHandle::open(&journal).unwrap();
+    let service = OfflineService::new_real(store.clone(), wakterm, channels);
+    let command = SendCommand {
+        id: WorkflowId::new(Uuid::from_u128(100)),
+        source: "Source".into(),
+        target: "Target".into(),
+        message: "must remain audit-first".into(),
+        return_final: false,
+        steer: false,
+        reply: false,
+        timeout_ms: 0,
+    };
+    let result = service.submit(command.clone(), &source, &target, 100).await;
+    assert!(
+        !matches!(result, Err(ServiceError::AuditFailed(_))),
+        "{result:?}"
+    );
+    telegram_server.await.unwrap();
+    // The send got past its audit to the admission, which the fake refused.
+    assert_eq!(
+        store
+            .get_workflow(command.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .workflow
+            .state,
+        WorkflowState::Indeterminate
+    );
+    drop(service);
+    store.shutdown().await.unwrap();
 }

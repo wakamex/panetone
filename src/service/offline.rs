@@ -263,11 +263,23 @@ impl ChannelBackend {
             Self::Fake(channels) => channels
                 .send(item)
                 .map_err(|error| ServiceError::Adapter(error.to_string())),
-            Self::Real(channels) => channels
-                .send_as(item, signal_account)
-                .await
-                .map(|receipt| receipt.external_id)
-                .map_err(|error| ServiceError::Adapter(error.to_string())),
+            Self::Real(channels) => {
+                // A rate limit posted nothing, and the client waits it out
+                // before its next send, so a short one is retried rather than
+                // failing the send it is part of.
+                let mut attempt = 0;
+                loop {
+                    attempt += 1;
+                    match channels.send_as(item, signal_account).await {
+                        Ok(receipt) => return Ok(receipt.external_id),
+                        Err(crate::channels::ChannelDeliveryError::RateLimited {
+                            retry_after_secs,
+                            ..
+                        }) if attempt < 4 && retry_after_secs <= 60 => continue,
+                        Err(error) => return Err(ServiceError::Adapter(error.to_string())),
+                    }
+                }
+            }
         }
     }
 }
