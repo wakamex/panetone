@@ -236,6 +236,13 @@ struct RouteEnsureArgs {
         help = "Serve this existing route from an endchat profile directory instead of a Wakterm agent, or `none` to return it to Wakterm"
     )]
     endchat_profile: Option<String>,
+    #[arg(
+        long,
+        value_name = "on|off",
+        value_parser = ["on", "off"],
+        help = "Transcribe audio people send to this existing route before its agent sees it, with the command in PANETONE_TRANSCRIBE_COMMAND"
+    )]
+    transcribe: Option<String>,
     #[command(flatten)]
     control: ControlSocketArgs,
 }
@@ -1148,6 +1155,7 @@ async fn run_route(args: RouteArgs) -> Result<()> {
                 signal_account: args.signal_account,
                 signal_direct: args.signal_direct,
                 endchat_profile: args.endchat_profile,
+                transcribe: args.transcribe.map(|value| value == "on"),
             })?,
         ),
     };

@@ -88,6 +88,7 @@ impl InboundIngestor {
             receipt: None,
             steering_acknowledged: None,
             proof: None,
+            transcribed: false,
         };
         Ok(self.store.accept_inbox(item).await?)
     }

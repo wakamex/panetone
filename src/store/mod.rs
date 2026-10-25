@@ -126,6 +126,9 @@ pub struct InboxItem {
     /// the delivery itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof: Option<DeliveryProof>,
+    /// Its audio has been transcribed into the body, for a route that asks.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transcribed: bool,
 }
 
 /// Wakterm recording input with the message's hash for the target agent

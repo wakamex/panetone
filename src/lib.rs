@@ -9,4 +9,5 @@ pub mod store;
 pub mod supervisor;
 #[doc(hidden)]
 pub mod test_support;
+pub mod transcribe;
 pub mod wakterm;

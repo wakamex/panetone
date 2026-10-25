@@ -47,6 +47,8 @@ const REPLY_ATTEMPTS: u32 = 360;
 
 /// Metadata naming the endchat profile that serves a route, by route ID.
 const ENDCHAT_PROFILES_KEY: &str = "endchat_profiles_v1";
+/// Metadata listing the IDs of routes whose incoming audio is transcribed.
+const TRANSCRIBE_ROUTES_KEY: &str = "transcribe_routes_v1";
 /// Metadata remembering each room speaker's display name, by agent ID.
 const ROOM_NAMES_KEY: &str = "room_names_v1";
 /// How long a channel message waits on a blocked pane before its sender is told why.
@@ -1044,6 +1046,35 @@ impl ProductionService {
             .map_err(error_string)
     }
 
+    async fn set_transcription(&self, route_id: RouteId, enabled: bool) -> Result<(), String> {
+        let mut routes = self.transcribed_routes().await?;
+        if enabled {
+            routes.insert(route_id.to_string());
+        } else {
+            routes.remove(&route_id.to_string());
+        }
+        self.store
+            .set_metadata(
+                TRANSCRIBE_ROUTES_KEY.into(),
+                serde_json::to_string(&routes).map_err(error_string)?,
+            )
+            .await
+            .map_err(error_string)
+    }
+
+    /// The IDs of routes whose incoming audio is transcribed.
+    async fn transcribed_routes(&self) -> Result<BTreeSet<String>, String> {
+        match self
+            .store
+            .get_metadata(TRANSCRIBE_ROUTES_KEY.into())
+            .await
+            .map_err(error_string)?
+        {
+            Some(json) => serde_json::from_str(&json).map_err(error_string),
+            None => Ok(BTreeSet::new()),
+        }
+    }
+
     /// Endchat profile directories by the ID of the route each serves.
     async fn endchat_profiles(&self) -> Result<BTreeMap<String, String>, String> {
         match self
@@ -1333,6 +1364,7 @@ impl ProductionService {
         let routes = self.store.list_routes().await.map_err(error_string)?;
         let live = self.live_routes().await.map_err(error_string)?;
         let rooms = self.store.rooms().await.map_err(error_string)?;
+        let transcribed_routes = self.transcribed_routes().await?;
         let mut attempted = 0;
         for mut item in pending {
             let matching = routes
@@ -1342,6 +1374,28 @@ impl ProductionService {
             let [route] = matching.as_slice() else {
                 continue;
             };
+            // The transcript is saved with the message, so it is made once
+            // and the agent receives the same text on every attempt.
+            if transcribed_routes.contains(&route.id.to_string())
+                && !item.transcribed
+                && crate::transcribe::has_audio(&item.body)
+            {
+                item.body = match std::env::var(crate::transcribe::COMMAND_ENV) {
+                    Ok(template) if !template.trim().is_empty() => {
+                        crate::transcribe::transcribe(&template, &item.body).await
+                    }
+                    _ => format!(
+                        "{}\n[transcription failed: {} is not set]",
+                        item.body,
+                        crate::transcribe::COMMAND_ENV
+                    ),
+                };
+                item.transcribed = true;
+                self.store
+                    .save_inbox(item.clone(), "pending", None)
+                    .await
+                    .map_err(error_string)?;
+            }
             // In a room a chat message joins the transcript and goes to every
             // agent there.
             if rooms.contains_key(&route.id.to_string()) {
@@ -2397,6 +2451,19 @@ impl ProductionService {
             Ok(routes) => routes,
             Err(error) => return internal(id, error),
         };
+        if let Some(enabled) = params.transcribe {
+            let Ok(route) = exact_route(&routes, &params.title) else {
+                return error_response(
+                    id,
+                    "route_not_found",
+                    "transcription can be set only for an existing route",
+                    None,
+                );
+            };
+            if let Err(detail) = self.set_transcription(route.id, enabled).await {
+                return internal(id, detail);
+            }
+        }
         if let Some(profile) = params.endchat_profile.as_deref() {
             let Ok(route) = exact_route(&routes, &params.title) else {
                 return error_response(
@@ -3696,6 +3763,7 @@ fi
                 receipt: None,
                 steering_acknowledged: None,
                 proof: None,
+                transcribed: false,
             })
             .await
             .unwrap();
@@ -4202,6 +4270,7 @@ fi
                 receipt: None,
                 steering_acknowledged: None,
                 proof: None,
+                transcribed: false,
             })
             .await
             .unwrap();
@@ -4699,6 +4768,7 @@ fi
                 receipt: None,
                 steering_acknowledged: None,
                 proof: None,
+                transcribed: false,
             })
             .await
             .unwrap();
@@ -4778,6 +4848,7 @@ fi
                 receipt: None,
                 steering_acknowledged: None,
                 proof: None,
+                transcribed: false,
             })
             .await
             .unwrap();
@@ -4886,6 +4957,7 @@ fi
             receipt: None,
             steering_acknowledged: None,
             proof: None,
+            transcribed: false,
         };
         store.accept_inbox(item.clone()).await.unwrap();
         item.state = "awaiting_proof".into();
@@ -5026,6 +5098,7 @@ fi
                 receipt: None,
                 steering_acknowledged: None,
                 proof: None,
+                transcribed: false,
             })
             .await
             .unwrap();
@@ -5066,6 +5139,7 @@ fi
                 receipt: None,
                 steering_acknowledged: None,
                 proof: None,
+                transcribed: false,
             })
             .await
             .unwrap();
@@ -5153,6 +5227,7 @@ fi
                 receipt: None,
                 steering_acknowledged: None,
                 proof: None,
+                transcribed: false,
             })
             .await
             .unwrap();

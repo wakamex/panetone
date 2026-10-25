@@ -1132,6 +1132,7 @@ async fn output_after_a_direct_message_returns_to_its_sender() {
         receipt: None,
         steering_acknowledged: None,
         proof: None,
+        transcribed: false,
     };
     store.accept_inbox(item.clone()).await.unwrap();
     item.state = "delivered".into();
@@ -1184,6 +1185,7 @@ async fn a_turns_output_goes_where_the_message_that_started_it_came_from() {
                 receipt: None,
                 steering_acknowledged: None,
                 proof: None,
+                transcribed: false,
             };
             store.accept_inbox(item.clone()).await.unwrap();
             item.state = "delivered".into();

@@ -485,6 +485,7 @@ async fn routes_outbox_inbox_and_metadata_are_durable_and_deduplicated() {
         receipt: None,
         steering_acknowledged: None,
         proof: None,
+        transcribed: false,
     };
     assert!(store.accept_inbox(inbox.clone()).await.unwrap());
     assert!(!store.accept_inbox(inbox).await.unwrap());
@@ -550,6 +551,7 @@ async fn an_admission_interrupted_by_a_restart_waits_for_proof_when_it_has_one()
             receipt: None,
             steering_acknowledged: None,
             proof: None,
+            transcribed: false,
         };
         store.accept_inbox(item.clone()).await.unwrap();
         item.state = "admission_prepared".into();

@@ -75,6 +75,10 @@ pub struct RouteEnsureParams {
     /// a Wakterm agent, or `none` to return it to Wakterm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endchat_profile: Option<String>,
+    /// Transcribe audio people send to an existing route before its agent
+    /// sees it, or stop doing so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcribe: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
