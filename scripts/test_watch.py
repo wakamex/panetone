@@ -1,7 +1,7 @@
 import sqlite3
 import unittest
 
-from watch import store_problems, task_problems
+from watch import report_id, store_problems, task_problems
 
 
 class TaskProblems(unittest.TestCase):
@@ -13,6 +13,12 @@ class TaskProblems(unittest.TestCase):
         problems = task_problems(tasks)
         self.assertEqual(sorted(problems), ["task:wakterm-events"])
         self.assertIn("retrying: event follower exited", problems["task:wakterm-events"])
+
+
+class ReportId(unittest.TestCase):
+    def test_the_same_problems_get_the_same_request_id(self):
+        self.assertEqual(report_id({"task:a": "x", "inbox:b": "y"}), report_id({"inbox:b": "z", "task:a": "w"}))
+        self.assertNotEqual(report_id({"task:a": "x"}), report_id({"task:a": "x", "inbox:b": "y"}))
 
 
 class StoreProblems(unittest.TestCase):

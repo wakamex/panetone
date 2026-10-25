@@ -221,4 +221,4 @@ The `route-health` worker checks every 60 seconds for live Claude or Codex agent
 - inbound messages that are unconfirmed or still undelivered after 10 minutes
 - agent-to-agent sends and final returns that are unconfirmed
 - Panetone workers that are not running, once per failure
-Reported problems are recorded in `~/.local/state/panetone-rust/watch.json` before the message is sent, so an unconfirmed report is never repeated, and the watcher ignores its own reports. Deleting that file makes the next run record a silent baseline. Run the tests with `python3 -m unittest test_watch` from `scripts/`.
+Reported problems are recorded in `~/.local/state/panetone-rust/watch.json` once Panetone accepts the report. A report whose send fails or is not confirmed leaves its problems unrecorded, so the next run sends them again; the request ID is derived from the set of problems, so a resend of a report that did arrive delivers nothing twice. The watcher ignores its own reports. Deleting that file makes the next run record a silent baseline. Run the tests with `python3 -m unittest test_watch` from `scripts/`.

@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 DATABASE = Path.home() / ".local/state/panetone-rust/migration/panetone.sqlite3"
@@ -22,6 +23,7 @@ STUCK_INBOX_MS = 10 * 60 * 1000
 # Reports are excluded from what the watcher reports, so an unconfirmed report
 # cannot trigger another one.
 REPORT_HEADER = "Panetone watch found new problems:"
+REPORT_NAMESPACE = uuid.UUID("5d0b8f3e-2c1a-4b7e-9f6d-1a2b3c4d5e6f")
 
 
 def store_problems(connection, now_ms):
@@ -73,6 +75,13 @@ def snippet(text, limit=80):
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def report_id(keys):
+    """The request ID for a report of these problems. It is the same for the
+    same problems, so resending a report whose send failed or was not confirmed
+    never delivers it twice."""
+    return str(uuid.uuid5(REPORT_NAMESPACE, "\n".join(sorted(keys))))
+
+
 def run_json(*command):
     return json.loads(subprocess.run(command, check=True, capture_output=True, text=True).stdout)
 
@@ -93,21 +102,26 @@ def main():
     # A recovered task is forgotten, so its next failure is reported again.
     seen = {key for key in seen if not key.startswith("task:") or key in tasks}
 
-    # Save before sending: an unconfirmed send may still have arrived, so a
-    # failed send must not cause the same report on every later run.
-    state = {"seen": sorted(seen | found.keys())}
-    STATE.parent.mkdir(parents=True, exist_ok=True)
-    STATE.write_text(json.dumps(state, indent=1) + "\n")
     print(f"{len(found)} known problems, {len(new)} new{' (baseline run, not reported)' if first_run else ''}")
 
+    status = 0
     if new and not first_run:
         lines = [f"- {text}" for text in sorted(new.values())]
         message = REPORT_HEADER + "\n" + "\n".join(lines)
-        sent = subprocess.run(["panetone", "send", "--from", ROUTE, "--to", ROUTE, message], capture_output=True, text=True)
+        sent = subprocess.run(
+            ["panetone", "send", "--from", ROUTE, "--to", ROUTE, "--id", report_id(new), message],
+            capture_output=True,
+            text=True,
+        )
         if sent.returncode != 0:
+            # The problems stay unreported, so the next run sends them again
+            # with the same ID while they are the same problems.
             print(f"report send was not confirmed:\n{sent.stdout}{sent.stderr}", file=sys.stderr)
-            return 1
-    return 0
+            found = {key: text for key, text in found.items() if key not in new}
+            status = 1
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps({"seen": sorted(seen | found.keys())}, indent=1) + "\n")
+    return status
 
 
 if __name__ == "__main__":
