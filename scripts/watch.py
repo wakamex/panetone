@@ -86,13 +86,25 @@ def run_json(*command):
     return json.loads(subprocess.run(command, check=True, capture_output=True, text=True).stdout)
 
 
+def daemon_status(tries=10, interval=3):
+    """Panetone's status, waiting out a daemon restart, which takes a few
+    seconds before the control socket answers."""
+    for attempt in range(tries):
+        try:
+            return run_json("panetone", "status", "--json")
+        except (subprocess.CalledProcessError, json.JSONDecodeError):
+            if attempt == tries - 1:
+                raise
+            time.sleep(interval)
+
+
 def main():
     now_ms = int(time.time() * 1000)
     connection = sqlite3.connect(f"file:{DATABASE}?mode=ro", uri=True)
     store = store_problems(connection, now_ms)
     connection.close()
 
-    tasks = task_problems(run_json("panetone", "status", "--json")["result"]["tasks"])
+    tasks = task_problems(daemon_status()["result"]["tasks"])
 
     first_run = not STATE.exists()
     seen = set() if first_run else set(json.loads(STATE.read_text())["seen"])

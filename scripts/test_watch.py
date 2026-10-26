@@ -1,7 +1,10 @@
 import sqlite3
+import subprocess
 import unittest
+from unittest import mock
 
-from watch import report_id, store_problems, task_problems
+import watch
+from watch import daemon_status, report_id, store_problems, task_problems
 
 
 class TaskProblems(unittest.TestCase):
@@ -13,6 +16,19 @@ class TaskProblems(unittest.TestCase):
         problems = task_problems(tasks)
         self.assertEqual(sorted(problems), ["task:wakterm-events"])
         self.assertIn("retrying: event follower exited", problems["task:wakterm-events"])
+
+
+class DaemonStatus(unittest.TestCase):
+    def test_a_daemon_restart_is_waited_out(self):
+        down = subprocess.CalledProcessError(1, ["panetone", "status"])
+        with mock.patch.object(watch, "run_json", side_effect=[down, down, {"result": {"tasks": {}}}]):
+            self.assertEqual(daemon_status(interval=0), {"result": {"tasks": {}}})
+
+    def test_a_daemon_that_stays_down_still_fails(self):
+        down = subprocess.CalledProcessError(1, ["panetone", "status"])
+        with mock.patch.object(watch, "run_json", side_effect=down):
+            with self.assertRaises(subprocess.CalledProcessError):
+                daemon_status(tries=2, interval=0)
 
 
 class ReportId(unittest.TestCase):
