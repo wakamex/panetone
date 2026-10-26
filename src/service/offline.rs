@@ -664,6 +664,31 @@ impl OfflineService {
                 .await;
         }
         let expected = record.workflow.state;
+        // A prompt Wakterm wrote but could not see the agent start on may
+        // still be taken, as when the agent starts just after Wakterm's
+        // confirmation window; it waits for the agent's input record like an
+        // unacknowledged steer.
+        if receipt.status == AdmissionStatus::Indeterminate && receipt.prompt_written == Some(true)
+        {
+            record.workflow.record_target_receipt(&receipt, &target)?;
+            record.proof = Some(DeliveryProof {
+                agent_id: target.agent_id.clone(),
+                after_sequence,
+                input_sha256: DeliveryProof::input_sha256(&prompt),
+                tab_expanded_sha256: DeliveryProof::tab_expanded_sha256(&prompt),
+                deadline_ms: now_ms + SEND_PROOF_WINDOW_MS,
+                detail: receipt
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| "Wakterm wrote it but did not see the agent start".into()),
+            });
+            record.workflow.submitted_target = Some(target);
+            transition(&self.store, &mut record, WorkflowState::Submitted, now_ms).await?;
+            let ack = ServiceAck::submitted(&record.command);
+            return self
+                .complete_submission(record, target_channel, ack, now_ms)
+                .await;
+        }
         let state = record.workflow.apply_target_receipt(&receipt, &target)?;
         // A queued workflow can be retried and submitted as soon as it is saved,
         // so its acknowledgement is saved with it rather than after the status post.
@@ -752,7 +777,14 @@ impl OfflineService {
                 },
             )
         } else {
-            ("submitted", "prompt accepted by Wakterm")
+            (
+                "submitted",
+                if record.proof.is_some() {
+                    "prompt written but not confirmed; waiting for the agent to record it"
+                } else {
+                    "prompt accepted by Wakterm"
+                },
+            )
         };
         self.post_target_status(&record, target_channel, purpose, detail, now_ms)
             .await?;

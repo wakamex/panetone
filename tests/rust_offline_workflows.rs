@@ -1143,3 +1143,60 @@ async fn an_unacknowledged_steer_waits_for_the_target_to_record_it() {
     drop(service);
     store.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_written_but_unconfirmed_prompt_waits_for_the_target_to_record_it() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+    let wakterm = FakeWakterm::new(contract());
+    wakterm.script_receipts([AdmissionStatus::Indeterminate]);
+    wakterm.write_indeterminate_prompts();
+    let service = OfflineService::new(store.clone(), wakterm, RecordingChannels::default());
+    let (source, target) = routes();
+    let request = command(140, false);
+    let ack = service
+        .submit(request.clone(), &source, &target, 100)
+        .await
+        .unwrap();
+    assert!(ack.submitted);
+    let state = || {
+        let store = store.clone();
+        async move {
+            store
+                .get_workflow(request.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .workflow
+                .state
+        }
+    };
+    assert_eq!(state().await, WorkflowState::Submitted);
+
+    // The agent starts on it a second after Wakterm stopped watching.
+    let typed = &service.wakterm().calls()[0].prompt;
+    let event: panetone::wakterm::EventRecord = serde_json::from_value(serde_json::json!({
+        "sequence": 101,
+        "event_id": "input-event-101",
+        "kind": "input_accepted",
+        "agent_id": "agent-target",
+        "incarnation_id": "target-incarnation-1",
+        "turn_id": "turn-1",
+        "input_sha256": panetone::store::DeliveryProof::input_sha256(typed),
+    }))
+    .unwrap();
+    store.save_route(target.clone(), 1).await.unwrap();
+    let agents = vec![panetone::store::RouteAgent {
+        route_id: target.id,
+        agent: target.agent.clone().unwrap(),
+    }];
+    store
+        .ingest_agent_events(100, 101, vec![event], agents, 300)
+        .await
+        .unwrap();
+    assert_eq!(service.settle_steered_sends(300).await.unwrap(), 1);
+    assert_eq!(state().await, WorkflowState::Completed);
+    drop(service);
+    store.shutdown().await.unwrap();
+}

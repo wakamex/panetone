@@ -40,6 +40,9 @@ pub struct FakeWakterm {
     steering_calls: Mutex<Vec<SteeringCall>>,
     /// Steers go unacknowledged, as when the agent records no input in time.
     steering_unacknowledged: std::sync::atomic::AtomicBool,
+    /// An indeterminate admission reports its prompt as written, as when the
+    /// agent starts just after Wakterm stops watching.
+    indeterminate_written: std::sync::atomic::AtomicBool,
 }
 
 impl FakeWakterm {
@@ -50,7 +53,13 @@ impl FakeWakterm {
             calls: Mutex::new(Vec::new()),
             steering_calls: Mutex::new(Vec::new()),
             steering_unacknowledged: std::sync::atomic::AtomicBool::new(false),
+            indeterminate_written: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    pub fn write_indeterminate_prompts(&self) {
+        self.indeterminate_written
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn leave_steering_unacknowledged(&self) {
@@ -107,7 +116,10 @@ impl FakeWakterm {
             definitive: status != AdmissionStatus::Indeterminate,
             prompt_written: match status {
                 AdmissionStatus::Accepted => Some(true),
-                AdmissionStatus::Indeterminate => None,
+                AdmissionStatus::Indeterminate => self
+                    .indeterminate_written
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .then_some(true),
                 _ => Some(false),
             },
             agent_id: Some(binding.agent_id.clone()),
