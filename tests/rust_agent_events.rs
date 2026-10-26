@@ -1581,6 +1581,67 @@ async fn a_turn_a_reminder_started_is_not_followed_by_another_reminder() {
 }
 
 #[tokio::test]
+async fn late_output_of_the_latest_turn_is_posted() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let route = route();
+    store.save_route(route.clone(), 1).await.unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+    let event =
+        |sequence: u64, kind: &str, turn: &str, observed_at: &str, text: &str| -> EventRecord {
+            serde_json::from_value(serde_json::json!({
+                "sequence": sequence,
+                "event_id": format!("event-{sequence}"),
+                "kind": kind,
+                "agent_id": "agent-zola",
+                "incarnation_id": "incarnation-zola-7",
+                "turn_id": turn,
+                "observed_at": observed_at,
+                "text": text,
+            }))
+            .unwrap()
+        };
+    // 2026-10-26T03:11:22Z, 28 minutes after the turn's answer was written.
+    let now_ms = 1_792_984_282_000;
+    store
+        .ingest_agent_events(
+            100,
+            104,
+            vec![
+                event(101, "turn_started", "turn-1", "2026-10-25T20:00:00Z", ""),
+                event(102, "turn_started", "turn-2", "2026-10-26T02:42:27Z", ""),
+                event(
+                    103,
+                    "assistant_message",
+                    "turn-1",
+                    "2026-10-25T20:01:00Z",
+                    "an old turn's answer",
+                ),
+                event(
+                    104,
+                    "assistant_message",
+                    "turn-2",
+                    "2026-10-26T02:43:24Z",
+                    "the latest turn's answer",
+                ),
+            ],
+            live_agents(&route),
+            now_ms,
+        )
+        .await
+        .unwrap();
+    let posts = store.pending_outbox().await.unwrap();
+    assert_eq!(
+        posts
+            .iter()
+            .map(|post| post.body.as_str())
+            .collect::<Vec<_>>(),
+        ["the latest turn's answer"]
+    );
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn output_observed_long_before_ingest_is_a_replay_and_is_not_posted() {
     let directory = tempdir().unwrap();
     let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();

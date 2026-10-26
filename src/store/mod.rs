@@ -1641,12 +1641,14 @@ fn ingest_event(
         .filter(|body| !body.trim().is_empty());
     // Output an agent produced long before Panetone saw it is a replay of
     // its history, such as a new incarnation reporting its transcript
-    // again; it was shown when it was new.
+    // again; it was shown when it was new. Late output of the agent's latest
+    // turn is no replay: an agent's transcript can lag its turn's end.
     if visible_body.is_some()
         && approval.is_none()
         && event
             .observed_at_ms()
             .is_some_and(|observed| now_ms - observed > STALE_OUTPUT_MS)
+        && !is_latest_turn(transaction, event)?
     {
         insert_agent_event(transaction, event, route_id, "stale", &record_json, now_ms)?;
         outcome.recorded += 1;
@@ -2760,6 +2762,24 @@ fn inbox_in_state(connection: &Connection, state: &str) -> StoreResult<Vec<Inbox
         .into_iter()
         .map(|record| serde_json::from_str(&record).map_err(StoreError::from))
         .collect()
+}
+
+/// Whether an event belongs to the turn its agent most recently started.
+fn is_latest_turn(connection: &Connection, event: &EventRecord) -> StoreResult<bool> {
+    let Some(turn_id) = event.fields.get("turn_id").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    Ok(connection
+        .query_row(
+            "SELECT json_extract(record_json, '$.turn_id') FROM agent_events
+             WHERE agent_id = ?1 AND kind = 'turn_started'
+             ORDER BY sequence DESC LIMIT 1",
+            params![event.agent_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .is_some_and(|latest| latest == turn_id))
 }
 
 fn input_recorded(connection: &Connection, proof: &DeliveryProof) -> StoreResult<bool> {
