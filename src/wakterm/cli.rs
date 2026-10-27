@@ -671,8 +671,13 @@ impl WaktermCli {
                     receipt.status == AdmissionStatus::Indeterminate
                         && receipt.prompt_written != Some(true)
                 }
+                // Wakterm reports a definite refusal as a receipt, so an error
+                // from the CLI itself, such as a mux restarting, is unsettled.
                 Err(
-                    WaktermCliError::Timeout | WaktermCliError::Io(_) | WaktermCliError::Json(_),
+                    WaktermCliError::Timeout
+                    | WaktermCliError::Io(_)
+                    | WaktermCliError::Json(_)
+                    | WaktermCliError::Rejected(_),
                 ) => true,
                 Err(_) => false,
             };

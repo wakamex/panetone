@@ -342,9 +342,14 @@ for ((i = 1; i <= $#; i++)); do
   if [[ "${{!i}}" == "--request-id" ]]; then j=$((i + 1)); request_id=${{!j}}; fi
 done
 echo "$request_id $prompt" >> '{log}'
-# The first attempt is still running elsewhere, so Wakterm cannot settle it;
-# asked again, it reports how that attempt ended.
-if [[ $(wc -l < '{log}') -eq 1 ]]; then
+# The first call reaches a mux that is restarting, and the second finds the
+# first attempt still running elsewhere, so neither can settle it; asked a
+# third time, Wakterm reports how that attempt ended.
+calls=$(wc -l < '{log}')
+if [[ $calls -eq 1 ]]; then
+  echo "failed to connect to the mux" >&2
+  exit 1
+elif [[ $calls -eq 2 ]]; then
   status=indeterminate definitive=false written=null
 else
   status=accepted definitive=true written=true
@@ -368,7 +373,7 @@ printf '{{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"%s","defin
     let line = format!("{request} prompt");
     assert_eq!(
         fs::read_to_string(&calls).unwrap(),
-        format!("{line}\n{line}\n")
+        format!("{line}\n{line}\n{line}\n")
     );
 }
 

@@ -434,7 +434,12 @@ fi
         &script,
         directory.path().join("dev-mux.sock"),
         Duration::from_secs(2),
-    );
+    )
+    .with_admission_timing(AdmissionTiming {
+        confirmation: Duration::from_millis(500),
+        retry_delays: vec![Duration::from_millis(10); 2],
+        retry_budget: Duration::from_secs(5),
+    });
     let target_binding = wakterm.resolve_stable_binding(22, || Ok(())).await.unwrap();
     let source = route(
         1,
