@@ -327,6 +327,52 @@ printf '{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"accepted","
 }
 
 #[tokio::test]
+async fn an_unsettled_admission_is_asked_again_with_the_same_request_id() {
+    let directory = tempdir().unwrap();
+    let calls = directory.path().join("calls.log");
+    let (_fake, binary) = fake_cli(&format!(
+        r#"
+if [[ "$*" == *"agent capabilities"* ]]; then
+  printf '%s\n' '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
+  exit 0
+fi
+prompt=$(cat)
+request_id=""
+for ((i = 1; i <= $#; i++)); do
+  if [[ "${{!i}}" == "--request-id" ]]; then j=$((i + 1)); request_id=${{!j}}; fi
+done
+echo "$request_id $prompt" >> '{log}'
+# The first attempt is still running elsewhere, so Wakterm cannot settle it;
+# asked again, it reports how that attempt ended.
+if [[ $(wc -l < '{log}') -eq 1 ]]; then
+  status=indeterminate definitive=false written=null
+else
+  status=accepted definitive=true written=true
+fi
+printf '{{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"%s","definitive":%s,"prompt_written":%s,"agent_id":"agent-zola","incarnation_id":"incarnation-zola-7","detail":null}}\n' "$request_id" "$status" "$definitive" "$written"
+"#,
+        log = calls.display()
+    ));
+    let cli = WaktermCli::new(binary, "/tmp/non-production.sock", Duration::from_secs(2))
+        .with_admission_timing(panetone::wakterm::AdmissionTiming {
+            confirmation: Duration::from_secs(1),
+            retry_delays: vec![Duration::from_millis(10); 3],
+            retry_budget: Duration::from_secs(10),
+        });
+    let request = EffectId::random();
+    let receipt = cli
+        .admit(request, &binding(), "prompt", false, 0)
+        .await
+        .unwrap();
+    assert_eq!(receipt.status, AdmissionStatus::Accepted);
+    let line = format!("{request} prompt");
+    assert_eq!(
+        fs::read_to_string(&calls).unwrap(),
+        format!("{line}\n{line}\n")
+    );
+}
+
+#[tokio::test]
 async fn real_cli_boundary_bounds_time_and_output() {
     let (_directory, sleeping) = fake_cli("while :; do :; done");
     let cli = WaktermCli::new(

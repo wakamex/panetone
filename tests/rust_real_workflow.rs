@@ -9,7 +9,7 @@ use panetone::domain::{
 use panetone::service::OfflineService;
 use panetone::service::ServiceError;
 use panetone::store::StoreHandle;
-use panetone::wakterm::WaktermCli;
+use panetone::wakterm::{AdmissionTiming, WaktermCli};
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -208,11 +208,18 @@ fi
     )
     .unwrap();
     panetone::test_support::seal_executable(&script);
+    // Every admission attempt hangs; each is cut off quickly and asked again
+    // only briefly.
     let wakterm = WaktermCli::new(
         &script,
         directory.path().join("dev-mux.sock"),
         Duration::from_millis(30),
-    );
+    )
+    .with_admission_timing(AdmissionTiming {
+        confirmation: Duration::from_millis(30),
+        retry_delays: vec![Duration::from_millis(10); 2],
+        retry_budget: Duration::from_secs(5),
+    });
     let target_binding = wakterm.resolve_stable_binding(22, || Ok(())).await.unwrap();
     let source = route(
         1,

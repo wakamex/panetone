@@ -218,7 +218,7 @@ The normal sequence is:
 2. claim the request UUID and semantic hash
 3. durably enqueue and deliver the visible target-channel audit; a Telegram rate limit of up to 60 seconds is waited out and the post retried, up to three times, and any other failure to post fails the send before the target is prompted
 4. persist the admission boundary
-5. submit through exact Wakterm agent and incarnation identity
+5. submit through exact Wakterm agent and incarnation identity; Wakterm writes a request ID's prompt at most once, so when its answer is lost to a timeout or comes back indeterminate without saying the prompt was written, Panetone repeats the identical call with the same request ID, pausing 1, 5, 15 and 30 seconds, for up to 6 minutes
 6. save the definitive receipt or an indeterminate state
 
 A successful acknowledgement is:

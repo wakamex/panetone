@@ -20,11 +20,30 @@ use super::{AgentCatalog, ContractError, EventRead, EventRecord, join_catalog_bi
 const AGENT_API_SCHEMA: &str = "wakterm.agent-api.v1";
 const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
-/// How long Wakterm may take to answer a one-way admission: it waits up to 15
-/// seconds for the target to start a turn, and while a Claude target leaves
-/// the prompt in its input box, as during an idle compaction, it keeps
-/// pressing Enter for up to 3 more minutes (Wakterm `docs/agent-api/v1/index.md`).
-const ADMISSION_CONFIRMATION_WINDOW: Duration = Duration::from_secs(15 + 180);
+/// How long Panetone waits on Wakterm's answers to an admission.
+#[derive(Clone, Debug)]
+pub struct AdmissionTiming {
+    /// How long Wakterm may take to answer: it waits up to 15 seconds for the
+    /// target to start a turn, and while a Claude target leaves the prompt in
+    /// its input box, as during an idle compaction, it keeps pressing Enter
+    /// for up to 3 more minutes (Wakterm `docs/agent-api/v1/index.md`).
+    pub confirmation: Duration,
+    /// Pauses before asking again about an admission whose answer was lost
+    /// or unsettled.
+    pub retry_delays: Vec<Duration>,
+    /// How long to keep asking.
+    pub retry_budget: Duration,
+}
+
+impl Default for AdmissionTiming {
+    fn default() -> Self {
+        Self {
+            confirmation: Duration::from_secs(15 + 180),
+            retry_delays: [1, 5, 15, 30].map(Duration::from_secs).to_vec(),
+            retry_budget: Duration::from_secs(6 * 60),
+        }
+    }
+}
 /// How long Wakterm waits for the target to record a steer before reporting it
 /// unacknowledged (`wakterm agent send`'s default).
 const STEER_ACK_WINDOW: Duration = Duration::from_secs(10);
@@ -128,6 +147,7 @@ pub struct WaktermCli {
     binary: PathBuf,
     socket: PathBuf,
     deadline: Duration,
+    admission: AdmissionTiming,
     capabilities: Arc<OnceCell<AgentApiCapabilities>>,
     event_follower: Arc<Mutex<Option<EventFollower>>>,
     /// One lock per agent, held while a prompt is written to its pane. Two
@@ -454,10 +474,18 @@ impl WaktermCli {
             binary: binary.into(),
             socket: socket.into(),
             deadline,
+            admission: AdmissionTiming::default(),
             capabilities: Arc::new(OnceCell::new()),
             event_follower: Arc::new(Mutex::new(None)),
             pane_writes: Arc::default(),
         }
+    }
+
+    /// The same client with other admission timings, for tests whose fake
+    /// Wakterm should not hold them for minutes.
+    pub fn with_admission_timing(mut self, admission: AdmissionTiming) -> Self {
+        self.admission = admission;
+        self
     }
 
     pub fn socket(&self) -> &Path {
@@ -629,14 +657,48 @@ impl WaktermCli {
             owned.push(final_timeout_ms.to_string());
         }
         let borrowed = owned.iter().map(String::as_str).collect::<Vec<_>>();
+        // Wakterm writes a request ID's prompt at most once: repeating the same
+        // call returns the first attempt's receipt, waiting for it while it
+        // runs, or admits the prompt if that attempt never wrote it. So an
+        // answer lost to a slow mux, or an outcome Wakterm could not settle, is
+        // asked for again (Wakterm `docs/agent-api/v1/index.md`).
+        let started = std::time::Instant::now();
+        let mut retries = self.admission.retry_delays.iter();
+        loop {
+            let result = self.admit_once(&borrowed, prompt).await;
+            let unsettled = match &result {
+                Ok(receipt) => {
+                    receipt.status == AdmissionStatus::Indeterminate
+                        && receipt.prompt_written != Some(true)
+                }
+                Err(
+                    WaktermCliError::Timeout | WaktermCliError::Io(_) | WaktermCliError::Json(_),
+                ) => true,
+                Err(_) => false,
+            };
+            match retries.next() {
+                Some(delay) if unsettled && started.elapsed() < self.admission.retry_budget => {
+                    tracing::warn!(agent = %binding.agent_id, "admission unsettled; asking Wakterm again");
+                    tokio::time::sleep(*delay).await;
+                }
+                _ => return result,
+            }
+        }
+    }
+
+    async fn admit_once(
+        &self,
+        args: &[&str],
+        prompt: &str,
+    ) -> Result<AdmissionReceipt, WaktermCliError> {
         // Wakterm accepts a one-way prompt only after the agent starts a turn,
         // waiting up to its confirmation window before answering.
         let output = self
             .run_command(
-                &borrowed,
+                args,
                 Some(prompt.as_bytes()),
                 true,
-                self.deadline + ADMISSION_CONFIRMATION_WINDOW,
+                self.deadline + self.admission.confirmation,
             )
             .await?;
         let wire: WireReceipt = serde_json::from_slice(&output)?;

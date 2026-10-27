@@ -4,8 +4,8 @@ mod fake;
 pub mod form;
 
 pub use cli::{
-    AgentApiCapabilities, AgentProblem, AgentProblemKind, ApprovalResolution, LiveRoute,
-    LiveRouteSnapshot, ReturnTerminal, SteeringReceipt, WaktermCli, WaktermCliError,
+    AdmissionTiming, AgentApiCapabilities, AgentProblem, AgentProblemKind, ApprovalResolution,
+    LiveRoute, LiveRouteSnapshot, ReturnTerminal, SteeringReceipt, WaktermCli, WaktermCliError,
 };
 pub use contract::{
     AgentCatalog, ApprovalChoice, ApprovalQuestion, ApprovalRequest, CatalogAgent, ContractError,
