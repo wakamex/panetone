@@ -20,9 +20,11 @@ use super::{AgentCatalog, ContractError, EventRead, EventRecord, join_catalog_bi
 const AGENT_API_SCHEMA: &str = "wakterm.agent-api.v1";
 const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
-/// How long Wakterm waits for the target to start a turn before it answers a
-/// one-way admission (Wakterm `docs/agent-api/v1/index.md`).
-const ADMISSION_CONFIRMATION_WINDOW: Duration = Duration::from_secs(15);
+/// How long Wakterm may take to answer a one-way admission: it waits up to 15
+/// seconds for the target to start a turn, and while a Claude target leaves
+/// the prompt in its input box, as during an idle compaction, it keeps
+/// pressing Enter for up to 3 more minutes (Wakterm `docs/agent-api/v1/index.md`).
+const ADMISSION_CONFIRMATION_WINDOW: Duration = Duration::from_secs(15 + 180);
 /// How long Wakterm waits for the target to record a steer before reporting it
 /// unacknowledged (`wakterm agent send`'s default).
 const STEER_ACK_WINDOW: Duration = Duration::from_secs(10);
