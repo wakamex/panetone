@@ -43,7 +43,7 @@ impl ControlAuthority {
             request.id,
             "permission_denied",
             format!(
-                "local client PID {peer_pid} is confined by a different OS sandbox; this control method is denied"
+                "local client PID {peer_pid} runs in an OS sandbox, such as a Codex workspace sandbox, which may only read Panetone status and routes; run this command from an unsandboxed session"
             ),
             None,
         )
