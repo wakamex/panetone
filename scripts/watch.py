@@ -86,9 +86,10 @@ def run_json(*command):
     return json.loads(subprocess.run(command, check=True, capture_output=True, text=True).stdout)
 
 
-def daemon_status(tries=10, interval=3):
-    """Panetone's status, waiting out a daemon restart, which takes a few
-    seconds before the control socket answers."""
+def daemon_status(tries=40, interval=3):
+    """Panetone's status, waiting out a daemon restart. A restart while the
+    mux is slow can fail startup a few times before systemd's restarts get
+    through, so this waits up to two minutes."""
     for attempt in range(tries):
         try:
             return run_json("panetone", "status", "--json")
