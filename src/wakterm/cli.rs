@@ -995,9 +995,14 @@ impl WaktermCli {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 stdout_task.abort();
-                stderr_task.abort();
+                // What a stalled CLI printed is the clue to where it stalled.
+                // Its pipe closes with it, unless a process it started holds it.
+                if let Ok(Ok(Ok(stderr))) = timeout(Duration::from_secs(1), stderr_task).await
+                    && !stderr.is_empty()
+                {
+                    tracing::warn!(stderr = %safe_detail(&stderr), "Wakterm CLI killed at its deadline");
+                }
                 let _ = stdout_task.await;
-                let _ = stderr_task.await;
                 return Err(WaktermCliError::Timeout);
             }
         };
