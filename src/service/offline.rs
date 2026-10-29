@@ -591,6 +591,7 @@ impl OfflineService {
         {
             Ok(receipt) => receipt,
             Err(error) => {
+                tracing::warn!(request = %record.command.id, %error, "admission became indeterminate");
                 transition(
                     &self.store,
                     &mut record,
@@ -602,7 +603,7 @@ impl OfflineService {
                     &record,
                     target_channel,
                     "delivery-failed",
-                    "DELIVERY INDETERMINATE; see durable request state",
+                    &format!("DELIVERY INDETERMINATE: {error}"),
                     now_ms,
                 )
                 .await?;
@@ -625,6 +626,7 @@ impl OfflineService {
             let acknowledged = match steering {
                 Ok(acknowledged) => acknowledged,
                 Err(error) => {
+                    tracing::warn!(request = %record.command.id, %error, "steering became indeterminate");
                     transition(
                         &self.store,
                         &mut record,
@@ -636,7 +638,7 @@ impl OfflineService {
                         &record,
                         target_channel,
                         "delivery-failed",
-                        "STEERING INDETERMINATE; see durable request state",
+                        &format!("STEERING INDETERMINATE: {error}"),
                         now_ms,
                     )
                     .await?;
