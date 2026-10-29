@@ -917,6 +917,42 @@ impl StoreHandle {
             .await
     }
 
+    /// The question or approval an agent incarnation is still waiting on: its
+    /// latest one, unless the agent has since written, taken input or ended a
+    /// turn. An answer continues the turn, so the agent's next message is
+    /// often the only sign of it.
+    pub async fn open_approval(
+        &self,
+        agent_id: String,
+        incarnation_id: String,
+    ) -> StoreResult<Option<StoredApproval>> {
+        self.run(move |connection| {
+            let request_id = connection
+                .query_row(
+                    "SELECT json_extract(record_json, '$.approval.request_id')
+                     FROM agent_events AS asked
+                     WHERE agent_id = ?1 AND incarnation_id = ?2
+                       AND kind = 'approval_requested' AND route_id IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM agent_events AS later
+                           WHERE later.agent_id = ?1 AND later.incarnation_id = ?2
+                             AND later.sequence > asked.sequence
+                             AND later.kind IN ('assistant_message', 'input_accepted', 'turn_started', 'turn_final'))
+                     ORDER BY sequence DESC
+                     LIMIT 1",
+                    params![agent_id, incarnation_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
+            match request_id {
+                Some(request_id) => get_approval(connection, &request_id),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
     pub async fn status(&self) -> StoreResult<StoreStatus> {
         self.request(|reply| Command::Status { reply }).await
     }
@@ -1562,6 +1598,74 @@ fn get_approval(connection: &Connection, request_id: &str) -> StoreResult<Option
     .transpose()
 }
 
+/// The text and buttons that ask the owner an agent's question or approval,
+/// a question form showing the answers recorded so far.
+pub(crate) fn approval_message(
+    approval: &ApprovalRequest,
+    form_state: &crate::wakterm::form::FormState,
+) -> (String, Vec<crate::domain::OutboxAction>) {
+    if crate::wakterm::form::answerable(approval) {
+        return (
+            crate::wakterm::form::text(approval, form_state),
+            crate::wakterm::form::actions(approval, form_state),
+        );
+    }
+    // Only a command approval or a Devin or Muse permission prompt
+    // asks to approve something; every other kind, including ones
+    // Panetone does not know, is a choice the agent is waiting on.
+    let mut body = if matches!(
+        approval.kind.as_str(),
+        "command_approval" | "devin_permission" | "muse_permission"
+    ) {
+        "Approval needed".to_string()
+    } else {
+        "Input needed".to_string()
+    };
+    if let Some(prompt) = approval.prompt.as_deref() {
+        body.push_str("\n\n");
+        body.push_str(prompt);
+    }
+    // A prompt that already names the command, as Devin's
+    // does, is not followed by it again.
+    if let Some(command) = approval.command.as_deref().filter(|command| {
+        !approval
+            .prompt
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains(command))
+    }) {
+        body.push_str("\n\nCommand:\n");
+        body.push_str(command);
+    }
+    if let Some(reason) = approval.reason.as_deref() {
+        body.push_str("\n\nReason: ");
+        body.push_str(reason);
+    }
+    if approval.kind == "user_question_form" {
+        body.push_str("\n\nThis form has several questions, so answer it in the agent's pane.");
+    }
+    if approval.kind == "user_question" {
+        for (index, choice) in approval.choices.iter().enumerate() {
+            if let Some(description) = choice.description.as_deref() {
+                body.push_str(&format!(
+                    "\n\n{}. {}: {}",
+                    index + 1,
+                    choice.label,
+                    description
+                ));
+            }
+        }
+    }
+    let actions = approval
+        .choices
+        .iter()
+        .map(|choice| crate::domain::OutboxAction {
+            id: format!("wakap:{}:{}", approval.request_id, choice.id),
+            label: choice.label.clone(),
+        })
+        .collect();
+    (body, actions)
+}
+
 /// Records one agent event and projects any visible output or approval it
 /// carries to its route's channel.
 #[allow(clippy::too_many_arguments)]
@@ -1816,70 +1920,9 @@ fn ingest_event(
             return Ok(());
         };
         let (body, attachments, actions) = match approval {
-            Some(approval) if crate::wakterm::form::answerable(&approval) => {
-                let state = crate::wakterm::form::FormState::default();
-                (
-                    crate::wakterm::form::text(&approval, &state),
-                    Vec::new(),
-                    crate::wakterm::form::actions(&approval, &state),
-                )
-            }
             Some(approval) => {
-                // Only a command approval or a Devin or Muse permission prompt
-                // asks to approve something; every other kind, including ones
-                // Panetone does not know, is a choice the agent is waiting on.
-                let mut body = if matches!(
-                    approval.kind.as_str(),
-                    "command_approval" | "devin_permission" | "muse_permission"
-                ) {
-                    "Approval needed".to_string()
-                } else {
-                    "Input needed".to_string()
-                };
-                if let Some(prompt) = approval.prompt.as_deref() {
-                    body.push_str("\n\n");
-                    body.push_str(prompt);
-                }
-                // A prompt that already names the command, as Devin's
-                // does, is not followed by it again.
-                if let Some(command) = approval.command.as_deref().filter(|command| {
-                    !approval
-                        .prompt
-                        .as_deref()
-                        .is_some_and(|prompt| prompt.contains(command))
-                }) {
-                    body.push_str("\n\nCommand:\n");
-                    body.push_str(command);
-                }
-                if let Some(reason) = approval.reason.as_deref() {
-                    body.push_str("\n\nReason: ");
-                    body.push_str(reason);
-                }
-                if approval.kind == "user_question_form" {
-                    body.push_str(
-                        "\n\nThis form has several questions, so answer it in the agent's pane.",
-                    );
-                }
-                if approval.kind == "user_question" {
-                    for (index, choice) in approval.choices.iter().enumerate() {
-                        if let Some(description) = choice.description.as_deref() {
-                            body.push_str(&format!(
-                                "\n\n{}. {}: {}",
-                                index + 1,
-                                choice.label,
-                                description
-                            ));
-                        }
-                    }
-                }
-                let actions = approval
-                    .choices
-                    .into_iter()
-                    .map(|choice| crate::domain::OutboxAction {
-                        id: format!("wakap:{}:{}", approval.request_id, choice.id),
-                        label: choice.label,
-                    })
-                    .collect();
+                let (body, actions) =
+                    approval_message(&approval, &crate::wakterm::form::FormState::default());
                 (body, Vec::new(), actions)
             }
             None => {

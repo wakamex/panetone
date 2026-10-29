@@ -1492,7 +1492,7 @@ impl ProductionService {
                             // The message is pending again before the notice,
                             // so a failed notice cannot strand it.
                             if now_ms() - item.created_at_ms >= INBOX_WAITING_NOTICE_MS
-                                && let Err(error) = self.notify_waiting(&item, route, &detail).await
+                                && let Err(error) = self.notify_waiting(&item, route, &binding, &detail).await
                             {
                                 tracing::warn!(error = %error, "waiting notice was not posted");
                             }
@@ -1678,23 +1678,49 @@ impl ProductionService {
              Check the pane before resending; the text may still be there.",
             route.title
         );
-        self.notify_sender(item, route, "unconfirmed", body).await
+        self.notify_sender(item, route, "unconfirmed", body, Vec::new())
+            .await
     }
 
     /// Tells the sender's chat, once, why an inbound message is still waiting
-    /// for an agent whose pane cannot take input.
+    /// for an agent whose pane cannot take input. When the agent is waiting on
+    /// a question it asked here, the notice asks it again with its buttons,
+    /// since the first asking may have scrolled out of view.
     async fn notify_waiting(
         &self,
         item: &InboxItem,
         route: &Route,
+        binding: &AgentBinding,
         detail: &str,
     ) -> Result<(), String> {
-        let body = format!(
-            "[waiting] {} cannot take your message yet: {detail}. \
-             Panetone delivers it when the pane can take input; do not resend.",
-            route.title
-        );
-        self.notify_sender(item, route, "waiting", body).await
+        let open = self
+            .store
+            .open_approval(binding.agent_id.clone(), binding.incarnation_id.clone())
+            .await
+            .map_err(error_string)?;
+        let (body, actions) = match open {
+            Some(stored) => {
+                let state = self.form_state(&stored.request.request_id).await?;
+                let (question, actions) = crate::store::approval_message(&stored.request, &state);
+                (
+                    format!(
+                        "[waiting] {} is waiting for your answer to this, and your message goes in after it:\n\n{question}",
+                        route.title
+                    ),
+                    actions,
+                )
+            }
+            None => (
+                format!(
+                    "[waiting] {} cannot take your message yet: {detail}. \
+                     Panetone delivers it when the pane can take input; do not resend.",
+                    route.title
+                ),
+                Vec::new(),
+            ),
+        };
+        self.notify_sender(item, route, "waiting", body, actions)
+            .await
     }
 
     /// Posts one notice of a kind about an inbound message to its own chat.
@@ -1704,6 +1730,7 @@ impl ProductionService {
         route: &Route,
         kind: &str,
         body: String,
+        actions: Vec<OutboxAction>,
     ) -> Result<(), String> {
         let namespace = Uuid::new_v5(
             &Uuid::NAMESPACE_URL,
@@ -1712,8 +1739,16 @@ impl ProductionService {
         let id = EffectId::new(Uuid::new_v5(&namespace, item.id.to_string().as_bytes()));
         // A notice about one message is posted once, even when its reason
         // changes on a later attempt.
-        if self.store.outbox_exists(id).await.map_err(error_string)? {
-            return Ok(());
+        // A long notice is posted in parts, the first under a derived ID.
+        for posted in [id, EffectId::chunk(id, 0)] {
+            if self
+                .store
+                .outbox_exists(posted)
+                .await
+                .map_err(error_string)?
+            {
+                return Ok(());
+            }
         }
         // A notice about Panetone's own delivery is for the owner, so a
         // message from a shared group is answered in a private channel.
@@ -1735,6 +1770,12 @@ impl ProductionService {
         } else {
             (item.channel, item.destination.clone())
         };
+        // Buttons work only in the route's own Telegram topic, where the
+        // primary bot receives their taps.
+        let in_topic = kind == ChannelKind::Telegram
+            && route.channels.iter().any(|binding| {
+                matches!(binding, ChannelBinding::Telegram { topic_id } if topic_id.to_string() == destination)
+            });
         let notice = OutboxItem {
             id,
             route_id: Some(route.id),
@@ -1744,18 +1785,20 @@ impl ProductionService {
             destination,
             body,
             attachments: Vec::new(),
-            actions: Vec::new(),
+            actions: if in_topic { actions } else { Vec::new() },
             state: OutboxState::Pending,
             attempts: 0,
             last_error: None,
             external_receipt: None,
             uncertain_attempts: 0,
         };
-        self.store
-            .enqueue_outbox(None, notice, now_ms())
-            .await
-            .map(|_| ())
-            .map_err(error_string)
+        for chunk in crate::domain::chunk_outbox(notice) {
+            self.store
+                .enqueue_outbox(None, chunk, now_ms())
+                .await
+                .map_err(error_string)?;
+        }
+        Ok(())
     }
 
     /// Posts a notice in a route's channel when one of its agents becomes
@@ -5155,6 +5198,138 @@ fi
             );
             assert_eq!(store.status().await.unwrap().pending_inbox, 2);
         }
+
+        // While the agent waits on a question it asked in the topic, the
+        // notice asks it again with its buttons, which may have scrolled away.
+        let route = store.list_routes().await.unwrap().remove(0);
+        store.initialize_event_cursor(10).await.unwrap();
+        let agent = AgentBinding {
+            agent_id: "agent-route".into(),
+            incarnation_id: "inc-route".into(),
+            harness: "claude".into(),
+            pane_id: Some(1),
+        };
+        let asked: crate::wakterm::EventRecord = serde_json::from_value(json!({
+            "sequence": 11,
+            "event_id": "question-11",
+            "kind": "approval_requested",
+            "agent_id": "agent-route",
+            "incarnation_id": "inc-route",
+            "observed_at": "2026-10-29T22:34:23Z",
+            "approval": {
+                "schema": "wakterm.agent-approval.v1",
+                "kind": "user_question",
+                "request_id": "219c69e3a2b98a05349b62f1",
+                "agent_id": "agent-route",
+                "incarnation_id": "inc-route",
+                "turn_id": "turn-1",
+                "item_id": "item-1",
+                "observed_at": "2026-10-29T22:34:23Z",
+                "prompt": "How should the host-wide setting start?",
+                "reason": null,
+                "command": null,
+                "cwd": null,
+                "choices": [
+                    {"id": "option_1", "label": "Warn for a day"},
+                    {"id": "option_2", "label": "Enforce now"}
+                ]
+            }
+        }))
+        .unwrap();
+        store
+            .ingest_agent_events(
+                10,
+                11,
+                vec![asked],
+                vec![RouteAgent {
+                    route_id: route.id,
+                    agent: agent.clone(),
+                }],
+                2,
+            )
+            .await
+            .unwrap();
+        let waiting = |id: u128| InboxItem {
+            id: EffectId::new(Uuid::from_u128(id)),
+            channel: ChannelKind::Telegram,
+            external_id: format!("update-{id}"),
+            destination: "10".into(),
+            sender_id: Some("42".into()),
+            sender: Some("Mihai".into()),
+            reply_to_external_id: None,
+            body: "what now".into(),
+            state: "pending".into(),
+            created_at_ms: now_ms() - INBOX_WAITING_NOTICE_MS,
+            receipt: None,
+            steering_acknowledged: None,
+            proof: None,
+            transcribed: false,
+        };
+        let notice_for = |outbox: Vec<OutboxItem>, needle: &str| {
+            outbox
+                .into_iter()
+                .filter(|item| item.body.contains(needle))
+                .collect::<Vec<_>>()
+        };
+        store.accept_inbox(waiting(128)).await.unwrap();
+        service.inbox_once().await.unwrap();
+        let asked_again = notice_for(
+            store.pending_outbox().await.unwrap(),
+            "is waiting for your answer",
+        );
+        assert_eq!(asked_again.len(), 1);
+        assert_eq!(asked_again[0].destination, "10");
+        assert!(asked_again[0].body.starts_with(
+            "[waiting] route is waiting for your answer to this, and your message goes in after it:\n\nInput needed\n\nHow should the host-wide setting start?"
+        ));
+        assert_eq!(
+            asked_again[0]
+                .actions
+                .iter()
+                .map(|action| action.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "wakap:219c69e3a2b98a05349b62f1:option_1",
+                "wakap:219c69e3a2b98a05349b62f1:option_2"
+            ]
+        );
+
+        // Once the agent writes again the question was answered, and a pane
+        // still blocked is blocked by something else.
+        let wrote: crate::wakterm::EventRecord = serde_json::from_value(json!({
+            "sequence": 12,
+            "event_id": "message-12",
+            "kind": "assistant_message",
+            "agent_id": "agent-route",
+            "incarnation_id": "inc-route",
+            "observed_at": "2026-10-29T23:31:24Z",
+            "turn_id": "turn-1",
+            "text": "Set to warn."
+        }))
+        .unwrap();
+        store
+            .ingest_agent_events(
+                11,
+                12,
+                vec![wrote],
+                vec![RouteAgent {
+                    route_id: route.id,
+                    agent,
+                }],
+                3,
+            )
+            .await
+            .unwrap();
+        store.accept_inbox(waiting(129)).await.unwrap();
+        service.inbox_once().await.unwrap();
+        assert_eq!(
+            notice_for(
+                store.pending_outbox().await.unwrap(),
+                "is waiting for your answer"
+            )
+            .len(),
+            1
+        );
         drop(service);
         store.shutdown().await.unwrap();
     }
