@@ -263,18 +263,13 @@ fi
         telegram[1]["text"]
             .as_str()
             .unwrap()
-            .contains("DELIVERY INDETERMINATE")
+            .contains("DELIVERY INDETERMINATE: adapter operation became uncertain: Wakterm CLI operation exceeded its deadline")
     );
-    assert_eq!(
-        store
-            .get_workflow(command.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .workflow
-            .state,
-        WorkflowState::Indeterminate
-    );
+    let record = store.get_workflow(command.id).await.unwrap().unwrap();
+    assert_eq!(record.workflow.state, WorkflowState::Indeterminate);
+    // Stamped when Wakterm gave up, after at least one full attempt of its
+    // 30 ms deadline and 30 ms confirmation window, not when the send began.
+    assert!(record.updated_at_ms >= 100 + 60, "{}", record.updated_at_ms);
     drop(service);
     store.shutdown().await.unwrap();
 }

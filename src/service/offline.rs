@@ -578,7 +578,12 @@ impl OfflineService {
             &record.workflow.observed_source.harness,
             &target.harness,
         );
-        let receipt = match self
+        // Admitting and steering can take minutes, so what follows them is
+        // stamped with the time they answered, and a proof deadline gets its
+        // whole window.
+        let started = std::time::Instant::now();
+        let answered_ms = || now_ms + i64::try_from(started.elapsed().as_millis()).unwrap_or(0);
+        let admission = self
             .wakterm
             .admit(
                 record.workflow.target_effect_id,
@@ -587,8 +592,9 @@ impl OfflineService {
                 record.command.return_final,
                 record.command.timeout_ms,
             )
-            .await
-        {
+            .await;
+        let now_ms = answered_ms();
+        let receipt = match admission {
             Ok(receipt) => receipt,
             Err(error) => {
                 tracing::warn!(request = %record.command.id, %error, "admission became indeterminate");
@@ -621,6 +627,7 @@ impl OfflineService {
         } else {
             None
         };
+        let now_ms = answered_ms();
         if let Some(steering) = steering {
             record.workflow.record_target_receipt(&receipt, &target)?;
             let acknowledged = match steering {
