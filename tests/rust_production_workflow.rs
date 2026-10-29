@@ -681,13 +681,16 @@ elif [[ "$operation" == *"agent admit"* ]]; then
     if [[ "$previous" == "--incarnation" ]]; then incarnation="$argument"; fi
     previous="$argument"
   done
-  cat > '{}'
+  # The busy queue asks again every second and the test can stop the daemon
+  # mid-call, so the prompt is replaced whole, never left half written.
+  cat > '{0}.partial'
+  mv '{0}.partial' '{0}'
   printf '{{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"busy","definitive":true,"prompt_written":false,"agent_id":"agent-target","incarnation_id":"%s","detail":"target is busy"}}\n' "$request_id" "$incarnation"
-elif [[ "$operation" == *"agent send agent-target"* && -e '{}' ]]; then
+elif [[ "$operation" == *"agent send agent-target"* && -e '{1}' ]]; then
   cat >/dev/null
   echo '{{"agent_id":"agent-target","agent_name":"target","pane_id":2,"transport":"ObservedPty","submitted":false,"acknowledgement":{{"kind":"not_requested","acknowledged":false,"latency_ms":null,"session_path":null,"detail":null}},"refusal":{{"reason":"input_blocked","detail":"the target is waiting for dialog open"}}}}'
 elif [[ "$operation" == *"agent send agent-target"* ]]; then
-  cat > '{}'
+  cat > '{2}'
   echo '{{"agent_id":"agent-target","agent_name":"target","pane_id":2,"transport":"CodexAppServerTui","submitted":true,"acknowledgement":{{"kind":"app_server","acknowledged":true,"latency_ms":1,"session_path":null,"detail":"[app-server-tui running] Codex commandExecution"}}}}'
 else
   echo "unexpected fake invocation: $operation" >&2
