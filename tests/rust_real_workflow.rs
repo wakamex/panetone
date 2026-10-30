@@ -400,6 +400,18 @@ fi
 
 #[tokio::test]
 async fn a_short_rate_limit_on_the_audit_is_waited_out() {
+    // Telegram limits the first post for a second, then accepts it.
+    audit_gets_past_a_first_failed_post(Some(b"HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 82\r\n\r\n{\"ok\":false,\"error_code\":429,\"description\":\"retry\",\"parameters\":{\"retry_after\":1}}")).await;
+}
+
+#[tokio::test]
+async fn an_audit_post_whose_answer_was_lost_is_posted_again() {
+    // Telegram reads the first post and drops the connection without an
+    // answer, so it may have posted it; a repeated audit line is harmless.
+    audit_gets_past_a_first_failed_post(None).await;
+}
+
+async fn audit_gets_past_a_first_failed_post(first: Option<&'static [u8]>) {
     let directory = tempdir().unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let admission_log = directory.path().join("admission.log");
@@ -449,17 +461,17 @@ fi
     );
     let target = route(2, "Target", target_binding, 202);
 
-    // Telegram limits the first post for a second, then accepts it.
-    let limited = b"HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 82\r\n\r\n{\"ok\":false,\"error_code\":429,\"description\":\"retry\",\"parameters\":{\"retry_after\":1}}";
     let posted = b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 37\r\n\r\n{\"ok\":true,\"result\":{\"message_id\":7}}";
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let telegram_server = tokio::spawn(async move {
-        for response in [&limited[..], &posted[..]] {
+        for response in [first, Some(&posted[..])] {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0_u8; 4096];
             let _ = stream.read(&mut request).await.unwrap();
-            stream.write_all(response).await.unwrap();
+            if let Some(response) = response {
+                stream.write_all(response).await.unwrap();
+            }
         }
     });
     let channels = RealChannels {

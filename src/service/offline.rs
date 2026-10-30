@@ -254,10 +254,14 @@ impl WaktermBackend {
 }
 
 impl ChannelBackend {
+    /// Sends one item. `repeatable` marks Panetone's own audit and status
+    /// lines, which may appear twice: a send that may or may not have posted
+    /// is then tried again rather than failing the workflow it is part of.
     async fn send(
         &self,
         item: &OutboxItem,
         signal_account: Option<&str>,
+        repeatable: bool,
     ) -> Result<String, ServiceError> {
         match self {
             Self::Fake(channels) => channels
@@ -276,6 +280,10 @@ impl ChannelBackend {
                             retry_after_secs,
                             ..
                         }) if attempt < 4 && retry_after_secs <= 60 => continue,
+                        Err(error) if repeatable && attempt < 3 && error.may_have_delivered() => {
+                            tracing::warn!(%error, attempt, "uncertain audit post; posting it again");
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        }
                         Err(error) => return Err(ServiceError::Adapter(error.to_string())),
                     }
                 }
@@ -337,6 +345,7 @@ impl OfflineService {
         item: OutboxItem,
         now_ms: i64,
         fault_after_send: Option<FaultPoint>,
+        repeatable: bool,
     ) -> Result<String, ServiceError> {
         let chunks = self
             .store
@@ -365,7 +374,7 @@ impl OfflineService {
                 ChannelKind::Telegram => Vec::new(),
             };
             let signal_account = signal_group_account(&routes, chunk.route_id, &chunk.destination);
-            match self.channels.send(&chunk, signal_account).await {
+            match self.channels.send(&chunk, signal_account, repeatable).await {
                 Ok(receipt) => {
                     if let Some(point) = fault_after_send {
                         self.faults.hit(point)?;
@@ -507,6 +516,7 @@ impl OfflineService {
                 audit,
                 now_ms,
                 Some(FaultPoint::AfterAuditEffect),
+                true,
             )
             .await
         {
@@ -900,7 +910,7 @@ impl OfflineService {
             uncertain_attempts: 0,
         };
         match self
-            .deliver_channel_effect(record.command.id, item, now_ms, None)
+            .deliver_channel_effect(record.command.id, item, now_ms, None, true)
             .await
         {
             Ok(_) | Err(ServiceError::Adapter(_)) => {}
@@ -1062,6 +1072,9 @@ impl OfflineService {
                     mirror,
                     now_ms,
                     Some(FaultPoint::AfterMirrorEffect),
+                    // A mirrored reply is the agent's own message, and a
+                    // second copy of it is not Panetone's to post.
+                    false,
                 )
                 .await
             {
