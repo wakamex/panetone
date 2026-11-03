@@ -82,6 +82,8 @@ pub struct FormUpdate {
     pub actions: Vec<OutboxAction>,
 }
 
+const DISCARD_DRAFT_CAPABILITY: &str = "claude_refusal_menu.discard_draft.v1";
+
 /// Why a Telegram approval tap was not applied.
 #[derive(Debug, PartialEq)]
 pub enum ApprovalTapError {
@@ -138,17 +140,38 @@ impl ProductionService {
             .iter()
             .find(|choice| choice.id == response.choice_id)
             .ok_or_else(|| "approval choice is no longer available".to_string())?;
+        // Claude puts a refused prompt back in its input box to be edited,
+        // which a Telegram owner cannot reach, and the draft then blocks every
+        // later message. Wakterm can clear it, and the owner's next message
+        // is the edited prompt.
+        let discard_draft = stored.request.kind == "claude_refusal_fallback"
+            && choice.id == "edit_prompt"
+            && self
+                .wakterm
+                .capabilities()
+                .await
+                .map_err(error_string)?
+                .capabilities
+                .contains(DISCARD_DRAFT_CAPABILITY);
         let resolved = self
             .wakterm
             .resolve_approval(
                 &stored.request.request_id,
                 &stored.request.agent_id,
                 &stored.request.incarnation_id,
-                &choice.id,
+                if discard_draft {
+                    "edit_prompt_discard_draft"
+                } else {
+                    &choice.id
+                },
                 None,
             )
             .await;
         match resolved {
+            Ok(_) if discard_draft => Ok(format!(
+                "{}. The input box is empty, so send your edited message here.",
+                choice.label
+            )),
             Ok(_) => Ok(choice.label.clone()),
             Err(error) => {
                 // Asked only after Wakterm refused, so a tap on a question
@@ -3573,6 +3596,122 @@ fi
         assert_eq!(
             service.resolve_telegram_approval(&tap).await,
             Err(ApprovalTapError::Closed)
+        );
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn editing_a_refused_prompt_from_telegram_clears_the_restored_draft() {
+        let directory = tempdir().unwrap();
+        let calls = directory.path().join("approval-args.log");
+        let binary = directory.path().join("wakterm-fake");
+        fs::write(
+            &binary,
+            format!(
+                r#"#!/bin/bash
+set -euo pipefail
+operation="$*"
+if [[ "$operation" == *"agent capabilities"* ]]; then
+  echo '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1","approval_control.v1","claude_refusal_menu.discard_draft.v1"]}}'
+elif [[ "$operation" == *"agent approval"* ]]; then
+  printf '%s\n' "$@" > '{}'
+  echo '{{"schema":"wakterm.agent-approval.v1","request_id":"8d1329d96f4088defa6e75b0","agent_id":"agent-route","incarnation_id":"inc-route","choice_id":"edit_prompt_discard_draft","resolved":true}}'
+else
+  echo "unexpected fake invocation: $operation" >&2
+  exit 9
+fi
+"#,
+                calls.display()
+            ),
+        )
+        .unwrap();
+        crate::test_support::seal_executable(&binary);
+        let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        let route = Route {
+            id: RouteId::new(Uuid::new_v4()),
+            title: "route".into(),
+            channels: vec![ChannelBinding::Telegram { topic_id: 10 }],
+            agent: None,
+        };
+        store.save_route(route.clone(), 1).await.unwrap();
+        store.initialize_event_cursor(100).await.unwrap();
+        let refusal: crate::wakterm::EventRecord = serde_json::from_value(json!({
+            "sequence": 101,
+            "event_id": "event-101",
+            "kind": "approval_requested",
+            "agent_id": "agent-route",
+            "incarnation_id": "inc-route",
+            "observed_at": "2026-11-03T03:17:15Z",
+            "approval": {
+                "schema": "wakterm.agent-approval.v1",
+                "kind": "claude_refusal_fallback",
+                "request_id": "8d1329d96f4088defa6e75b0",
+                "agent_id": "agent-route",
+                "incarnation_id": "inc-route",
+                "turn_id": "turn-1",
+                "item_id": "8d1329d96f4088defa6e75b0",
+                "observed_at": "2026-11-03T03:17:15Z",
+                "prompt": "Session paused: the safeguards flagged this session.",
+                "reason": null,
+                "command": null,
+                "cwd": null,
+                "choices": [
+                    {"id": "retry_fallback", "label": "Switch to the fallback model"},
+                    {"id": "edit_prompt", "label": "Edit prompt and retry"}
+                ]
+            }
+        }))
+        .unwrap();
+        store
+            .ingest_agent_events(
+                100,
+                101,
+                vec![refusal],
+                vec![RouteAgent {
+                    route_id: route.id,
+                    agent: AgentBinding {
+                        agent_id: "agent-route".into(),
+                        incarnation_id: "inc-route".into(),
+                        harness: "claude".into(),
+                        pane_id: Some(1),
+                    },
+                }],
+                2,
+            )
+            .await
+            .unwrap();
+        let service = ProductionService::new(
+            store.clone(),
+            WaktermCli::new(
+                binary,
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            RealChannels::default(),
+            SupervisorHandle::default(),
+            Vec::new(),
+            directory.path().join("control.sock"),
+        );
+        let label = service
+            .resolve_telegram_approval(&TelegramApprovalResponse {
+                query_id: "query".into(),
+                destination: "10".into(),
+                sender_id: "42".into(),
+                message_id: 555,
+                request_id: "8d1329d96f4088defa6e75b0".into(),
+                choice_id: "edit_prompt".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            label,
+            "Edit prompt and retry. The input box is empty, so send your edited message here."
+        );
+        assert!(
+            fs::read_to_string(&calls)
+                .unwrap()
+                .contains("--choice\nedit_prompt_discard_draft\n")
         );
         drop(service);
         store.shutdown().await.unwrap();
