@@ -1495,7 +1495,7 @@ async fn a_tagged_message_settles_the_reply_its_agent_owes() {
 }
 
 #[tokio::test]
-async fn a_turn_a_reminder_started_is_not_followed_by_another_reminder() {
+async fn no_reminder_follows_a_turn_a_reminder_started_or_the_safeguards_refused() {
     let directory = tempdir().unwrap();
     let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
     let route = route();
@@ -1577,6 +1577,48 @@ async fn a_turn_a_reminder_started_is_not_followed_by_another_reminder() {
         .unwrap();
     assert_eq!(ended.turn_id, "turn-2");
     assert!(ended.started_by_reminder);
+    assert!(!ended.refused);
+
+    let mut refusal = event(106, "approval_requested", "turn-3", None);
+    refusal.fields.insert(
+        "approval".into(),
+        serde_json::json!({
+            "schema": "wakterm.agent-approval.v1",
+            "request_id": "0123456789abcdef01234567",
+            "agent_id": "agent-zola",
+            "incarnation_id": "incarnation-zola-7",
+            "turn_id": "turn-3",
+            "item_id": "0123456789abcdef01234567",
+            "kind": "claude_refusal_fallback",
+            "prompt": "Session paused: the model's safeguards flagged this session.",
+            "choices": [
+                {"id": "retry_fallback", "label": "Switch to the fallback model"},
+                {"id": "edit_prompt", "label": "Edit prompt and retry"}
+            ],
+            "observed_at": "2026-10-16T12:00:00Z"
+        }),
+    );
+    store
+        .ingest_agent_events(
+            104,
+            107,
+            vec![
+                event(105, "turn_started", "turn-3", Some("other")),
+                refusal,
+                event(107, "turn_final", "turn-3", None),
+            ],
+            live_agents(&route),
+            3,
+        )
+        .await
+        .unwrap();
+    let ended = store
+        .last_turn_end("agent-zola".into(), 100)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ended.turn_id, "turn-3");
+    assert!(ended.refused && !ended.started_by_reminder);
     store.shutdown().await.unwrap();
 }
 

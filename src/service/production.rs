@@ -82,6 +82,21 @@ pub struct FormUpdate {
     pub actions: Vec<OutboxAction>,
 }
 
+/// Why a Telegram approval tap was not applied.
+#[derive(Debug, PartialEq)]
+pub enum ApprovalTapError {
+    /// The question is no longer open: it was answered in the pane, or the
+    /// agent moved on without it.
+    Closed,
+    Failed(String),
+}
+
+impl From<String> for ApprovalTapError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
 /// Route health metadata key: reported agent problems by problem key.
 const ROUTE_HEALTH_KEY: &str = "route_health";
 
@@ -96,7 +111,7 @@ impl ProductionService {
     pub async fn resolve_telegram_approval(
         &self,
         response: &TelegramApprovalResponse,
-    ) -> Result<String, String> {
+    ) -> Result<String, ApprovalTapError> {
         let stored = self
             .store
             .get_approval(response.request_id.clone())
@@ -113,7 +128,9 @@ impl ProductionService {
             matches!(binding, ChannelBinding::Telegram { topic_id } if topic_id.to_string() == response.destination)
         });
         if !correct_topic {
-            return Err("approval button does not belong to this topic".into());
+            return Err("approval button does not belong to this topic"
+                .to_string()
+                .into());
         }
         let choice = stored
             .request
@@ -121,7 +138,8 @@ impl ProductionService {
             .iter()
             .find(|choice| choice.id == response.choice_id)
             .ok_or_else(|| "approval choice is no longer available".to_string())?;
-        self.wakterm
+        let resolved = self
+            .wakterm
             .resolve_approval(
                 &stored.request.request_id,
                 &stored.request.agent_id,
@@ -129,9 +147,27 @@ impl ProductionService {
                 &choice.id,
                 None,
             )
-            .await
-            .map_err(error_string)?;
-        Ok(choice.label.clone())
+            .await;
+        match resolved {
+            Ok(_) => Ok(choice.label.clone()),
+            Err(error) => {
+                // Asked only after Wakterm refused, so a tap on a question
+                // still open is never turned away on Panetone's view alone.
+                let open = self
+                    .store
+                    .open_approval(
+                        stored.request.agent_id.clone(),
+                        stored.request.incarnation_id.clone(),
+                    )
+                    .await
+                    .map_err(error_string)?;
+                if open.is_some_and(|open| open.request.request_id == stored.request.request_id) {
+                    Err(ApprovalTapError::Failed(error_string(error)))
+                } else {
+                    Err(ApprovalTapError::Closed)
+                }
+            }
+        }
     }
 
     /// Applies a tap on a question form message and returns the confirmation
@@ -1227,7 +1263,8 @@ impl ProductionService {
     }
 
     /// Reminds an agent of the replies it owes, at most once after each turn
-    /// that a reminder did not start. Returns whether a reminder was sent.
+    /// that a reminder did not start and the model's safeguards did not
+    /// refuse. Returns whether a reminder was sent.
     async fn remind(
         &self,
         live: &LiveRouteSnapshot,
@@ -1270,6 +1307,7 @@ impl ProductionService {
         if turn.superseded
             || turn.started_by_reminder
             || turn.reminded
+            || turn.refused
             || now_ms() - turn.ended_at_ms < REPLY_REMINDER_DELAY_MS
         {
             return Ok(false);
@@ -3414,6 +3452,128 @@ fi
                 .starts_with("[Resolved] Wakterm cannot read")
         );
         assert!(service.reported_problems().await.unwrap().is_empty());
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_tap_on_a_question_that_closed_in_the_pane_says_so() {
+        let directory = tempdir().unwrap();
+        let binary = directory.path().join("wakterm-fake");
+        fs::write(
+            &binary,
+            r#"#!/bin/bash
+set -euo pipefail
+operation="$*"
+if [[ "$operation" == *"agent capabilities"* ]]; then
+  echo '{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1","approval_control.v1"]}'
+elif [[ "$operation" == *"agent approval"* ]]; then
+  echo 'unexpected response Ok(ErrorResponse(ErrorResponse { reason: "Error: Claude does not report a dialog open" })); terminating' >&2
+  exit 1
+else
+  echo "unexpected fake invocation: $operation" >&2
+  exit 9
+fi
+"#,
+        )
+        .unwrap();
+        crate::test_support::seal_executable(&binary);
+        let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        let route = Route {
+            id: RouteId::new(Uuid::new_v4()),
+            title: "route".into(),
+            channels: vec![ChannelBinding::Telegram { topic_id: 10 }],
+            agent: None,
+        };
+        store.save_route(route.clone(), 1).await.unwrap();
+        store.initialize_event_cursor(100).await.unwrap();
+        let agent = AgentBinding {
+            agent_id: "agent-route".into(),
+            incarnation_id: "inc-route".into(),
+            harness: "claude".into(),
+            pane_id: Some(1),
+        };
+        let event = |sequence: u64, kind: &str| -> crate::wakterm::EventRecord {
+            let mut value = json!({
+                "sequence": sequence,
+                "event_id": format!("event-{sequence}"),
+                "kind": kind,
+                "agent_id": "agent-route",
+                "incarnation_id": "inc-route",
+                "turn_id": "turn-1",
+                "observed_at": "2026-11-03T03:17:15Z",
+            });
+            if kind == "approval_requested" {
+                value["approval"] = json!({
+                    "schema": "wakterm.agent-approval.v1",
+                    "kind": "claude_refusal_fallback",
+                    "request_id": "8d1329d96f4088defa6e75b0",
+                    "agent_id": "agent-route",
+                    "incarnation_id": "inc-route",
+                    "turn_id": "turn-1",
+                    "item_id": "8d1329d96f4088defa6e75b0",
+                    "observed_at": "2026-11-03T03:17:15Z",
+                    "prompt": "Session paused: the safeguards flagged this session.",
+                    "reason": null,
+                    "command": null,
+                    "cwd": null,
+                    "choices": [
+                        {"id": "retry_fallback", "label": "Switch to the fallback model"},
+                        {"id": "edit_prompt", "label": "Edit prompt and retry"}
+                    ]
+                });
+            }
+            serde_json::from_value(value).unwrap()
+        };
+        let ingest = |after: u64, events: Vec<crate::wakterm::EventRecord>| {
+            let store = store.clone();
+            let agents = vec![RouteAgent {
+                route_id: route.id,
+                agent: agent.clone(),
+            }];
+            async move {
+                let last = events.last().unwrap().sequence;
+                store
+                    .ingest_agent_events(after, last, events, agents, now_ms())
+                    .await
+                    .unwrap();
+            }
+        };
+        ingest(100, vec![event(101, "approval_requested")]).await;
+        let service = ProductionService::new(
+            store.clone(),
+            WaktermCli::new(
+                binary,
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            RealChannels::default(),
+            SupervisorHandle::default(),
+            Vec::new(),
+            directory.path().join("control.sock"),
+        );
+        let tap = TelegramApprovalResponse {
+            query_id: "query".into(),
+            destination: "10".into(),
+            sender_id: "42".into(),
+            message_id: 555,
+            request_id: "8d1329d96f4088defa6e75b0".into(),
+            choice_id: "edit_prompt".into(),
+        };
+
+        // While the question is open, Wakterm's refusal is shown as it came.
+        let Err(ApprovalTapError::Failed(error)) = service.resolve_telegram_approval(&tap).await
+        else {
+            panic!("an open question's refusal must be reported as a failure");
+        };
+        assert!(error.contains("Claude does not report a dialog open"));
+
+        // Once the turn ended without it, the question had closed in the pane.
+        ingest(101, vec![event(102, "turn_final")]).await;
+        assert_eq!(
+            service.resolve_telegram_approval(&tap).await,
+            Err(ApprovalTapError::Closed)
+        );
         drop(service);
         store.shutdown().await.unwrap();
     }

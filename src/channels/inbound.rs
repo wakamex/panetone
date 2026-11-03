@@ -79,6 +79,7 @@ pub struct TelegramApprovalResponse {
     pub query_id: String,
     pub destination: String,
     pub sender_id: String,
+    pub message_id: i64,
     pub request_id: String,
     pub choice_id: String,
 }
@@ -207,6 +208,7 @@ impl TelegramPoller {
                         query_id: callback.id,
                         destination: topic.to_string(),
                         sender_id: callback.from.id.to_string(),
+                        message_id: message.message_id,
                         request_id,
                         choice_id,
                     });
@@ -331,19 +333,37 @@ impl TelegramPoller {
             .iter()
             .map(|action| vec![json!({"text": action.label, "callback_data": action.id})])
             .collect::<Vec<_>>();
-        let response = self
-            .http
-            .post(format!(
-                "{}/bot{}/editMessageText",
-                self.api_base, self.token
-            ))
-            .json(&json!({
+        self.edit(
+            "editMessageText",
+            json!({
                 "chat_id": self.chat_id,
                 "message_id": message_id,
                 "text": text,
                 "link_preview_options": {"is_disabled": true},
                 "reply_markup": {"inline_keyboard": keyboard},
-            }))
+            }),
+        )
+        .await
+    }
+
+    /// Removes a posted message's buttons and keeps its text.
+    pub async fn remove_buttons(&self, message_id: i64) -> Result<(), ChannelDeliveryError> {
+        self.edit(
+            "editMessageReplyMarkup",
+            json!({
+                "chat_id": self.chat_id,
+                "message_id": message_id,
+                "reply_markup": {"inline_keyboard": []},
+            }),
+        )
+        .await
+    }
+
+    async fn edit(&self, method: &str, body: Value) -> Result<(), ChannelDeliveryError> {
+        let response = self
+            .http
+            .post(format!("{}/bot{}/{method}", self.api_base, self.token))
+            .json(&body)
             .send()
             .await
             .map_err(|error| {

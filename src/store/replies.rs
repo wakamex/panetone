@@ -87,6 +87,9 @@ pub struct TurnEnd {
     pub started_by_reminder: bool,
     /// A reminder already followed this turn.
     pub reminded: bool,
+    /// The model's safeguards refused this turn. The agent's next turn would
+    /// carry the same history, so a reminder would most likely be refused too.
+    pub refused: bool,
 }
 
 pub(super) fn open_debt(connection: &mut Connection, mut debt: ReplyDebt) -> StoreResult<()> {
@@ -502,12 +505,25 @@ pub(super) fn last_turn_end(
         )
         .optional()?
         .is_some();
+    let refused = connection
+        .query_row(
+            "SELECT 1 FROM agent_events
+             WHERE agent_id = ?1 AND kind = 'approval_requested'
+               AND json_extract(record_json, '$.approval.turn_id') = ?2
+               AND json_extract(record_json, '$.approval.kind') = 'claude_refusal_fallback'
+             LIMIT 1",
+            params![agent_id, turn_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
     Ok(Some(TurnEnd {
         turn_id,
         ended_at_ms,
         superseded,
         started_by_reminder,
         reminded,
+        refused,
     }))
 }
 

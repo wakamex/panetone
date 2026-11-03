@@ -194,7 +194,7 @@ async fn telegram_polling_returns_structured_approval_callbacks() {
             "callback_query": {
                 "id": "callback-1",
                 "from": {"id": 1234},
-                "message": {"chat": {"id": -1001}, "message_thread_id": 77},
+                "message": {"message_id": 555, "chat": {"id": -1001}, "message_thread_id": 77},
                 "data": "wakap:0123456789abcdef01234567:allow_once"
             }
         }, {
@@ -235,6 +235,7 @@ async fn telegram_polling_returns_structured_approval_callbacks() {
     assert_eq!(batch.unknown_taps, ["callback-3"]);
     assert_eq!(batch.approvals[0].sender_id, "1234");
     assert_eq!(batch.approvals[0].destination, "77");
+    assert_eq!(batch.approvals[0].message_id, 555);
     assert_eq!(batch.approvals[0].request_id, "0123456789abcdef01234567");
     assert_eq!(batch.approvals[0].choice_id, "allow_once");
     let payload = request.await.unwrap();

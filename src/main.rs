@@ -13,7 +13,9 @@ use panetone::control::{
     CONTROL_SCHEMA, ControlRequest, ControlServer, OutputDispositionParams, RouteEnsureParams,
     RouteInspectParams, SendParams, SourceAgent, request,
 };
-use panetone::service::{FormUpdate, InboundIngestor, ProductionService, SignalReceiver};
+use panetone::service::{
+    ApprovalTapError, FormUpdate, InboundIngestor, ProductionService, SignalReceiver,
+};
 use panetone::store::StoreHandle;
 use panetone::supervisor::{Supervisor, TaskPolicy, run_periodic};
 use panetone::wakterm::{EventRead, EventRecord, WaktermCli, resume_cursor};
@@ -744,11 +746,19 @@ async fn telegram_loop(
             let result = if approval.sender_id == owner {
                 service.resolve_telegram_approval(&approval).await
             } else {
-                Err("Only the configured owner can answer approvals".into())
+                Err(ApprovalTapError::Failed(
+                    "Only the configured owner can answer approvals".into(),
+                ))
             };
             let answer = match result {
                 Ok(label) => format!("Applied: {label}"),
-                Err(error) => {
+                Err(ApprovalTapError::Closed) => {
+                    if let Err(error) = poller.remove_buttons(approval.message_id).await {
+                        tracing::warn!(message_id = approval.message_id, error = %error, "closed approval's buttons were not removed");
+                    }
+                    "This question already closed in the pane, so nothing was sent.".to_string()
+                }
+                Err(ApprovalTapError::Failed(error)) => {
                     tracing::warn!(
                         request_id = %approval.request_id,
                         error = %error,
