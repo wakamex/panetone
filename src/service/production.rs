@@ -1159,16 +1159,7 @@ impl ProductionService {
         if profile == "none" {
             profiles.remove(&route_id.to_string());
         } else {
-            let path = Path::new(profile);
-            if !path.is_absolute() || !path.join("main").is_dir() {
-                return Err(format!(
-                    "{profile} is not an endchat profile directory: it needs to be an absolute path holding main/"
-                ));
-            }
-            profiles.insert(
-                route_id.to_string(),
-                profile.trim_end_matches('/').to_owned(),
-            );
+            profiles.insert(route_id.to_string(), endchat_profile_path(profile)?);
         }
         self.store
             .set_metadata(
@@ -2646,17 +2637,32 @@ impl ProductionService {
                 return internal(id, detail);
             }
         }
+        // A route an endchat profile serves needs no Wakterm agent, so the
+        // profile can create it.
+        let served_by_profile = params
+            .endchat_profile
+            .as_deref()
+            .filter(|profile| *profile != "none");
         if let Some(profile) = params.endchat_profile.as_deref() {
-            let Ok(route) = exact_route(&routes, &params.title) else {
-                return error_response(
-                    id,
-                    "route_not_found",
-                    "an endchat profile can serve only an existing route",
-                    None,
-                );
-            };
-            if let Err(detail) = self.set_endchat_profile(route.id, profile).await {
-                return error_response(id, "invalid_params", detail, None);
+            match exact_route(&routes, &params.title) {
+                Ok(route) => {
+                    if let Err(detail) = self.set_endchat_profile(route.id, profile).await {
+                        return error_response(id, "invalid_params", detail, None);
+                    }
+                }
+                Err(_) if served_by_profile.is_none() => {
+                    return error_response(
+                        id,
+                        "route_not_found",
+                        "only an existing route can be handed back to Wakterm",
+                        None,
+                    );
+                }
+                Err(_) => {
+                    if let Err(detail) = endchat_profile_path(profile) {
+                        return error_response(id, "invalid_params", detail, None);
+                    }
+                }
             }
         }
         let mut route = match exact_route(&routes, &params.title) {
@@ -2675,6 +2681,7 @@ impl ProductionService {
                 };
                 match live.route(&params.title) {
                     Ok(_) => {}
+                    Err(_) if served_by_profile.is_some() => {}
                     Err(
                         WaktermCliError::RouteNotFound(_) | WaktermCliError::RouteUnavailable(_),
                     ) => {
@@ -2728,6 +2735,12 @@ impl ProductionService {
                 .expect("a new route has no conflicting Telegram group");
                 if let Err(error) = self.store.save_route(route.clone(), now_ms()).await {
                     return internal(id, error);
+                }
+                if let Some(profile) = served_by_profile {
+                    if let Err(detail) = self.set_endchat_profile(route.id, profile).await {
+                        return internal(id, detail);
+                    }
+                    return self.route_response(id, &route, true, true, None).await;
                 }
                 return self
                     .route_response(id, &route, true, true, Some(live))
@@ -3098,6 +3111,17 @@ fn ensure_telegram_group_binding(
             Ok(true)
         }
     }
+}
+
+/// An endchat profile directory as a route stores it.
+fn endchat_profile_path(profile: &str) -> Result<String, String> {
+    let path = Path::new(profile);
+    if !path.is_absolute() || !path.join("main").is_dir() {
+        return Err(format!(
+            "{profile} is not an endchat profile directory: it needs to be an absolute path holding main/"
+        ));
+    }
+    Ok(profile.trim_end_matches('/').to_owned())
 }
 
 fn valid_route_title(title: &str) -> bool {
@@ -4694,6 +4718,98 @@ fi
         assert_eq!(service.replies_once().await.unwrap(), 0);
         drop(service);
         drop(workflows);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_endchat_profile_creates_the_route_it_serves() {
+        let directory = tempdir().unwrap();
+        let binary = directory.path().join("wakterm-fake");
+        // Wakterm has no agent for the route.
+        fs::write(
+            &binary,
+            r#"#!/bin/bash
+set -euo pipefail
+operation="$*"
+if [[ "$operation" == *"agent capabilities"* ]]; then
+  printf '%s\n' '{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}'
+elif [[ "$operation" == *"agent catalog"* ]]; then
+  printf '%s\n' '{"schema":"wakterm.agent-api.v1","as_of_event_sequence":10,"agents":[]}'
+elif [[ "$operation" == *"list --format json"* ]]; then
+  printf '%s\n' '[]'
+else
+  echo "unexpected fake invocation: $operation" >&2
+  exit 9
+fi
+"#,
+        )
+        .unwrap();
+        crate::test_support::seal_executable(&binary);
+        let profile = directory.path().join("shamans");
+        fs::create_dir_all(profile.join("main")).unwrap();
+        let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        store.initialize_event_cursor(10).await.unwrap();
+        let service = ProductionService::new(
+            store.clone(),
+            WaktermCli::new(
+                binary,
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            RealChannels::default(),
+            SupervisorHandle::default(),
+            vec!["event_stream.v1".into()],
+            directory.path().join("control.sock"),
+        );
+        let params = |endchat_profile: Option<String>| RouteEnsureParams {
+            title: "shamans".into(),
+            telegram_topic_id: Some(60),
+            telegram_group_chat_id: Some(-5530242512),
+            telegram_allow_members: true,
+            signal_group_id: None,
+            signal_allow_members: false,
+            signal_account: None,
+            signal_direct: false,
+            endchat_profile,
+            transcribe: None,
+        };
+
+        // Without a profile, a new route still needs a live agent.
+        let refused = service
+            .handle_route_ensure(Uuid::new_v4(), params(None))
+            .await;
+        assert_eq!(refused.error.unwrap().code, "route_unavailable");
+        assert!(store.list_routes().await.unwrap().is_empty());
+
+        let created = service
+            .handle_route_ensure(
+                Uuid::new_v4(),
+                params(Some(profile.to_str().unwrap().to_owned())),
+            )
+            .await;
+        assert!(created.ok, "{created:?}");
+        let routes = store.list_routes().await.unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(
+            routes[0].channels,
+            [
+                ChannelBinding::Telegram { topic_id: 60 },
+                ChannelBinding::TelegramGroup {
+                    chat_id: -5530242512,
+                    allow_members: true,
+                },
+            ]
+        );
+        assert_eq!(
+            service
+                .endchat_profiles()
+                .await
+                .unwrap()
+                .get(&routes[0].id.to_string())
+                .map(String::as_str),
+            profile.to_str()
+        );
+        drop(service);
         store.shutdown().await.unwrap();
     }
 
