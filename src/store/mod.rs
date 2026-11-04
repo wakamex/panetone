@@ -921,7 +921,8 @@ impl StoreHandle {
     /// latest one, unless the agent has since written, taken input or ended a
     /// turn, or a later process of the agent has reported anything. An answer
     /// continues the turn, so the agent's next message is often the only sign
-    /// of it.
+    /// of it. A message counts by when it was written: one written just before
+    /// the question can be recorded after it.
     pub async fn open_approval(
         &self,
         agent_id: String,
@@ -938,7 +939,10 @@ impl StoreHandle {
                            SELECT 1 FROM agent_events AS later
                            WHERE later.agent_id = ?1 AND later.sequence > asked.sequence
                              AND (later.incarnation_id != ?2
-                                  OR later.kind IN ('assistant_message', 'input_accepted', 'turn_started', 'turn_final')))
+                                  OR later.kind IN ('input_accepted', 'turn_started', 'turn_final')
+                                  OR (later.kind = 'assistant_message'
+                                      AND julianday(json_extract(later.record_json, '$.observed_at'))
+                                          > julianday(json_extract(asked.record_json, '$.observed_at')))))
                      ORDER BY sequence DESC
                      LIMIT 1",
                     params![agent_id, incarnation_id],

@@ -3717,13 +3717,20 @@ fi
             service.resolve_telegram_approval(&tap).await,
             Err(ApprovalTapError::Closed)
         );
-        // The buttons stay while Panetone still sees the question open.
+        // The buttons stay while Panetone still sees the question open, even
+        // after a message written before the question is recorded after it.
+        let mut earlier = event(102, "assistant_message");
+        earlier
+            .fields
+            .insert("observed_at".into(), json!("2026-11-03T03:17:09.989Z"));
+        earlier.fields.insert("text".into(), json!("Asking now."));
+        ingest(101, vec![earlier]).await;
         assert_eq!(service.strip_closed_approval_buttons().await.unwrap(), 0);
 
         // A restarted agent's process left the question behind.
-        let mut restarted = event(102, "turn_state_changed");
+        let mut restarted = event(103, "turn_state_changed");
         restarted.incarnation_id = "inc-route-2".into();
-        ingest(101, vec![restarted]).await;
+        ingest(102, vec![restarted]).await;
         assert_eq!(service.strip_closed_approval_buttons().await.unwrap(), 1);
         let request = edit.await.unwrap();
         assert!(request.starts_with("POST /bottoken/editMessageReplyMarkup "));
