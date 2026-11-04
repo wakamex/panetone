@@ -1881,12 +1881,9 @@ fn ingest_event(
             }
         }
         let destination = if approval.is_some() {
-            route.channels.iter().find_map(|binding| match binding {
-                crate::domain::ChannelBinding::Telegram { topic_id } => {
-                    Some((ChannelKind::Telegram, topic_id.to_string()))
-                }
-                crate::domain::ChannelBinding::Signal { .. } => None,
-            })
+            route
+                .telegram_topic()
+                .map(|topic_id| (ChannelKind::Telegram, topic_id.to_string()))
         } else {
             let preference = preferences.get(&route.id.to_string()).map(String::as_str);
             // Where a turn's output goes follows the message that started
@@ -1901,31 +1898,26 @@ fn ingest_event(
                     Some(format!("sig:{destination}"))
                 }
                 Some((ChannelKind::Signal, _))
-                    if preference.is_some_and(|value| value.starts_with("sig:")) =>
+                    if preference.is_some_and(|value| value.starts_with("sig:direct:")) =>
                 {
                     Some("sig".to_owned())
                 }
-                Some((ChannelKind::Telegram, _))
-                    if preference.is_some_and(|value| value.starts_with("sig:")) =>
+                Some((ChannelKind::Telegram, destination))
+                    if preference.is_some_and(|value| value.starts_with("sig:direct:")) =>
                 {
-                    Some("tg".to_owned())
+                    Some(format!("tg:{destination}"))
                 }
                 _ => preference.map(str::to_owned),
             };
-            output_destination(route, preference.as_deref())
+            route.output_destination(preference.as_deref())
         };
         // A reply never appears in a group whose other members are not
         // its audience; the route's Telegram topic shows it instead.
         let destination = match (&tagged, destination) {
             (Some(tagged), _) if tagged.clean.is_empty() => None,
-            (Some(_), Some((ChannelKind::Signal, group))) if shared_group(route, &group) => {
-                route.channels.iter().find_map(|binding| match binding {
-                    crate::domain::ChannelBinding::Telegram { topic_id } => {
-                        Some((ChannelKind::Telegram, topic_id.to_string()))
-                    }
-                    crate::domain::ChannelBinding::Signal { .. } => None,
-                })
-            }
+            (Some(_), Some((kind, group))) if route.is_shared(kind, &group) => route
+                .telegram_topic()
+                .map(|topic_id| (ChannelKind::Telegram, topic_id.to_string())),
             (_, destination) => destination,
         };
         let Some((kind, destination)) = destination else {
@@ -2257,19 +2249,6 @@ fn turn_origin(
 
 /// Whether a Signal destination is a group of the route that admits members
 /// other than the owner.
-fn shared_group(route: &Route, group: &str) -> bool {
-    route.channels.iter().any(|binding| {
-        matches!(
-            binding,
-            crate::domain::ChannelBinding::Signal {
-                group_id,
-                allow_members: true,
-                ..
-            } if group_id.trim_end_matches('=') == group.trim_end_matches('=')
-        )
-    })
-}
-
 fn route_preferences(
     connection: &Connection,
 ) -> StoreResult<std::collections::BTreeMap<String, String>> {
@@ -2278,48 +2257,6 @@ fn route_preferences(
         .map(|value| serde_json::from_str(&value).map_err(StoreError::from))
         .transpose()
         .map(Option::unwrap_or_default)
-}
-
-fn output_destination(route: &Route, preference: Option<&str>) -> Option<(ChannelKind, String)> {
-    let takes_direct = route.channels.iter().any(|binding| {
-        matches!(
-            binding,
-            crate::domain::ChannelBinding::Signal { direct: true, .. }
-        )
-    });
-    if let Some(direct) = preference.and_then(|preference| preference.strip_prefix("sig:"))
-        && takes_direct
-    {
-        return Some((ChannelKind::Signal, direct.to_owned()));
-    }
-    let selected = match preference {
-        Some("tg") => Some(ChannelKind::Telegram),
-        Some("sig") => Some(ChannelKind::Signal),
-        _ => None,
-    }
-    .unwrap_or_else(|| {
-        if route
-            .channels
-            .iter()
-            .any(|binding| matches!(binding, crate::domain::ChannelBinding::Signal { .. }))
-        {
-            ChannelKind::Signal
-        } else {
-            ChannelKind::Telegram
-        }
-    });
-    let telegram_topic = route.channels.iter().find_map(|binding| match binding {
-        crate::domain::ChannelBinding::Telegram { topic_id } => Some(*topic_id),
-        _ => None,
-    });
-    let signal_group = route.channels.iter().find_map(|binding| match binding {
-        crate::domain::ChannelBinding::Signal { group_id, .. } => Some(group_id.as_str()),
-        _ => None,
-    });
-    match selected {
-        ChannelKind::Telegram => telegram_topic.map(|topic_id| (selected, topic_id.to_string())),
-        ChannelKind::Signal => signal_group.map(|group_id| (selected, group_id.into())),
-    }
 }
 
 /// Removes `<memory-used>...</memory-used>` blocks, which agents add to cite
@@ -2895,17 +2832,11 @@ fn save_inbox(
         let mut preferences = route_preferences(&transaction)?;
         preferences.insert(
             route_id.to_string(),
+            // The output goes back where the message came from, such as a
+            // reply to a direct message to its sender.
             match channel {
-                ChannelKind::Telegram => "tg".to_owned(),
-                // A reply to a direct message returns to its sender.
-                ChannelKind::Signal
-                    if item
-                        .destination
-                        .starts_with(crate::domain::SIGNAL_DIRECT_PREFIX) =>
-                {
-                    format!("sig:{}", item.destination)
-                }
-                ChannelKind::Signal => "sig".to_owned(),
+                ChannelKind::Telegram => format!("tg:{}", item.destination),
+                ChannelKind::Signal => format!("sig:{}", item.destination),
             },
         );
         set_metadata(

@@ -143,9 +143,9 @@ fn archive_group(group: &str) -> String {
         .replace('/', "_")
 }
 
-/// Splits a Panetone Signal inbound body into its text and the file names of
+/// Splits a Panetone inbound body into its text and the file names of
 /// the `[attached TYPE: PATH]` lines Panetone appends for attachments.
-pub fn split_signal_attachments(body: &str) -> (String, Vec<String>) {
+pub fn split_attachments(body: &str) -> (String, Vec<String>) {
     let mut text = Vec::new();
     let mut attachments = Vec::new();
     for line in body.split('\n') {
@@ -228,11 +228,11 @@ mod tests {
     #[test]
     fn signal_attachment_lines_become_file_names() {
         assert_eq!(
-            split_signal_attachments(
+            split_attachments(
                 "look at this\n[attached image/png: /home/x/.local/share/signal-cli/attachments/0X57sub2.png]"
             ),
             ("look at this".into(), vec!["0X57sub2.png".into()])
         );
-        assert_eq!(split_signal_attachments("plain"), ("plain".into(), vec![]));
+        assert_eq!(split_attachments("plain"), ("plain".into(), vec![]));
     }
 }

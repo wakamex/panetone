@@ -113,29 +113,15 @@ impl TelegramClient {
         if item.kind != ChannelKind::Telegram {
             return Err(ChannelDeliveryError::InvalidDestination(item.kind));
         }
-        let topic_id = item
-            .destination
-            .parse::<i64>()
-            .map_err(|_| ChannelDeliveryError::InvalidDestination(item.kind))?;
+        let target = self.target(&item.destination)?;
         let mut next_send = self.wait_for_send().await;
         let started = Instant::now();
         let result = if !item.attachments.is_empty() {
-            telegram_send_attachments(
-                &self.http,
-                &self.api_base,
-                &self.token,
-                self.chat_id,
-                topic_id,
-                item,
-            )
-            .await
+            telegram_send_attachments(&self.http, &self.api_base, &self.token, target, item).await
         } else {
-            let mut payload = json!({
-                "chat_id": self.chat_id,
-                "message_thread_id": topic_id,
-                "text": item.body,
-                "link_preview_options": {"is_disabled": true}
-            });
+            let mut payload = target.json();
+            payload["text"] = json!(item.body);
+            payload["link_preview_options"] = json!({"is_disabled": true});
             if !item.actions.is_empty() {
                 payload["reply_markup"] = json!({
                     "inline_keyboard": item.actions.iter().map(|action| vec![json!({
@@ -150,7 +136,7 @@ impl TelegramClient {
         if elapsed > SLOW_TELEGRAM_SEND {
             tracing::warn!(
                 elapsed_ms = elapsed.as_millis() as u64,
-                topic_id,
+                destination = %item.destination,
                 ok = result.is_ok(),
                 "slow Telegram send"
             );
@@ -173,21 +159,19 @@ impl TelegramClient {
         result
     }
 
-    /// Shows the bot as typing in a topic for about five seconds. It is not
-    /// paced like a post, so it never delays one.
-    pub async fn send_typing(&self, topic_id: i64) -> Result<(), ChannelDeliveryError> {
+    /// Shows the bot as typing in a topic or group for about five seconds. It
+    /// is not paced like a post, so it never delays one.
+    pub async fn send_typing(&self, destination: &str) -> Result<(), ChannelDeliveryError> {
         let kind = ChannelKind::Telegram;
+        let mut body = self.target(destination)?.json();
+        body["action"] = json!("typing");
         let response = self
             .http
             .post(format!(
                 "{}/bot{}/sendChatAction",
                 self.api_base, self.token
             ))
-            .json(&json!({
-                "chat_id": self.chat_id,
-                "message_thread_id": topic_id,
-                "action": "typing"
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(|error| map_http_error(kind, &error))?;
@@ -232,6 +216,24 @@ impl TelegramClient {
                 detail: format!("editMessageReplyMarkup returned HTTP {}", status.as_u16()),
             })
         }
+    }
+
+    /// The chat and topic a destination names: a topic of the owner's
+    /// supergroup, or a group of its own.
+    fn target(&self, destination: &str) -> Result<TelegramTarget, ChannelDeliveryError> {
+        if let Some(chat_id) = crate::domain::telegram_chat_id(destination) {
+            return Ok(TelegramTarget {
+                chat_id,
+                topic_id: None,
+            });
+        }
+        let topic_id = destination
+            .parse::<i64>()
+            .map_err(|_| ChannelDeliveryError::InvalidDestination(ChannelKind::Telegram))?;
+        Ok(TelegramTarget {
+            chat_id: self.chat_id,
+            topic_id: Some(topic_id),
+        })
     }
 
     async fn wait_for_send(&self) -> tokio::sync::MutexGuard<'_, Instant> {
@@ -436,13 +438,13 @@ impl RealChannels {
     pub async fn telegram_typing(
         &self,
         harness: &str,
-        topic_id: i64,
+        destination: &str,
     ) -> Result<(), ChannelDeliveryError> {
         self.telegram_by_harness
             .get(&harness.to_ascii_lowercase())
             .or(self.telegram.as_ref())
             .ok_or(ChannelDeliveryError::NotConfigured(ChannelKind::Telegram))?
-            .send_typing(topic_id)
+            .send_typing(destination)
             .await
     }
 
@@ -519,16 +521,39 @@ async fn telegram_send(
     telegram_response(response, item.kind).await
 }
 
+#[derive(Clone, Copy)]
+struct TelegramTarget {
+    chat_id: i64,
+    topic_id: Option<i64>,
+}
+
+impl TelegramTarget {
+    fn json(self) -> Value {
+        let mut value = json!({"chat_id": self.chat_id});
+        if let Some(topic_id) = self.topic_id {
+            value["message_thread_id"] = json!(topic_id);
+        }
+        value
+    }
+
+    fn form(self) -> Form {
+        let form = Form::new().text("chat_id", self.chat_id.to_string());
+        match self.topic_id {
+            Some(topic_id) => form.text("message_thread_id", topic_id.to_string()),
+            None => form,
+        }
+    }
+}
+
 async fn telegram_send_attachments(
     client: &reqwest::Client,
     base: &str,
     token: &str,
-    chat_id: i64,
-    topic_id: i64,
+    target: TelegramTarget,
     item: &OutboxItem,
 ) -> Result<DeliveryReceipt, ChannelDeliveryError> {
     if item.attachments.len() > 1 {
-        return telegram_send_media_group(client, base, token, chat_id, topic_id, item).await;
+        return telegram_send_media_group(client, base, token, target, item).await;
     }
     let attachment = &item.attachments[0];
     let bytes = attachment
@@ -541,10 +566,7 @@ async fn telegram_send_attachments(
         .file_name(attachment.file_name.clone())
         .mime_str(&attachment.media_type)
         .map_err(|_| ChannelDeliveryError::Malformed(item.kind))?;
-    let mut form = Form::new()
-        .text("chat_id", chat_id.to_string())
-        .text("message_thread_id", topic_id.to_string())
-        .part(field, part);
+    let mut form = target.form().part(field, part);
     if !item.body.is_empty() {
         form = form.text("caption", item.body.clone());
     }
@@ -562,8 +584,7 @@ async fn telegram_send_media_group(
     client: &reqwest::Client,
     base: &str,
     token: &str,
-    chat_id: i64,
-    topic_id: i64,
+    target: TelegramTarget,
     item: &OutboxItem,
 ) -> Result<DeliveryReceipt, ChannelDeliveryError> {
     let photos = item.attachments.iter().all(telegram_photo);
@@ -589,14 +610,10 @@ async fn telegram_send_media_group(
             entry
         })
         .collect::<Vec<_>>();
-    let mut form = Form::new()
-        .text("chat_id", chat_id.to_string())
-        .text("message_thread_id", topic_id.to_string())
-        .text(
-            "media",
-            serde_json::to_string(&media)
-                .map_err(|_| ChannelDeliveryError::Malformed(item.kind))?,
-        );
+    let mut form = target.form().text(
+        "media",
+        serde_json::to_string(&media).map_err(|_| ChannelDeliveryError::Malformed(item.kind))?,
+    );
     for (index, attachment) in item.attachments.iter().enumerate() {
         let bytes = attachment
             .bytes()

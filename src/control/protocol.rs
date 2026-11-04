@@ -59,6 +59,12 @@ pub struct RouteEnsureParams {
     pub title: String,
     #[serde(default)]
     pub telegram_topic_id: Option<i64>,
+    /// A Telegram group of the route's own, by its negative chat ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telegram_group_chat_id: Option<i64>,
+    /// Let every member of the Telegram group write to the route.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub telegram_allow_members: bool,
     #[serde(default)]
     pub signal_group_id: Option<String>,
     #[serde(default)]

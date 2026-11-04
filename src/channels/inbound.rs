@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -141,10 +142,14 @@ impl TelegramPoller {
         })
     }
 
+    /// Reads the next updates: taps and messages in the owner's supergroup,
+    /// and messages in the Telegram groups of `groups`, by chat ID. Updates
+    /// from any other chat are skipped before their files are downloaded.
     pub async fn poll(
         &self,
         offset: i64,
         poll_seconds: u64,
+        groups: &BTreeSet<i64>,
     ) -> Result<InboundBatch, ChannelDeliveryError> {
         let response = self
             .http
@@ -229,10 +234,18 @@ impl TelegramPoller {
             let Some(message) = update.message else {
                 continue;
             };
-            if message.chat.id != self.chat_id {
-                continue;
-            }
-            let Some(topic) = message.message_thread_id else {
+            // A topic of the owner's supergroup, or a group of its own.
+            let (destination, topic) = if message.chat.id == self.chat_id {
+                let Some(topic) = message.message_thread_id else {
+                    continue;
+                };
+                (topic.to_string(), Some(topic))
+            } else if groups.contains(&message.chat.id) {
+                (
+                    crate::domain::telegram_chat_destination(message.chat.id),
+                    None,
+                )
+            } else {
                 continue;
             };
             let mut body = message.text.or(message.caption).unwrap_or_default();
@@ -282,7 +295,6 @@ impl TelegramPoller {
             if body.is_empty() {
                 continue;
             }
-            let destination = topic.to_string();
             messages.push(InboundMessage {
                 channel: self.kind,
                 external_id: update.update_id.to_string(),
@@ -296,7 +308,7 @@ impl TelegramPoller {
                 quoted: message
                     .reply_to_message
                     .filter(|reply| {
-                        reply.forum_topic_created.is_none() && Some(reply.message_id) != Some(topic)
+                        reply.forum_topic_created.is_none() && Some(reply.message_id) != topic
                     })
                     .map(|reply| QuotedMessage {
                         author_ids: reply

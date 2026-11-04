@@ -216,6 +216,19 @@ struct RouteEnsureArgs {
     title: String,
     #[arg(long)]
     telegram_topic_id: Option<i64>,
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        value_name = "CHAT_ID",
+        help = "Telegram group of the route's own, by its negative chat ID"
+    )]
+    telegram_group_chat_id: Option<i64>,
+    #[arg(
+        long,
+        requires = "telegram_group_chat_id",
+        help = "Let every member of the Telegram group write to the route"
+    )]
+    telegram_allow_members: bool,
     #[arg(long)]
     signal_group_id: Option<String>,
     #[arg(long, requires = "signal_group_id")]
@@ -392,7 +405,7 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
             .is_none()
     {
         let baseline = poller
-            .poll(-1, 0)
+            .poll(-1, 0, &Default::default())
             .await
             .context("initialize Telegram update offset")?;
         store
@@ -731,7 +744,11 @@ async fn telegram_loop(
             .unwrap_or_default()
             .parse::<i64>()
             .map_err(|_| "stored Telegram update offset is invalid".to_string())?;
-        let mut batch = match poller.poll(offset, 1).await {
+        let groups = ingestor
+            .telegram_groups()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut batch = match poller.poll(offset, 1, &groups).await {
             Ok(batch) => {
                 consecutive_failures = 0;
                 batch
@@ -815,12 +832,14 @@ async fn telegram_loop(
         for query_id in std::mem::take(&mut batch.unknown_taps) {
             answer_tap(&poller, &query_id, "This button is no longer valid").await;
         }
-        batch
-            .messages
-            .retain(|message| message.sender_id.as_deref() == Some(owner.as_str()));
-        // A reply to a question form message is a typed answer, not a prompt.
+        // The owner's reply to a question form message is a typed answer, not
+        // a prompt. Who else may write where is checked as the batch is kept.
         let mut prompts = Vec::with_capacity(batch.messages.len());
         for message in std::mem::take(&mut batch.messages) {
+            if message.sender_id.as_deref() != Some(owner.as_str()) {
+                prompts.push(message);
+                continue;
+            }
             match service.answer_form_reply(&message).await {
                 Ok(None) => prompts.push(message),
                 Ok(Some(update)) => edit_form_message(&poller, &update).await,
@@ -831,7 +850,7 @@ async fn telegram_loop(
         }
         batch.messages = prompts;
         ingestor
-            .persist_telegram_batch("telegram_update_offset", batch, wall_now_ms())
+            .persist_telegram_batch("telegram_update_offset", batch, &owner, wall_now_ms())
             .await
             .map_err(|error| error.to_string())?;
     }
@@ -1172,6 +1191,8 @@ async fn run_route(args: RouteArgs) -> Result<()> {
             serde_json::to_value(RouteEnsureParams {
                 title: args.title,
                 telegram_topic_id: args.telegram_topic_id,
+                telegram_group_chat_id: args.telegram_group_chat_id,
+                telegram_allow_members: args.telegram_allow_members,
                 signal_group_id: args.signal_group_id,
                 signal_allow_members: args.signal_allow_members,
                 signal_account: args.signal_account,

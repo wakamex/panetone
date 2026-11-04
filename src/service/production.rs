@@ -1750,7 +1750,7 @@ impl ProductionService {
         let mut shown = 0;
         for route in &routes {
             let preference = preferences.get(&route.id.to_string()).map(String::as_str);
-            let Some(topic_id) = telegram_output_topic(route, preference) else {
+            let Some(destination) = telegram_output_destination(route, preference) else {
                 continue;
             };
             let Ok(live_route) = live.route(&route.title) else {
@@ -1765,7 +1765,7 @@ impl ProductionService {
             };
             match self
                 .channels
-                .telegram_typing(&agent.harness, topic_id)
+                .telegram_typing(&agent.harness, &destination)
                 .await
             {
                 Ok(()) => shown += 1,
@@ -1795,7 +1795,7 @@ impl ProductionService {
         };
         let direct_turn = preferences
             .get(&route.id.to_string())
-            .is_some_and(|preference| preference.starts_with("sig:"));
+            .is_some_and(|preference| preference.starts_with("sig:direct:"));
         Ok(direct_turn != item.destination.starts_with(SIGNAL_DIRECT_PREFIX))
     }
 
@@ -2606,11 +2606,15 @@ impl ProductionService {
             || (params.signal_allow_members && params.signal_group_id.is_none())
             || ((params.signal_account.is_some() || params.signal_direct)
                 && params.signal_group_id.is_none())
+            || params
+                .telegram_group_chat_id
+                .is_some_and(|chat_id| chat_id >= 0)
+            || (params.telegram_allow_members && params.telegram_group_chat_id.is_none())
         {
             return error_response(
                 id,
                 "invalid_params",
-                "route title must be 1 to 128 characters without surrounding whitespace, a Telegram topic ID must be positive, and Signal member access or a Signal account requires a non-empty group ID",
+                "route title must be 1 to 128 characters without surrounding whitespace, a Telegram topic ID must be positive, a Telegram group chat ID must be negative, and member access or a Signal account requires a group",
                 None,
             );
         }
@@ -2716,6 +2720,12 @@ impl ProductionService {
                     params.signal_direct,
                 )
                 .expect("a new route has no conflicting Signal binding");
+                ensure_telegram_group_binding(
+                    &mut route,
+                    params.telegram_group_chat_id,
+                    params.telegram_allow_members,
+                )
+                .expect("a new route has no conflicting Telegram group");
                 if let Err(error) = self.store.save_route(route.clone(), now_ms()).await {
                     return internal(id, error);
                 }
@@ -2774,6 +2784,24 @@ impl ProductionService {
                         route.title
                     ),
                     Some(json!({"signal_group_id": existing})),
+                );
+            }
+        }
+        match ensure_telegram_group_binding(
+            &mut route,
+            params.telegram_group_chat_id,
+            params.telegram_allow_members,
+        ) {
+            Ok(changed) => binding_created |= changed,
+            Err(existing) => {
+                return error_response(
+                    id,
+                    "route_binding_conflict",
+                    format!(
+                        "route {:?} is already bound to a different Telegram group",
+                        route.title
+                    ),
+                    Some(json!({"telegram_group_chat_id": existing})),
                 );
             }
         }
@@ -3006,7 +3034,7 @@ fn ensure_signal_binding(
                 account,
                 direct,
             } => Some((group_id, allow_members, account, direct)),
-            ChannelBinding::Telegram { .. } => None,
+            _ => None,
         })
     {
         if group_id.trim_end_matches('=') != requested_group_id.trim_end_matches('=') {
@@ -3036,6 +3064,40 @@ fn ensure_signal_binding(
         direct: requested_direct,
     });
     Ok(true)
+}
+
+/// Binds a route to a Telegram group, or lets its members in. Returns whether
+/// the route changed, or the group it is already bound to.
+fn ensure_telegram_group_binding(
+    route: &mut Route,
+    requested_chat_id: Option<i64>,
+    allow_members: bool,
+) -> Result<bool, i64> {
+    let Some(requested_chat_id) = requested_chat_id else {
+        return Ok(false);
+    };
+    let existing = route.channels.iter_mut().find_map(|binding| match binding {
+        ChannelBinding::TelegramGroup {
+            chat_id,
+            allow_members,
+        } => Some((*chat_id, allow_members)),
+        _ => None,
+    });
+    match existing {
+        Some((chat_id, _)) if chat_id != requested_chat_id => Err(chat_id),
+        Some((_, existing_allow_members)) => {
+            let changed = allow_members && !*existing_allow_members;
+            *existing_allow_members |= allow_members;
+            Ok(changed)
+        }
+        None => {
+            route.channels.push(ChannelBinding::TelegramGroup {
+                chat_id: requested_chat_id,
+                allow_members,
+            });
+            Ok(true)
+        }
+    }
 }
 
 fn valid_route_title(title: &str) -> bool {
@@ -3129,45 +3191,24 @@ fn project_live_routes(
     Ok(projected)
 }
 
-/// The Telegram topic a route's agent output goes to, if it goes to Telegram:
-/// a route that also has a Signal group posts there unless Telegram was the
-/// channel last used.
-fn telegram_output_topic(route: &Route, preference: Option<&str>) -> Option<i64> {
-    let has_signal = route
-        .channels
-        .iter()
-        .any(|binding| matches!(binding, ChannelBinding::Signal { .. }));
-    if has_signal && preference != Some("tg") {
-        return None;
+/// The Telegram topic or group a route's agent output goes to, if it goes to
+/// Telegram.
+fn telegram_output_destination(route: &Route, preference: Option<&str>) -> Option<String> {
+    match route.output_destination(preference) {
+        Some((ChannelKind::Telegram, destination)) => Some(destination),
+        _ => None,
     }
-    route.channels.iter().find_map(|binding| match binding {
-        ChannelBinding::Telegram { topic_id } => Some(*topic_id),
-        ChannelBinding::Signal { .. } => None,
-    })
 }
 
 fn route_matches_inbox(route: &Route, item: &InboxItem) -> bool {
-    route
-        .channels
-        .iter()
-        .any(|binding| match (binding, item.channel) {
-            (ChannelBinding::Telegram { topic_id }, ChannelKind::Telegram) => {
-                topic_id.to_string() == item.destination
-            }
-            (
-                ChannelBinding::Signal {
-                    group_id, direct, ..
-                },
-                ChannelKind::Signal,
-            ) => {
-                if item.destination.starts_with(SIGNAL_DIRECT_PREFIX) {
-                    *direct
-                } else {
-                    group_id.trim_end_matches('=') == item.destination.trim_end_matches('=')
-                }
-            }
-            _ => false,
-        })
+    route.channels.iter().any(|binding| {
+        if item.channel == ChannelKind::Signal && item.destination.starts_with(SIGNAL_DIRECT_PREFIX)
+        {
+            matches!(binding, ChannelBinding::Signal { direct: true, .. })
+        } else {
+            binding.serves(item.channel, &item.destination)
+        }
+    })
 }
 
 fn route_error(id: Uuid, role: &str, detail: &'static str) -> ControlResponse {
@@ -5393,17 +5434,38 @@ fi
             account: None,
             direct: false,
         };
+        let output = |route: &Route, preference| telegram_output_destination(route, preference);
         assert_eq!(
-            telegram_output_topic(&route(vec![telegram.clone()]), None),
-            Some(10)
+            output(&route(vec![telegram.clone()]), None).as_deref(),
+            Some("10")
         );
-        let both = route(vec![telegram, signal.clone()]);
-        assert_eq!(telegram_output_topic(&both, None), None);
-        assert_eq!(telegram_output_topic(&both, Some("sig")), None);
-        assert_eq!(telegram_output_topic(&both, Some("tg")), Some(10));
+        let both = route(vec![telegram.clone(), signal.clone()]);
+        assert_eq!(output(&both, None), None);
+        assert_eq!(output(&both, Some("sig")), None);
+        assert_eq!(output(&both, Some("tg")).as_deref(), Some("10"));
+        assert_eq!(output(&both, Some("tg:10")).as_deref(), Some("10"));
+        assert_eq!(output(&route(vec![signal]), Some("tg")), None);
+        // A Telegram group is where output goes unless the owner's topic was
+        // used last.
+        let group = route(vec![
+            telegram,
+            ChannelBinding::TelegramGroup {
+                chat_id: -1002,
+                allow_members: true,
+            },
+        ]);
+        assert_eq!(output(&group, None).as_deref(), Some("chat:-1002"));
         assert_eq!(
-            telegram_output_topic(&route(vec![signal]), Some("tg")),
-            None
+            output(&group, Some("tg:chat:-1002")).as_deref(),
+            Some("chat:-1002")
+        );
+        assert_eq!(output(&group, Some("tg:10")).as_deref(), Some("10"));
+        assert_eq!(output(&group, Some("tg:chat:-1003")).as_deref(), Some("10"));
+        assert!(group.is_shared(ChannelKind::Telegram, "chat:-1002"));
+        assert!(!group.is_shared(ChannelKind::Telegram, "10"));
+        assert_eq!(
+            crate::service::offline::private_destination(&group),
+            Some((ChannelKind::Telegram, "10".into()))
         );
     }
 

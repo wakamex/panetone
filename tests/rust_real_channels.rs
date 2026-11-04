@@ -155,6 +155,20 @@ async fn telegram_sends_the_expected_stable_request() {
 }
 
 #[tokio::test]
+async fn telegram_sends_to_a_group_of_its_own_without_a_topic() {
+    let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 39\r\n\r\n{\"ok\":true,\"result\":{\"message_id\":403}}";
+    let (base, request) = http_server(response, Duration::ZERO).await;
+    let telegram = TelegramClient::new(&base, "fake-token", -1001, Duration::from_secs(2)).unwrap();
+    telegram
+        .send(&item(ChannelKind::Telegram, "chat:-2001"))
+        .await
+        .unwrap();
+    let request = request.await.unwrap();
+    assert_eq!(request.body["chat_id"], -2001);
+    assert!(request.body.get("message_thread_id").is_none());
+}
+
+#[tokio::test]
 async fn telegram_sends_approval_choices_as_inline_buttons() {
     let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 39\r\n\r\n{\"ok\":true,\"result\":{\"message_id\":402}}";
     let (base, request) = http_server(response, Duration::ZERO).await;
@@ -279,7 +293,7 @@ async fn telegram_shows_the_harness_bot_typing_in_a_topic() {
         "claude".into(),
         TelegramClient::new(&base, "claude-token", -1001, Duration::from_secs(2)).unwrap(),
     );
-    channels.telegram_typing("Claude", 77).await.unwrap();
+    channels.telegram_typing("Claude", "77").await.unwrap();
     let request = request.await.unwrap();
     assert_eq!(
         request.request_line,
@@ -290,7 +304,9 @@ async fn telegram_shows_the_harness_bot_typing_in_a_topic() {
         serde_json::json!({"chat_id": -1001, "message_thread_id": 77, "action": "typing"})
     );
     assert!(matches!(
-        RealChannels::default().telegram_typing("claude", 77).await,
+        RealChannels::default()
+            .telegram_typing("claude", "77")
+            .await,
         Err(ChannelDeliveryError::NotConfigured(ChannelKind::Telegram))
     ));
 }

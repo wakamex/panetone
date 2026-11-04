@@ -41,11 +41,71 @@ pub enum ChannelBinding {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         direct: bool,
     },
+    /// A Telegram group of its own, outside the owner's supergroup of route
+    /// topics, which other people can join.
+    TelegramGroup {
+        chat_id: i64,
+        #[serde(default)]
+        allow_members: bool,
+    },
+}
+
+impl ChannelBinding {
+    /// The channel and destination that messages to this binding use.
+    pub fn destination(&self) -> (ChannelKind, String) {
+        match self {
+            Self::Telegram { topic_id } => (ChannelKind::Telegram, topic_id.to_string()),
+            Self::TelegramGroup { chat_id, .. } => {
+                (ChannelKind::Telegram, telegram_chat_destination(*chat_id))
+            }
+            Self::Signal { group_id, .. } => (ChannelKind::Signal, group_id.clone()),
+        }
+    }
+
+    /// Whether people other than the owner read and write this channel.
+    pub fn admits_members(&self) -> bool {
+        matches!(
+            self,
+            Self::Signal {
+                allow_members: true,
+                ..
+            } | Self::TelegramGroup {
+                allow_members: true,
+                ..
+            }
+        )
+    }
+
+    /// Whether a destination names this binding's channel. Signal group IDs
+    /// are compared without their base64 padding.
+    pub fn serves(&self, kind: ChannelKind, destination: &str) -> bool {
+        let (own_kind, own) = self.destination();
+        own_kind == kind
+            && match self {
+                Self::Signal { .. } => {
+                    own.trim_end_matches('=') == destination.trim_end_matches('=')
+                }
+                _ => own == destination,
+            }
+    }
 }
 
 /// Starts the destination of a Signal direct message, followed by the other
 /// party's number or UUID. A group destination is the group ID.
 pub const SIGNAL_DIRECT_PREFIX: &str = "direct:";
+
+/// Starts the destination of a Telegram group outside the owner's supergroup,
+/// followed by its chat ID. A topic in the supergroup is the topic ID alone.
+pub const TELEGRAM_CHAT_PREFIX: &str = "chat:";
+
+pub fn telegram_chat_destination(chat_id: i64) -> String {
+    format!("{TELEGRAM_CHAT_PREFIX}{chat_id}")
+}
+
+/// The chat a Telegram destination names, when it is a group of its own.
+pub fn telegram_chat_id(destination: &str) -> Option<i64> {
+    destination.strip_prefix(TELEGRAM_CHAT_PREFIX)?.parse().ok()
+}
 
 /// Removes characters that draw nothing, such as zero-width spaces, a byte
 /// order mark, direction controls and control codes, and turns lone line

@@ -1,8 +1,10 @@
+use std::collections::BTreeSet;
+
 use thiserror::Error;
 
-use crate::archive::{ArchiveEntry, ChatArchives, split_signal_attachments};
+use crate::archive::{ArchiveEntry, ChatArchives, split_attachments};
 use crate::channels::{ChannelDeliveryError, InboundBatch, InboundMessage, SignalSubscriber};
-use crate::domain::{ChannelBinding, SIGNAL_DIRECT_PREFIX, strip_invisible};
+use crate::domain::{ChannelBinding, SIGNAL_DIRECT_PREFIX, strip_invisible, telegram_chat_id};
 use crate::store::{InboxItem, StoreError, StoreHandle};
 
 #[derive(Debug, Error)]
@@ -93,15 +95,60 @@ impl InboundIngestor {
         Ok(self.store.accept_inbox(item).await?)
     }
 
+    /// The chat IDs of the Telegram groups routes are bound to.
+    pub async fn telegram_groups(&self) -> Result<BTreeSet<i64>, InboundIngestError> {
+        Ok(self
+            .store
+            .list_routes()
+            .await?
+            .iter()
+            .flat_map(|route| &route.channels)
+            .filter_map(|binding| match binding {
+                ChannelBinding::TelegramGroup { chat_id, .. } => Some(*chat_id),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Records a batch of Telegram messages and moves the update cursor past
+    /// it. A topic of the owner's supergroup takes only the owner's messages,
+    /// and a route's Telegram group also its members' when the route lets
+    /// them in.
     pub async fn persist_telegram_batch(
         &self,
         cursor_key: &str,
         batch: InboundBatch,
+        owner: &str,
         now_ms: i64,
     ) -> Result<usize, InboundIngestError> {
+        let routes = self.store.list_routes().await?;
         let mut inserted = 0;
         for message in batch.messages {
-            inserted += usize::from(self.persist(message, now_ms).await?);
+            let from_owner = message.sender_id.as_deref() == Some(owner);
+            let Some(chat_id) = telegram_chat_id(&message.destination) else {
+                if from_owner {
+                    inserted += usize::from(self.persist(message, now_ms).await?);
+                }
+                continue;
+            };
+            let Some((route, allow_members)) = routes.iter().find_map(|route| {
+                route.channels.iter().find_map(|binding| match binding {
+                    ChannelBinding::TelegramGroup {
+                        chat_id: bound,
+                        allow_members,
+                    } if *bound == chat_id => Some((route, *allow_members)),
+                    _ => None,
+                })
+            }) else {
+                continue;
+            };
+            if from_owner || allow_members {
+                let title = route.title.clone();
+                inserted += usize::from(
+                    self.persist_group_message(message, &title, allow_members, now_ms, now_ms)
+                        .await?,
+                );
+            }
         }
         self.store
             .set_metadata(cursor_key.into(), batch.next_offset.to_string())
@@ -152,38 +199,50 @@ impl InboundIngestor {
         if !from_owner && (is_direct || !allow_members) {
             return Ok(false);
         }
-        let route_title = route.title.clone();
-        let (text, attachments) = split_signal_attachments(&message.body);
+        // Signal external IDs are `SENDER:TIMESTAMP_MS`.
+        let sent_ms = message
+            .external_id
+            .rsplit(':')
+            .next()
+            .and_then(|timestamp| timestamp.parse().ok())
+            .unwrap_or(now_ms);
+        if is_direct {
+            if *allow_members {
+                name_sender(&mut message);
+            }
+            message.body = format!("[direct message] {}", message.body);
+            return self.persist(message, now_ms).await;
+        }
+        let title = route.title.clone();
+        self.persist_group_message(message, &title, *allow_members, sent_ms, now_ms)
+            .await
+    }
+
+    /// Records a message from a route's group chat, naming its sender when
+    /// the group admits members, and adds it to the group's archive.
+    async fn persist_group_message(
+        &self,
+        mut message: InboundMessage,
+        route_title: &str,
+        allow_members: bool,
+        sent_ms: i64,
+        now_ms: i64,
+    ) -> Result<bool, InboundIngestError> {
+        let (text, attachments) = split_attachments(&message.body);
         let entry = ArchiveEntry {
-            // Signal external IDs are `SENDER:TIMESTAMP_MS`.
-            sent_ms: message
-                .external_id
-                .rsplit(':')
-                .next()
-                .and_then(|timestamp| timestamp.parse().ok())
-                .unwrap_or(now_ms),
+            sent_ms,
             sender: message.sender.clone().unwrap_or_else(|| "Unknown".into()),
             text,
             attachments,
             group: message.destination.clone(),
         };
-        if *allow_members {
-            let sender = message
-                .sender
-                .as_deref()
-                .and_then(|name| name.split_whitespace().next())
-                .filter(|name| !name.is_empty())
-                .unwrap_or("Unknown");
-            message.body = format!("{sender} says: {}", message.body);
-        }
-        if is_direct {
-            message.body = format!("[direct message] {}", message.body);
+        if allow_members {
+            name_sender(&mut message);
         }
         let inserted = self.persist(message, now_ms).await?;
-        // A redelivered message is already archived, and a direct message is
-        // not part of the group's record.
-        if inserted && !is_direct {
-            self.archives.append(&route_title, &entry);
+        // A redelivered message is already archived.
+        if inserted {
+            self.archives.append(route_title, &entry);
         }
         Ok(inserted)
     }
@@ -201,6 +260,18 @@ impl InboundIngestor {
         };
         self.persist_signal(message, owner, receiver, now_ms).await
     }
+}
+
+/// Opens a message with its sender's first name, so an agent serving a group
+/// knows who wrote it.
+fn name_sender(message: &mut InboundMessage) {
+    let sender = message
+        .sender
+        .as_deref()
+        .and_then(|name| name.split_whitespace().next())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Unknown");
+    message.body = format!("{sender} says: {}", message.body);
 }
 
 /// The line that tells the agent which message an inbound message replies to,

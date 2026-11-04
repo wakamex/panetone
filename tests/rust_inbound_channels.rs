@@ -148,7 +148,7 @@ async fn telegram_polling_classifies_rate_limits_and_server_errors_as_retryable(
         Duration::from_secs(2),
     )
     .unwrap();
-    let error = poller.poll(10, 0).await.unwrap_err();
+    let error = poller.poll(10, 0, &Default::default()).await.unwrap_err();
     assert!(matches!(
         error,
         panetone::channels::ChannelDeliveryError::RateLimited {
@@ -174,7 +174,7 @@ async fn telegram_polling_classifies_rate_limits_and_server_errors_as_retryable(
         Duration::from_secs(2),
     )
     .unwrap();
-    let error = poller.poll(10, 0).await.unwrap_err();
+    let error = poller.poll(10, 0, &Default::default()).await.unwrap_err();
     assert_eq!(
         error,
         panetone::channels::ChannelDeliveryError::Transport(
@@ -226,7 +226,7 @@ async fn telegram_polling_returns_structured_approval_callbacks() {
         Duration::from_secs(2),
     )
     .unwrap();
-    let batch = poller.poll(40, 0).await.unwrap();
+    let batch = poller.poll(40, 0, &Default::default()).await.unwrap();
     assert_eq!(batch.next_offset, 48);
     assert!(batch.messages.is_empty());
     assert_eq!(batch.approvals.len(), 2);
@@ -282,7 +282,7 @@ async fn telegram_updates_are_durable_before_the_confirmation_cursor_advances() 
         Duration::from_secs(2),
     )
     .unwrap();
-    let batch = poller.poll(10, 0).await.unwrap();
+    let batch = poller.poll(10, 0, &Default::default()).await.unwrap();
     let request = request.await.unwrap();
     assert_eq!(request["offset"], 10);
     assert_eq!(batch.next_offset, 13);
@@ -300,7 +300,7 @@ async fn telegram_updates_are_durable_before_the_confirmation_cursor_advances() 
     let ingestor = InboundIngestor::new(store.clone());
     assert_eq!(
         ingestor
-            .persist_telegram_batch("telegram_offset", batch.clone(), 100)
+            .persist_telegram_batch("telegram_offset", batch.clone(), "42", 100)
             .await
             .unwrap(),
         1
@@ -311,7 +311,7 @@ async fn telegram_updates_are_durable_before_the_confirmation_cursor_advances() 
     );
     assert_eq!(
         ingestor
-            .persist_telegram_batch("telegram_offset", batch, 101)
+            .persist_telegram_batch("telegram_offset", batch, "42", 101)
             .await
             .unwrap(),
         0
@@ -361,7 +361,7 @@ async fn telegram_document_is_downloaded_before_the_update_is_returned() {
     )
     .unwrap();
 
-    let batch = poller.poll(100, 0).await.unwrap();
+    let batch = poller.poll(100, 0, &Default::default()).await.unwrap();
     assert_eq!(batch.next_offset, 101);
     assert_eq!(batch.messages.len(), 1);
     let attachment = attachment_directory.join("100-plan.md");
@@ -421,7 +421,7 @@ async fn telegram_voice_note_is_downloaded_like_a_document() {
     )
     .unwrap();
 
-    let batch = poller.poll(101, 0).await.unwrap();
+    let batch = poller.poll(101, 0, &Default::default()).await.unwrap();
     assert_eq!(batch.messages.len(), 1);
     let attachment = attachment_directory.join("101-voice.ogg");
     assert_eq!(
@@ -481,7 +481,7 @@ async fn telegram_photo_uses_the_largest_available_size() {
     )
     .unwrap();
 
-    let batch = poller.poll(200, 0).await.unwrap();
+    let batch = poller.poll(200, 0, &Default::default()).await.unwrap();
     assert_eq!(batch.next_offset, 201);
     assert_eq!(batch.messages.len(), 1);
     let attachment = attachment_directory.join("200-photo.jpg");
@@ -895,12 +895,12 @@ async fn replies_tell_the_agent_which_message_they_answer() {
         Duration::from_secs(2),
     )
     .unwrap();
-    let batch = poller.poll(20, 0).await.unwrap();
+    let batch = poller.poll(20, 0, &Default::default()).await.unwrap();
     request.await.unwrap();
     let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
     let ingestor = InboundIngestor::new(store.clone());
     ingestor
-        .persist_telegram_batch("telegram_offset", batch, 100)
+        .persist_telegram_batch("telegram_offset", batch, "42", 100)
         .await
         .unwrap();
     let bodies = store
@@ -1243,4 +1243,108 @@ async fn the_owners_direct_message_reaches_the_route_that_takes_them() {
     assert_eq!(pending[0].body, "[direct message] Mihai says: start");
     assert_eq!(pending[0].destination, "direct:owner");
     store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_telegram_group_of_a_route_takes_members_only_when_the_route_lets_them_in() {
+    let response = serde_json::json!({
+        "ok": true,
+        "result": [
+            {"update_id": 30, "message": {
+                "message_id": 1, "chat": {"id": -2001},
+                "from": {"id": 7, "first_name": "Melissa", "last_name": "Jones"},
+                "text": "who started the war?"}},
+            {"update_id": 31, "message": {
+                "message_id": 2, "chat": {"id": -2002},
+                "from": {"id": 7, "first_name": "Melissa"},
+                "text": "and this one?"}},
+            {"update_id": 32, "message": {
+                "message_id": 3, "chat": {"id": -2002},
+                "from": {"id": 42, "first_name": "Mihai"},
+                "text": "owner here"}},
+            {"update_id": 33, "message": {
+                "message_id": 4, "chat": {"id": -3003},
+                "from": {"id": 42, "first_name": "Mihai"},
+                "text": "a group no route is bound to"}},
+            {"update_id": 34, "message": {
+                "message_id": 5, "chat": {"id": -1001}, "message_thread_id": 77,
+                "from": {"id": 7, "first_name": "Melissa"},
+                "text": "not the owner's topic to write in"}}
+        ]
+    })
+    .to_string();
+    let (base, _request) = telegram_server(&response).await;
+    let directory = tempdir().unwrap();
+    let poller = TelegramPoller::telegram(
+        &base,
+        "fake-token",
+        -1001,
+        directory.path(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    for (title, chat_id, allow_members) in [("debate", -2001, true), ("private", -2002, false)] {
+        store
+            .save_route(
+                Route {
+                    id: RouteId::new(Uuid::new_v4()),
+                    title: title.into(),
+                    channels: vec![
+                        ChannelBinding::Telegram { topic_id: 77 },
+                        ChannelBinding::TelegramGroup {
+                            chat_id,
+                            allow_members,
+                        },
+                    ],
+                    agent: None,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+    }
+    let ingestor = InboundIngestor::new(store.clone());
+    let groups = ingestor.telegram_groups().await.unwrap();
+    assert_eq!(groups.into_iter().collect::<Vec<_>>(), [-2002, -2001]);
+
+    // Only the bound groups and the owner's supergroup are read.
+    let batch = poller
+        .poll(30, 0, &ingestor.telegram_groups().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        batch
+            .messages
+            .iter()
+            .map(|message| message.destination.as_str())
+            .collect::<Vec<_>>(),
+        ["chat:-2001", "chat:-2002", "chat:-2002", "77"]
+    );
+    assert_eq!(
+        ingestor
+            .persist_telegram_batch("telegram_offset", batch, "42", 100)
+            .await
+            .unwrap(),
+        2
+    );
+    let mut kept = store
+        .pending_inbox()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|item| (item.destination, item.body))
+        .collect::<Vec<_>>();
+    kept.sort();
+    assert_eq!(
+        kept,
+        [
+            (
+                "chat:-2001".to_string(),
+                "Melissa says: who started the war?".to_string()
+            ),
+            ("chat:-2002".to_string(), "owner here".to_string()),
+        ]
+    );
 }

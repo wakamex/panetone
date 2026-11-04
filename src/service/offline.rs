@@ -1204,7 +1204,7 @@ fn available_agent(route: &Route) -> Result<AgentBinding, ServiceError> {
 /// the owner reads, or its first channel when every one is shared.
 pub(crate) fn channel_destination(route: &Route) -> Result<(ChannelKind, String), ServiceError> {
     private_destination(route)
-        .or_else(|| route.channels.first().map(binding_destination))
+        .or_else(|| route.channels.first().map(ChannelBinding::destination))
         .ok_or_else(|| ServiceError::MissingChannel(route.title.clone()))
 }
 
@@ -1213,23 +1213,8 @@ pub(crate) fn private_destination(route: &Route) -> Option<(ChannelKind, String)
     route
         .channels
         .iter()
-        .find(|binding| {
-            !matches!(
-                binding,
-                ChannelBinding::Signal {
-                    allow_members: true,
-                    ..
-                }
-            )
-        })
-        .map(binding_destination)
-}
-
-fn binding_destination(binding: &ChannelBinding) -> (ChannelKind, String) {
-    match binding {
-        ChannelBinding::Telegram { topic_id } => (ChannelKind::Telegram, topic_id.to_string()),
-        ChannelBinding::Signal { group_id, .. } => (ChannelKind::Signal, group_id.clone()),
-    }
+        .find(|binding| !binding.admits_members())
+        .map(ChannelBinding::destination)
 }
 
 fn callback_envelope_from_value(workflow: &StoredWorkflow, returned: &ReturnDelivery) -> String {
