@@ -8,8 +8,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::archive::{ArchiveEntry, ChatArchives};
+use crate::channels::{ChannelDeliveryError, RealChannels, TelegramApprovalResponse};
 use crate::channels::{InboundMessage, TelegramFormTap};
-use crate::channels::{RealChannels, TelegramApprovalResponse};
 use crate::control::{
     CONTROL_SCHEMA, ControlHandler, ControlRequest, ControlResponse, OutputDispositionParams,
     RouteEnsureParams, RouteInspectParams, SendParams, error_response, success_response,
@@ -173,6 +173,11 @@ impl ProductionService {
                 choice.label
             )),
             Ok(_) => Ok(choice.label.clone()),
+            // Wakterm reads the pane itself, and Panetone sees the turn end
+            // only a few seconds later.
+            Err(error) if error.to_string().contains("does not report a dialog open") => {
+                Err(ApprovalTapError::Closed)
+            }
             Err(error) => {
                 // Asked only after Wakterm refused, so a tap on a question
                 // still open is never turned away on Panetone's view alone.
@@ -191,6 +196,75 @@ impl ProductionService {
                 }
             }
         }
+    }
+
+    /// Removes the buttons of approval posts from the last day whose question
+    /// has closed, so a tap cannot reach a menu that is gone. Returns how many
+    /// posts lost their buttons.
+    pub async fn strip_closed_approval_buttons(&self) -> Result<usize, String> {
+        let posts = self
+            .store
+            .approval_posts_with_buttons(now_ms() - 24 * 60 * 60 * 1000)
+            .await
+            .map_err(error_string)?;
+        let mut stripped = 0;
+        for mut post in posts {
+            let Some(request_id) = post.actions.iter().find_map(|action| {
+                action
+                    .id
+                    .strip_prefix("wakap:")
+                    .and_then(|rest| rest.split(':').next())
+            }) else {
+                continue;
+            };
+            let Some(approval) = self
+                .store
+                .get_approval(request_id.to_string())
+                .await
+                .map_err(error_string)?
+            else {
+                continue;
+            };
+            let open = self
+                .store
+                .open_approval(
+                    approval.request.agent_id.clone(),
+                    approval.request.incarnation_id.clone(),
+                )
+                .await
+                .map_err(error_string)?;
+            if open.is_some_and(|open| open.request.request_id == approval.request.request_id) {
+                continue;
+            }
+            let Some(message_id) = post
+                .external_receipt
+                .as_deref()
+                .and_then(|receipt| receipt.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            match self.channels.remove_telegram_buttons(message_id).await {
+                Ok(()) => {}
+                // Tried again on the next pass.
+                Err(error)
+                    if error.may_have_delivered()
+                        || matches!(error, ChannelDeliveryError::RateLimited { .. }) =>
+                {
+                    tracing::warn!(message_id, error = %error, "closed approval's buttons were not removed; retrying");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(message_id, error = %error, "closed approval's buttons could not be removed");
+                }
+            }
+            post.actions.clear();
+            self.store
+                .save_outbox(post, now_ms())
+                .await
+                .map_err(error_string)?;
+            stripped += 1;
+        }
+        Ok(stripped)
     }
 
     /// Applies a tap on a question form message and returns the confirmation
@@ -3480,7 +3554,7 @@ fi
     }
 
     #[tokio::test]
-    async fn a_tap_on_a_question_that_closed_in_the_pane_says_so() {
+    async fn a_question_that_closed_in_the_pane_loses_its_buttons_and_a_tap_says_so() {
         let directory = tempdir().unwrap();
         let binary = directory.path().join("wakterm-fake");
         fs::write(
@@ -3563,6 +3637,48 @@ fi
             }
         };
         ingest(100, vec![event(101, "approval_requested")]).await;
+        let mut posted = store.pending_outbox().await.unwrap().remove(0);
+        assert!(!posted.actions.is_empty());
+        posted.state = OutboxState::Delivered;
+        posted.external_receipt = Some("555".into());
+        store.save_outbox(posted, 3).await.unwrap();
+        // A Telegram that records the one edit it is asked for.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let edit = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let read = stream.read(&mut chunk).await.unwrap();
+                received.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&received);
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(str::to_owned)
+                        })
+                        .unwrap()
+                        .trim()
+                        .parse::<usize>()
+                        .unwrap();
+                    if body.len() >= length {
+                        break;
+                    }
+                }
+            }
+            let body = b"{\"ok\":true,\"result\":true}";
+            stream
+                .write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes())
+                .await
+                .unwrap();
+            stream.write_all(body).await.unwrap();
+            String::from_utf8(received).unwrap()
+        });
         let service = ProductionService::new(
             store.clone(),
             WaktermCli::new(
@@ -3570,7 +3686,18 @@ fi
                 directory.path().join("mux.sock"),
                 Duration::from_secs(2),
             ),
-            RealChannels::default(),
+            RealChannels {
+                telegram: Some(
+                    crate::channels::TelegramClient::new(
+                        &base,
+                        "token",
+                        -1001,
+                        Duration::from_secs(2),
+                    )
+                    .unwrap(),
+                ),
+                ..RealChannels::default()
+            },
             SupervisorHandle::default(),
             Vec::new(),
             directory.path().join("control.sock"),
@@ -3584,19 +3711,22 @@ fi
             choice_id: "edit_prompt".into(),
         };
 
-        // While the question is open, Wakterm's refusal is shown as it came.
-        let Err(ApprovalTapError::Failed(error)) = service.resolve_telegram_approval(&tap).await
-        else {
-            panic!("an open question's refusal must be reported as a failure");
-        };
-        assert!(error.contains("Claude does not report a dialog open"));
-
-        // Once the turn ended without it, the question had closed in the pane.
-        ingest(101, vec![event(102, "turn_final")]).await;
+        // Wakterm reads the pane, so its answer that no dialog is open counts
+        // even before Panetone sees the turn end.
         assert_eq!(
             service.resolve_telegram_approval(&tap).await,
             Err(ApprovalTapError::Closed)
         );
+        // The buttons stay while Panetone still sees the question open.
+        assert_eq!(service.strip_closed_approval_buttons().await.unwrap(), 0);
+
+        ingest(101, vec![event(102, "turn_final")]).await;
+        assert_eq!(service.strip_closed_approval_buttons().await.unwrap(), 1);
+        let request = edit.await.unwrap();
+        assert!(request.starts_with("POST /bottoken/editMessageReplyMarkup "));
+        assert!(request.contains("\"message_id\":555"));
+        assert!(request.contains("\"inline_keyboard\":[]"));
+        assert_eq!(service.strip_closed_approval_buttons().await.unwrap(), 0);
         drop(service);
         store.shutdown().await.unwrap();
     }

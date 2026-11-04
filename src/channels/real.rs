@@ -204,6 +204,36 @@ impl TelegramClient {
         }
     }
 
+    /// Removes a posted message's buttons and keeps its text. Telegram
+    /// refuses an edit that changes nothing, which counts as done.
+    pub async fn remove_buttons(&self, message_id: i64) -> Result<(), ChannelDeliveryError> {
+        let kind = ChannelKind::Telegram;
+        let response = self
+            .http
+            .post(format!(
+                "{}/bot{}/editMessageReplyMarkup",
+                self.api_base, self.token
+            ))
+            .json(&json!({
+                "chat_id": self.chat_id,
+                "message_id": message_id,
+                "reply_markup": {"inline_keyboard": []}
+            }))
+            .send()
+            .await
+            .map_err(|error| map_http_error(kind, &error))?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if status.is_success() || body.contains("message is not modified") {
+            Ok(())
+        } else {
+            Err(ChannelDeliveryError::Rejected {
+                kind,
+                detail: format!("editMessageReplyMarkup returned HTTP {}", status.as_u16()),
+            })
+        }
+    }
+
     async fn wait_for_send(&self) -> tokio::sync::MutexGuard<'_, Instant> {
         let next_send = self.next_send.lock().await;
         if *next_send > Instant::now() {
@@ -413,6 +443,18 @@ impl RealChannels {
             .or(self.telegram.as_ref())
             .ok_or(ChannelDeliveryError::NotConfigured(ChannelKind::Telegram))?
             .send_typing(topic_id)
+            .await
+    }
+
+    /// Removes the buttons of a message the default bot posted.
+    pub async fn remove_telegram_buttons(
+        &self,
+        message_id: i64,
+    ) -> Result<(), ChannelDeliveryError> {
+        self.telegram
+            .as_ref()
+            .ok_or(ChannelDeliveryError::NotConfigured(ChannelKind::Telegram))?
+            .remove_buttons(message_id)
             .await
     }
 

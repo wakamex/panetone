@@ -953,6 +953,24 @@ impl StoreHandle {
         .await
     }
 
+    /// Delivered Telegram posts since a time that still carry approval
+    /// buttons.
+    pub async fn approval_posts_with_buttons(&self, since_ms: i64) -> StoreResult<Vec<OutboxItem>> {
+        self.run(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT record_json FROM outbox
+                 WHERE channel = 'telegram' AND state = 'delivered' AND created_at_ms >= ?1
+                   AND EXISTS (
+                       SELECT 1 FROM json_each(record_json, '$.actions')
+                       WHERE json_extract(value, '$.id') LIKE 'wakap:%')",
+            )?;
+            let rows = statement.query_map(params![since_ms], |row| row.get::<_, String>(0))?;
+            rows.map(|json| Ok(serde_json::from_str::<OutboxItem>(&json?)?))
+                .collect()
+        })
+        .await
+    }
+
     pub async fn status(&self) -> StoreResult<StoreStatus> {
         self.request(|reply| Command::Status { reply }).await
     }

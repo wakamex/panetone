@@ -665,7 +665,9 @@ async fn run_production_worker(
     worker: ProductionWorker,
 ) -> Result<(), String> {
     match worker {
-        ProductionWorker::Events => service.event_once().await?,
+        ProductionWorker::Events => {
+            service.event_once().await? + service.strip_closed_approval_buttons().await?
+        }
         ProductionWorker::Outbox => service.outbox_once().await?,
         ProductionWorker::BusyTargets => service.busy_once().await?,
         ProductionWorker::ReturnTerminals => service.terminal_once().await?,
