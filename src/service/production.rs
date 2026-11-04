@@ -3720,7 +3720,10 @@ fi
         // The buttons stay while Panetone still sees the question open.
         assert_eq!(service.strip_closed_approval_buttons().await.unwrap(), 0);
 
-        ingest(101, vec![event(102, "turn_final")]).await;
+        // A restarted agent's process left the question behind.
+        let mut restarted = event(102, "turn_state_changed");
+        restarted.incarnation_id = "inc-route-2".into();
+        ingest(101, vec![restarted]).await;
         assert_eq!(service.strip_closed_approval_buttons().await.unwrap(), 1);
         let request = edit.await.unwrap();
         assert!(request.starts_with("POST /bottoken/editMessageReplyMarkup "));

@@ -919,8 +919,9 @@ impl StoreHandle {
 
     /// The question or approval an agent incarnation is still waiting on: its
     /// latest one, unless the agent has since written, taken input or ended a
-    /// turn. An answer continues the turn, so the agent's next message is
-    /// often the only sign of it.
+    /// turn, or a later process of the agent has reported anything. An answer
+    /// continues the turn, so the agent's next message is often the only sign
+    /// of it.
     pub async fn open_approval(
         &self,
         agent_id: String,
@@ -935,9 +936,9 @@ impl StoreHandle {
                        AND kind = 'approval_requested' AND route_id IS NOT NULL
                        AND NOT EXISTS (
                            SELECT 1 FROM agent_events AS later
-                           WHERE later.agent_id = ?1 AND later.incarnation_id = ?2
-                             AND later.sequence > asked.sequence
-                             AND later.kind IN ('assistant_message', 'input_accepted', 'turn_started', 'turn_final'))
+                           WHERE later.agent_id = ?1 AND later.sequence > asked.sequence
+                             AND (later.incarnation_id != ?2
+                                  OR later.kind IN ('assistant_message', 'input_accepted', 'turn_started', 'turn_final')))
                      ORDER BY sequence DESC
                      LIMIT 1",
                     params![agent_id, incarnation_id],
