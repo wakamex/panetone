@@ -662,6 +662,12 @@ async fn answer_tap(poller: &TelegramPoller, query_id: &str, text: &str) {
     }
 }
 
+async fn remove_approval_buttons(poller: &TelegramPoller, message_id: i64) {
+    if let Err(error) = poller.remove_buttons(message_id).await {
+        tracing::warn!(message_id, error = %error, "answered approval's buttons were not removed");
+    }
+}
+
 /// Telegram limits callback answers to 200 characters.
 fn callback_text(text: &str) -> String {
     match text.char_indices().nth(199) {
@@ -762,12 +768,15 @@ async fn telegram_loop(
                     "Only the configured owner can answer approvals".into(),
                 ))
             };
+            // Other copies of the question lose their buttons once the agent
+            // moves on.
             let answer = match result {
-                Ok(label) => format!("Applied: {label}"),
+                Ok(label) => {
+                    remove_approval_buttons(&poller, approval.message_id).await;
+                    format!("Applied: {label}")
+                }
                 Err(ApprovalTapError::Closed) => {
-                    if let Err(error) = poller.remove_buttons(approval.message_id).await {
-                        tracing::warn!(message_id = approval.message_id, error = %error, "closed approval's buttons were not removed");
-                    }
+                    remove_approval_buttons(&poller, approval.message_id).await;
                     "This question already closed in the pane, so nothing was sent.".to_string()
                 }
                 Err(ApprovalTapError::Failed(error)) => {
