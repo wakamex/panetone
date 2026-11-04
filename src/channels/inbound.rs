@@ -246,6 +246,11 @@ impl TelegramPoller {
                     None,
                 )
             } else {
+                // Logged so a new group's chat ID can be found to bind it.
+                tracing::info!(
+                    chat_id = message.chat.id,
+                    "Telegram message from a chat no route is bound to was skipped"
+                );
                 continue;
             };
             let mut body = message.text.or(message.caption).unwrap_or_default();
