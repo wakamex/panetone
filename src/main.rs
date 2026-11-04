@@ -652,6 +652,16 @@ async fn edit_form_message(poller: &TelegramPoller, update: &FormUpdate) {
     }
 }
 
+/// Shows a tap's outcome on the button. The tap has already been applied, and
+/// Telegram refuses an answer once the tap is too old, as after a slow
+/// approval, so a failure is only logged; the stopped loop would otherwise
+/// apply the same taps again.
+async fn answer_tap(poller: &TelegramPoller, query_id: &str, text: &str) {
+    if let Err(error) = poller.answer_callback(query_id, text).await {
+        tracing::warn!(error = %error, "Telegram button tap could not be answered");
+    }
+}
+
 /// Telegram limits callback answers to 200 characters.
 fn callback_text(text: &str) -> String {
     match text.char_indices().nth(199) {
@@ -773,10 +783,7 @@ async fn telegram_loop(
                     format!("Not applied: {}", truncate_chars(reason, 180))
                 }
             };
-            poller
-                .answer_callback(&approval.query_id, &answer)
-                .await
-                .map_err(|error| error.to_string())?;
+            answer_tap(&poller, &approval.query_id, &answer).await;
         }
         for tap in std::mem::take(&mut batch.form_taps) {
             let result = if tap.sender_id == owner {
@@ -794,16 +801,10 @@ async fn telegram_loop(
                     error
                 }
             };
-            poller
-                .answer_callback(&tap.query_id, &callback_text(&toast))
-                .await
-                .map_err(|error| error.to_string())?;
+            answer_tap(&poller, &tap.query_id, &callback_text(&toast)).await;
         }
         for query_id in std::mem::take(&mut batch.unknown_taps) {
-            poller
-                .answer_callback(&query_id, "This button is no longer valid")
-                .await
-                .map_err(|error| error.to_string())?;
+            answer_tap(&poller, &query_id, "This button is no longer valid").await;
         }
         batch
             .messages
