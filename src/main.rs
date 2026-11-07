@@ -349,12 +349,28 @@ enum ProductionWorker {
     Rooms,
 }
 
+/// How long the daemon waits at startup for the Wakterm Agent API to answer.
+const WAKTERM_STARTUP_WAIT: Duration = Duration::from_secs(300);
+
 async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
     let deadline = Duration::from_secs(10);
     let wakterm = WaktermCli::new(&args.wakterm_bin, &args.wakterm_socket, deadline);
-    let (version, capabilities, catalog) =
-        tokio::try_join!(wakterm.version(), wakterm.capabilities(), wakterm.catalog())
-            .context("preflight the live Wakterm Agent API")?;
+    // At boot the mux server counts as started before it answers, and it
+    // can take a minute or more to restore its panes, so the daemon waits for
+    // it instead of failing its first runs.
+    let waiting_since = Instant::now();
+    let (version, capabilities, catalog) = loop {
+        match tokio::try_join!(wakterm.version(), wakterm.capabilities(), wakterm.catalog()) {
+            Ok(preflight) => break preflight,
+            Err(error) if waiting_since.elapsed() < WAKTERM_STARTUP_WAIT => {
+                tracing::warn!(error = %error, "Wakterm Agent API is not answering yet; waiting");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            Err(error) => {
+                return Err(error).context("preflight the live Wakterm Agent API");
+            }
+        }
+    };
     if !capabilities.general_event_consumer_enabled() {
         bail!("production requires Wakterm capability event_stream.v1");
     }
