@@ -1297,12 +1297,21 @@ pub(crate) fn migrate_schema(connection: &mut Connection) -> StoreResult<()> {
 }
 
 fn recover(connection: &mut Connection) -> StoreResult<()> {
-    let prepared = workflows_by_state(connection, WorkflowState::AdmissionPrepared)?;
-    for mut record in prepared {
-        let expected = record.workflow.state;
-        record.workflow.state = WorkflowState::Indeterminate;
-        record.updated_at_ms = record.updated_at_ms.saturating_add(1);
-        save_workflow(connection, &record, expected)?;
+    // Wakterm writes a prompt at most once per request ID, so an interrupted
+    // admission waits in the busy queue to be asked again under the same ID.
+    // An interrupted steer may have been typed and cannot be repeated.
+    for (interrupted, recovered) in [
+        (
+            WorkflowState::AdmissionPrepared,
+            WorkflowState::AwaitingTargetIdle,
+        ),
+        (WorkflowState::Steering, WorkflowState::Indeterminate),
+    ] {
+        for mut record in workflows_by_state(connection, interrupted)? {
+            record.workflow.state = recovered;
+            record.updated_at_ms = record.updated_at_ms.saturating_add(1);
+            save_workflow(connection, &record, interrupted)?;
+        }
     }
 
     let mut statement = connection
@@ -1327,14 +1336,23 @@ fn recover(connection: &mut Connection) -> StoreResult<()> {
         [],
     )?;
     connection.execute(
-        // An admission interrupted by a restart may have been typed, so it
-        // waits for proof like any other unconfirmed delivery.
+        // An admission interrupted by a restart is asked again under the same
+        // ID, which Wakterm writes at most once.
+        "UPDATE inbox SET state = 'pending',
+             record_json = json_remove(json_set(record_json, '$.state', 'pending'),
+                 '$.proof', '$.receipt')
+         WHERE state = 'admission_prepared'",
+        [],
+    )?;
+    connection.execute(
+        // A steer interrupted by a restart may have been typed, so it waits
+        // for proof like any other unconfirmed delivery.
         "UPDATE inbox SET state = CASE WHEN json_extract(record_json, '$.proof') IS NULL
                  THEN 'indeterminate' ELSE 'awaiting_proof' END,
              record_json = json_set(record_json, '$.state',
                  CASE WHEN json_extract(record_json, '$.proof') IS NULL
                  THEN 'indeterminate' ELSE 'awaiting_proof' END)
-         WHERE state = 'admission_prepared'",
+         WHERE state = 'steering'",
         [],
     )?;
     Ok(())

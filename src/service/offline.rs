@@ -630,6 +630,13 @@ impl OfflineService {
         // A target whose keyboard is held by a dialog cannot be steered; the
         // request then waits in the busy queue like an unsteered one.
         let steering = if receipt.status == AdmissionStatus::Busy && record.command.steer {
+            transition(
+                &self.store,
+                &mut record,
+                WorkflowState::Steering,
+                answered_ms(),
+            )
+            .await?;
             match self.wakterm.steer(&target, prompt.clone()).await {
                 Err(ServiceError::TargetBlocked(_)) => None,
                 result => Some(result),

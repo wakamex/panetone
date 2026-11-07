@@ -636,7 +636,7 @@ async fn unrelated_terminal_identity_is_rejected_without_a_callback_or_mirror() 
 }
 
 #[tokio::test]
-async fn crash_after_prompt_effect_recovers_indeterminate_without_redelivery() {
+async fn crash_after_prompt_effect_asks_wakterm_again_under_the_same_request_id() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("state.sqlite3");
     let store = StoreHandle::open(&path).unwrap();
@@ -654,10 +654,14 @@ async fn crash_after_prompt_effect_recovers_indeterminate_without_redelivery() {
         service.submit(request.clone(), &source, &target, 100).await,
         Err(ServiceError::Injected(FaultPoint::AfterPromptEffect))
     ));
-    assert_eq!(service.wakterm().calls().len(), 1);
+    let first = service.wakterm().calls();
+    assert_eq!(first.len(), 1);
     drop(service);
     store.shutdown().await.unwrap();
 
+    // Wakterm writes a prompt at most once per request ID and answers a
+    // repeated request with its first receipt, so the interrupted admission
+    // waits in the busy queue to be asked again.
     let reopened = StoreHandle::open(&path).unwrap();
     assert_eq!(
         reopened
@@ -667,18 +671,22 @@ async fn crash_after_prompt_effect_recovers_indeterminate_without_redelivery() {
             .unwrap()
             .workflow
             .state,
-        WorkflowState::Indeterminate
+        WorkflowState::AwaitingTargetIdle
     );
     let replacement = OfflineService::new(
         reopened.clone(),
         FakeWakterm::new(contract()),
         RecordingChannels::default(),
     );
-    assert!(matches!(
-        replacement.submit(request, &source, &target, 200).await,
-        Err(ServiceError::AdmissionFailed(WorkflowState::Indeterminate))
-    ));
-    assert!(replacement.wakterm().calls().is_empty());
+    let ack = replacement
+        .retry_busy_target(request.id, &target, 200)
+        .await
+        .unwrap();
+    assert!(ack.submitted);
+    let again = replacement.wakterm().calls();
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].request_id, first[0].request_id);
+    assert_eq!(again[0].prompt, first[0].prompt);
     drop(replacement);
     reopened.shutdown().await.unwrap();
 }
@@ -765,7 +773,7 @@ async fn crash_after_durable_acceptance_finishes_without_a_second_prompt() {
 }
 
 #[tokio::test]
-async fn crash_before_the_busy_queue_checkpoint_is_conservatively_indeterminate() {
+async fn crash_before_the_busy_queue_checkpoint_requeues_the_admission() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("state.sqlite3");
     let store = StoreHandle::open(&path).unwrap();
@@ -793,7 +801,7 @@ async fn crash_before_the_busy_queue_checkpoint_is_conservatively_indeterminate(
             .unwrap()
             .workflow
             .state,
-        WorkflowState::Indeterminate
+        WorkflowState::AwaitingTargetIdle
     );
     reopened.shutdown().await.unwrap();
 }

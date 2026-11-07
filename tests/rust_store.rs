@@ -212,7 +212,7 @@ async fn unknown_historical_hash_kind_keeps_uuid_reserved() {
 }
 
 #[tokio::test]
-async fn busy_queue_and_uncertain_admission_recover_conservatively() {
+async fn a_restart_requeues_interrupted_admissions_and_not_interrupted_steers() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("state.sqlite3");
     let store = StoreHandle::open(&path).unwrap();
@@ -274,13 +274,38 @@ async fn busy_queue_and_uncertain_admission_recover_conservatively() {
         .save_workflow(uncertain.clone(), WorkflowState::AuditPosted)
         .await
         .unwrap();
+
+    let mut steering = claim_new(&store, id(22)).await;
+    for (next, expected) in [
+        (WorkflowState::AuditPosted, WorkflowState::Claimed),
+        (WorkflowState::AdmissionPrepared, WorkflowState::AuditPosted),
+        (WorkflowState::Steering, WorkflowState::AdmissionPrepared),
+    ] {
+        steering.workflow.transition(next).unwrap();
+        steering.updated_at_ms += 1;
+        store
+            .save_workflow(steering.clone(), expected)
+            .await
+            .unwrap();
+    }
     store.shutdown().await.unwrap();
 
+    // Wakterm writes a prompt at most once per request ID, so the interrupted
+    // admission joins the busy queue to be asked again; the interrupted steer
+    // may have been typed.
     let reopened = StoreHandle::open(&path).unwrap();
-    assert_eq!(reopened.awaiting_target().await.unwrap().len(), 1);
+    let mut awaiting = reopened
+        .awaiting_target()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|record| record.command.id)
+        .collect::<Vec<_>>();
+    awaiting.sort_by_key(|id| id.to_string());
+    assert_eq!(awaiting, [id(20), id(21)]);
     assert_eq!(
         reopened
-            .get_workflow(id(21))
+            .get_workflow(id(22))
             .await
             .unwrap()
             .unwrap()
@@ -519,23 +544,22 @@ async fn routes_outbox_inbox_and_metadata_are_durable_and_deduplicated() {
 }
 
 #[tokio::test]
-async fn an_admission_interrupted_by_a_restart_waits_for_proof_when_it_has_one() {
+async fn a_restart_retries_an_interrupted_admission_and_awaits_proof_of_a_steer() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("state.sqlite3");
     let store = StoreHandle::open(&path).unwrap();
-    for (id, proof) in [
-        (1, None),
-        (
-            2,
-            Some(DeliveryProof {
-                agent_id: "agent".into(),
-                after_sequence: 0,
-                input_sha256: DeliveryProof::input_sha256("hello"),
-                tab_expanded_sha256: None,
-                deadline_ms: 1,
-                detail: "Panetone restarted while delivering it".into(),
-            }),
-        ),
+    let proof = DeliveryProof {
+        agent_id: "agent".into(),
+        after_sequence: 0,
+        input_sha256: DeliveryProof::input_sha256("hello"),
+        tab_expanded_sha256: None,
+        deadline_ms: 1,
+        detail: "Panetone restarted while delivering it".into(),
+    };
+    for (id, state, proof) in [
+        (1, "admission_prepared", Some(proof.clone())),
+        (2, "steering", None),
+        (3, "steering", Some(proof)),
     ] {
         let mut item = InboxItem {
             id: EffectId::new(Uuid::from_u128(id)),
@@ -554,17 +578,23 @@ async fn an_admission_interrupted_by_a_restart_waits_for_proof_when_it_has_one()
             transcribed: false,
         };
         store.accept_inbox(item.clone()).await.unwrap();
-        item.state = "admission_prepared".into();
+        item.state = state.into();
         item.proof = proof;
         store.save_inbox(item, "pending", None).await.unwrap();
     }
     store.shutdown().await.unwrap();
 
+    // Wakterm writes a prompt at most once per request ID, so an interrupted
+    // admission is asked again; a steer may have been typed, so it waits for
+    // the agent's record of it, or is indeterminate without a proof to wait on.
     let reopened = StoreHandle::open(&path).unwrap();
+    let pending = reopened.pending_inbox().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, EffectId::new(Uuid::from_u128(1)));
+    assert_eq!(pending[0].proof, None);
     let awaiting = reopened.awaiting_inbox().await.unwrap();
     assert_eq!(awaiting.len(), 1);
-    assert_eq!(awaiting[0].id, EffectId::new(Uuid::from_u128(2)));
-    assert_eq!(awaiting[0].state, "awaiting_proof");
+    assert_eq!(awaiting[0].id, EffectId::new(Uuid::from_u128(3)));
     reopened.shutdown().await.unwrap();
     let states = Connection::open(&path)
         .unwrap()
@@ -574,7 +604,7 @@ async fn an_admission_interrupted_by_a_restart_waits_for_proof_when_it_has_one()
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(states, ["indeterminate", "awaiting_proof"]);
+    assert_eq!(states, ["pending", "indeterminate", "awaiting_proof"]);
 }
 
 #[tokio::test]

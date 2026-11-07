@@ -173,7 +173,7 @@ Panetone removes characters that draw nothing from an inbound message and from a
 
 When Wakterm refuses to write an inbound Telegram or Signal message because a dialog, shell mode, startup prompt or a draft the user is typing holds the agent's keyboard, nothing is written and Panetone retries until the pane can take input. Once the message has waited a minute, Panetone posts one `[waiting]` notice in the sender's chat giving the reason. When the agent is waiting on a question or approval it asked in the route's Telegram topic, the notice asks it again with its buttons, since the first asking may have scrolled out of view; either copy's buttons answer it. This and the `[unconfirmed]` notice describe Panetone's own delivery, so for a message from a Signal or Telegram group that admits other members they go to the route's private channel, its Telegram topic, instead of the group.
 
-When Wakterm cannot confirm that an inbound Telegram or Signal message reached its agent, because the agent did not start a turn in time, a steer was not acknowledged, the Wakterm call failed, or Panetone restarted during delivery, the message waits for proof in the `awaiting_proof` state. Before typing a message, Panetone records the target agent, its event cursor, and the SHA-256 of the trimmed text. A later `input_accepted` or `turn_started` event from that agent with the same `input_sha256` marks the message delivered without telling the sender anything. If none arrives within two minutes, which allows for Codex taking steered input only when its running turn reaches it, the sender's chat gets an `[unconfirmed]` notice asking them to check the pane before resending, and the message becomes `indeterminate`.
+When Wakterm cannot confirm that an inbound Telegram or Signal message reached its agent, because the agent did not start a turn in time, a steer was not acknowledged, the Wakterm call failed, or Panetone restarted while steering it into a busy turn, the message waits for proof in the `awaiting_proof` state. Before typing a message, Panetone records the target agent, its event cursor, and the SHA-256 of the trimmed text. A later `input_accepted` or `turn_started` event from that agent with the same `input_sha256` marks the message delivered without telling the sender anything. If none arrives within two minutes, which allows for Codex taking steered input only when its running turn reaches it, the sender's chat gets an `[unconfirmed]` notice asking them to check the pane before resending, and the message becomes `indeterminate`.
 
 While a route's agent is working on a turn, Panetone shows the bot as typing in the route's Telegram topic. Telegram clears the indicator after about five seconds, so the `typing` worker sends `sendChatAction` every four seconds for each route whose agent has turn state `waiting_on_agent` and whose output goes to Telegram; a route that also has a Signal group gets it only while Telegram is its selected output channel. The indicator is sent by the bot of the working agent's harness, is not paced like a post, and a failure is logged at debug level without affecting the daemon's health.
 
@@ -193,7 +193,11 @@ The event, outbox, inbox, busy-target and return workers retry a failed pass in 
 - Never replay an indeterminate prompt merely because the daemon restarted.
 - A delivering outbox item returns to pending after restart and counts as an
   attempt that may have posted, so its retry is labeled `[resent]`.
-- An admission prepared without a definitive receipt becomes indeterminate.
+- An admission a restart interrupted is asked of Wakterm again under the same
+  request ID, since Wakterm writes a prompt at most once per ID and answers a
+  repeated request with its first receipt. A steer into a busy turn that a
+  restart interrupted may have been typed, so a send becomes indeterminate and
+  a channel message waits for proof.
 - Preserve the database before manual repair.
 - Attribute Wakterm client, mux, Telegram, Signal, and Panetone failures to one
   layer before changing code.

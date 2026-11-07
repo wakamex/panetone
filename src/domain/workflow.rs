@@ -114,7 +114,12 @@ pub enum WorkflowState {
     Claimed,
     AuditPosted,
     AwaitingTargetIdle,
+    /// Wakterm is being asked to admit the prompt. Admission writes a prompt
+    /// at most once per request ID, so after a restart it is asked again.
     AdmissionPrepared,
+    /// The prompt is being typed into the target's busy turn, which may
+    /// happen at most once, so a restart cannot repeat it.
+    Steering,
     Submitted,
     Completed,
     Failed,
@@ -165,6 +170,10 @@ impl Workflow {
                     WorkflowState::AdmissionPrepared,
                     WorkflowState::AwaitingTargetIdle
                 )
+                | (WorkflowState::AdmissionPrepared, WorkflowState::Steering)
+                | (WorkflowState::Steering, WorkflowState::AwaitingTargetIdle)
+                | (WorkflowState::Steering, WorkflowState::Submitted)
+                | (WorkflowState::Steering, WorkflowState::Indeterminate)
                 | (WorkflowState::AdmissionPrepared, WorkflowState::Submitted)
                 | (WorkflowState::AdmissionPrepared, WorkflowState::Failed)
                 | (

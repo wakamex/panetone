@@ -833,7 +833,10 @@ impl ProductionService {
                         )
                         .await
                         .map_err(error_string)?;
-                } else if workflow.workflow.state == WorkflowState::AdmissionPrepared {
+                } else if matches!(
+                    workflow.workflow.state,
+                    WorkflowState::AdmissionPrepared | WorkflowState::Steering
+                ) {
                     tracing::debug!(
                         request_id = %request_id,
                         terminal_event_sequence = terminal.terminal_event_sequence,
@@ -1589,6 +1592,7 @@ impl ProductionService {
             };
             receipt.validate(item.id, &binding).map_err(error_string)?;
             item.receipt = Some(receipt.clone());
+            let mut saved_as = "admission_prepared";
             item.state = match receipt.status {
                 AdmissionStatus::Accepted => "delivered",
                 // A direct message is never written into a turn another
@@ -1605,6 +1609,14 @@ impl ProductionService {
                     continue;
                 }
                 AdmissionStatus::Busy => {
+                    // Typing into the busy turn may happen at most once, so a
+                    // restart from here waits for proof instead of retrying.
+                    item.state = "steering".into();
+                    self.store
+                        .save_inbox(item.clone(), "admission_prepared", None)
+                        .await
+                        .map_err(error_string)?;
+                    saved_as = "steering";
                     let steering = match self.wakterm.steer(&binding, &item.body).await {
                         Ok(steering) => steering,
                         // Nothing was written; a later pass retries.
@@ -1612,7 +1624,7 @@ impl ProductionService {
                             item.state = "pending".into();
                             item.receipt = None;
                             self.store
-                                .save_inbox(item.clone(), "admission_prepared", None)
+                                .save_inbox(item.clone(), saved_as, None)
                                 .await
                                 .map_err(error_string)?;
                             // The message is pending again before the notice,
@@ -1627,7 +1639,7 @@ impl ProductionService {
                         Err(error) => {
                             await_proof(&mut item, &error.to_string());
                             self.store
-                                .save_inbox(item, "admission_prepared", None)
+                                .save_inbox(item, saved_as, None)
                                 .await
                                 .map_err(error_string)?;
                             return Err(error.to_string());
@@ -1663,7 +1675,7 @@ impl ProductionService {
             .into();
             let preference = (item.state == "delivered").then_some((route.id, item.channel));
             self.store
-                .save_inbox(item, "admission_prepared", preference)
+                .save_inbox(item, saved_as, preference)
                 .await
                 .map_err(error_string)?;
         }
