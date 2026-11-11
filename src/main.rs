@@ -10,8 +10,8 @@ use panetone::channels::{
     TelegramPoller,
 };
 use panetone::control::{
-    CONTROL_SCHEMA, ControlRequest, ControlServer, OutputDispositionParams, RouteEnsureParams,
-    RouteInspectParams, SendParams, SourceAgent, request,
+    CONTROL_SCHEMA, ControlRequest, ControlServer, NotifyParams, OutputDispositionParams,
+    RouteEnsureParams, RouteInspectParams, SendParams, SourceAgent, request,
 };
 use panetone::service::{
     ApprovalTapError, FormUpdate, InboundIngestor, ProductionService, SignalReceiver,
@@ -39,6 +39,8 @@ enum Command {
     Status(StatusArgs),
     /// Withdraw a request's reply, so its target is no longer reminded.
     Cancel(CancelArgs),
+    /// Post a service's notice to a route's private channel, without an agent.
+    Notify(NotifyArgs),
     /// Chat in a room: a route whose agents and people all see every message.
     Chat(ChatArgs),
     /// Inspect or establish durable workspace routes.
@@ -170,6 +172,25 @@ struct ChatArgs {
 struct CancelArgs {
     /// The request ID of the send that asked for a reply.
     request_id: Uuid,
+    #[command(flatten)]
+    control: ControlSocketArgs,
+}
+
+#[derive(Args)]
+struct NotifyArgs {
+    /// The route whose owner gets the notice, in its Telegram topic or private
+    /// Signal chat.
+    #[arg(long = "to")]
+    title: String,
+    /// The notice's text. If omitted, it is read from standard input.
+    message: Option<String>,
+    /// The service's name, shown in brackets before the notice.
+    #[arg(long = "as", value_name = "NAME")]
+    from: Option<String>,
+    /// Notice UUID, which makes a retry safe: a notice with an ID already
+    /// posted posts nothing again.
+    #[arg(long)]
+    id: Option<Uuid>,
     #[command(flatten)]
     control: ControlSocketArgs,
 }
@@ -317,6 +338,7 @@ async fn main() -> Result<()> {
         Command::Send(args) => run_send(args).await,
         Command::Status(args) => run_status(args).await,
         Command::Cancel(args) => run_cancel(args).await,
+        Command::Notify(args) => run_notify(args).await,
         Command::Chat(args) => {
             let name = args.name.unwrap_or_else(|| {
                 let login = std::env::var("USER").unwrap_or_else(|_| "you".into());
@@ -1162,6 +1184,41 @@ async fn run_cancel(args: CancelArgs) -> Result<()> {
         Ok(())
     } else {
         bail!("cancel was rejected")
+    }
+}
+
+async fn run_notify(args: NotifyArgs) -> Result<()> {
+    let socket = control_socket(args.control.socket)?;
+    let body = match args.message {
+        Some(message) => message,
+        None => {
+            let mut body = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut body)
+                .context("read the notice from standard input")?;
+            body
+        }
+    };
+    let params = NotifyParams {
+        title: args.title,
+        body,
+        id: args.id,
+        from: args.from,
+    };
+    let response = request(
+        &socket,
+        &ControlRequest {
+            schema: CONTROL_SCHEMA.into(),
+            id: Uuid::new_v4(),
+            method: "notify".into(),
+            params: serde_json::to_value(params)?,
+        },
+    )
+    .await?;
+    println!("{}", serde_json::to_string(&response)?);
+    if response.ok {
+        Ok(())
+    } else {
+        bail!("the notice was rejected")
     }
 }
 

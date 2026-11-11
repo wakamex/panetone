@@ -15,6 +15,21 @@ pub struct ControlRequest {
     pub params: Value,
 }
 
+/// A notice a local service posts to a route's private channel, the owner's
+/// Telegram topic or Signal chat, without an agent turn.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NotifyParams {
+    /// The route's title.
+    pub title: String,
+    pub body: String,
+    /// Makes a retry safe: a notice with an ID already posted posts nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<Uuid>,
+    /// The service's name, shown in brackets before the notice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SendParams {
     #[serde(rename = "from", skip_serializing_if = "Option::is_none")]

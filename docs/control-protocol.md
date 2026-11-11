@@ -266,6 +266,8 @@ The target answers in any turn by writing the answer as normal output with a sta
 
 When a turn of the target ends while it owes a reply, and nothing starts another turn within 30 seconds, Panetone admits one reminder listing every reply it owes. No reminder follows a turn that a reminder started, so reminders never wake an agent on their own, and none follows a turn the model's safeguards refused (a Claude `claude_refusal_fallback` approval), since the next turn would carry the same history and most likely be refused too.
 
+`notify` takes `{"title": ROUTE_TITLE, "body": TEXT, "id": UUID, "from": NAME}`, with `id` and `from` optional, and posts the body, after `[NAME] ` when `from` is given, to the route's first channel that only the owner reads; the CLI form is `panetone notify`. It never reaches an agent. A route with no such channel fails with `route_unavailable`. The notice's outbox effect ID is a version 5 UUID of `id`, so a repeated `id` returns `{"posted": false, "already_posted": true}` and posts nothing; a new notice returns `{"posted": true, "channel": KIND}`. A sender name must be one line of 1 to 64 characters, and the body must not be empty. Like `send`, it is refused to sandboxed clients.
+
 `reply.cancel` takes `{"request_id": UUID}` and withdraws an open debt; the CLI form is `panetone cancel REQUEST_ID`. Its result reports `cancelled` and `previous_state`, which is `open`, `replied` or `cancelled`. A request that did not ask for a reply fails with `reply_not_found`. Debts do not expire.
 
 Requests that Wakterm correlated with a provider turn before replies were tagged still return that turn's final response through the terminal stream. The terminal watcher calls Wakterm only while such a request has no stored terminal result.

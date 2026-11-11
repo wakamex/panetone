@@ -11,8 +11,9 @@ use crate::archive::{ArchiveEntry, ChatArchives};
 use crate::channels::{ChannelDeliveryError, RealChannels, TelegramApprovalResponse};
 use crate::channels::{InboundMessage, TelegramFormTap};
 use crate::control::{
-    CONTROL_SCHEMA, ControlHandler, ControlRequest, ControlResponse, OutputDispositionParams,
-    RouteEnsureParams, RouteInspectParams, SendParams, error_response, success_response,
+    CONTROL_SCHEMA, ControlHandler, ControlRequest, ControlResponse, NotifyParams,
+    OutputDispositionParams, RouteEnsureParams, RouteInspectParams, SendParams, error_response,
+    success_response,
 };
 use crate::domain::{
     AdmissionStatus, AgentBinding, ChannelBinding, ChannelKind, EffectId, OutboxAction, OutboxItem,
@@ -1890,17 +1891,7 @@ impl ProductionService {
         }
         // A notice about Panetone's own delivery is for the owner, so a
         // message from a shared group is answered in a private channel.
-        let shared = route.channels.iter().any(|binding| {
-            matches!(
-                binding,
-                ChannelBinding::Signal {
-                    group_id,
-                    allow_members: true,
-                    ..
-                } if group_id.trim_end_matches('=') == item.destination.trim_end_matches('=')
-            )
-        });
-        let (kind, destination) = if shared {
+        let (kind, destination) = if route.is_shared(item.channel, &item.destination) {
             match crate::service::offline::private_destination(route) {
                 Some(private) => private,
                 None => return Ok(()),
@@ -2597,6 +2588,84 @@ impl ProductionService {
         success_response(id, json!({"routes": listed}))
     }
 
+    /// Posts a local service's notice to a route's private channel through the
+    /// outbox, so it reaches the owner without an agent turn and no caller
+    /// handles channel credentials.
+    async fn handle_notify(&self, id: Uuid, params: NotifyParams) -> ControlResponse {
+        let from = params.from.as_deref().map(str::trim);
+        if params.body.trim().is_empty()
+            || from.is_some_and(|from| {
+                from.is_empty() || from.chars().count() > 64 || from.contains('\n')
+            })
+        {
+            return error_response(
+                id,
+                "invalid_params",
+                "a notice needs a non-empty body, and a sender name must be one line of 1 to 64 characters",
+                None,
+            );
+        }
+        let routes = match self.store.list_routes().await {
+            Ok(routes) => routes,
+            Err(error) => return internal(id, error),
+        };
+        let route = match exact_route(&routes, &params.title) {
+            Ok(route) => route,
+            Err(detail) => return route_error(id, "", detail),
+        };
+        let Some((kind, destination)) = crate::service::offline::private_destination(route) else {
+            return error_response(
+                id,
+                "route_unavailable",
+                format!(
+                    "route {:?} has no channel only its owner reads",
+                    route.title
+                ),
+                None,
+            );
+        };
+        let namespace = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"https://panetone.dev/notify/v1");
+        let notice_id = EffectId::new(Uuid::new_v5(
+            &namespace,
+            params.id.unwrap_or_else(Uuid::new_v4).as_bytes(),
+        ));
+        for posted in [notice_id, EffectId::chunk(notice_id, 0)] {
+            match self.store.outbox_exists(posted).await {
+                Ok(true) => {
+                    return success_response(id, json!({"posted": false, "already_posted": true}));
+                }
+                Ok(false) => {}
+                Err(error) => return internal(id, error),
+            }
+        }
+        let body = crate::domain::strip_invisible(params.body.trim());
+        let notice = OutboxItem {
+            id: notice_id,
+            route_id: Some(route.id),
+            sender_harness: None,
+            source_agent: None,
+            kind,
+            destination,
+            body: match from {
+                Some(from) => format!("[{from}] {body}"),
+                None => body,
+            },
+            attachments: Vec::new(),
+            actions: Vec::new(),
+            state: OutboxState::Pending,
+            attempts: 0,
+            last_error: None,
+            external_receipt: None,
+            uncertain_attempts: 0,
+        };
+        for chunk in crate::domain::chunk_outbox(notice) {
+            if let Err(error) = self.store.enqueue_outbox(None, chunk, now_ms()).await {
+                return internal(id, error);
+            }
+        }
+        success_response(id, json!({"posted": true, "channel": kind}))
+    }
+
     async fn handle_route_ensure(&self, id: Uuid, params: RouteEnsureParams) -> ControlResponse {
         if !valid_route_title(&params.title)
             || params
@@ -2997,6 +3066,10 @@ impl ControlHandler for ProductionService {
                 },
                 "send" => match serde_json::from_value::<SendParams>(request.params.clone()) {
                     Ok(params) => self.handle_send(request, params).await,
+                    Err(error) => invalid(request.id, error),
+                },
+                "notify" => match serde_json::from_value::<NotifyParams>(request.params) {
+                    Ok(params) => self.handle_notify(request.id, params).await,
                     Err(error) => invalid(request.id, error),
                 },
                 "route.list" => self.handle_route_list(request.id).await,
@@ -4730,6 +4803,87 @@ fi
         assert_eq!(service.replies_once().await.unwrap(), 0);
         drop(service);
         drop(workflows);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_service_notice_reaches_the_owner_once_without_an_agent() {
+        let directory = tempdir().unwrap();
+        let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        let shared = ChannelBinding::TelegramGroup {
+            chat_id: -2001,
+            allow_members: true,
+        };
+        for (title, channels) in [
+            (
+                "switcher",
+                vec![shared.clone(), ChannelBinding::Telegram { topic_id: 10 }],
+            ),
+            ("group-only", vec![shared]),
+        ] {
+            store
+                .save_route(
+                    Route {
+                        id: RouteId::new(Uuid::new_v4()),
+                        title: title.into(),
+                        channels,
+                        agent: None,
+                    },
+                    1,
+                )
+                .await
+                .unwrap();
+        }
+        let service = ProductionService::new(
+            store.clone(),
+            WaktermCli::new(
+                directory.path().join("wakterm-unused"),
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            RealChannels::default(),
+            SupervisorHandle::default(),
+            Vec::new(),
+            directory.path().join("control.sock"),
+        );
+        let notice = |title: &str, id: u128| NotifyParams {
+            title: title.into(),
+            body: "Open https://auth.example/device and enter ABCD-1234\n".into(),
+            id: Some(Uuid::from_u128(id)),
+            from: Some("switcher".into()),
+        };
+
+        let posted = service
+            .handle_notify(Uuid::new_v4(), notice("switcher", 1))
+            .await;
+        assert!(posted.ok, "{posted:?}");
+        // The owner's topic, never the shared group, and no agent is involved.
+        let outbox = store.pending_outbox().await.unwrap();
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].kind, ChannelKind::Telegram);
+        assert_eq!(outbox[0].destination, "10");
+        assert_eq!(
+            outbox[0].body,
+            "[switcher] Open https://auth.example/device and enter ABCD-1234"
+        );
+        assert!(outbox[0].source_agent.is_none());
+
+        // A retry under the same ID posts nothing again.
+        let again = service
+            .handle_notify(Uuid::new_v4(), notice("switcher", 1))
+            .await;
+        assert_eq!(again.result.unwrap()["already_posted"], true);
+        assert_eq!(store.pending_outbox().await.unwrap().len(), 1);
+
+        let refused = service
+            .handle_notify(Uuid::new_v4(), notice("group-only", 2))
+            .await;
+        assert_eq!(refused.error.unwrap().code, "route_unavailable");
+        let missing = service
+            .handle_notify(Uuid::new_v4(), notice("nowhere", 3))
+            .await;
+        assert_eq!(missing.error.unwrap().code, "route_not_found");
+        drop(service);
         store.shutdown().await.unwrap();
     }
 
