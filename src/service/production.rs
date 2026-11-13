@@ -754,19 +754,107 @@ impl ProductionService {
                 .retry_busy_target(workflow.command.id, &live_route, now_ms())
                 .await
             {
-                Ok(_)
-                | Err(ServiceError::RouteUnavailable(_))
-                | Err(ServiceError::AdmissionFailed(
-                    WorkflowState::Failed | WorkflowState::Indeterminate,
-                ))
-                | Err(ServiceError::AdmissionRejected {
-                    state: WorkflowState::Failed | WorkflowState::Indeterminate,
-                    ..
-                }) => {}
+                Ok(_) | Err(ServiceError::RouteUnavailable(_)) => {}
+                Err(ServiceError::AdmissionFailed(
+                    state @ (WorkflowState::Failed | WorkflowState::Indeterminate),
+                )) => {
+                    self.tell_sender_queued_send_ended(&live, &workflow, state, "")
+                        .await?;
+                }
+                Err(ServiceError::AdmissionRejected {
+                    state: state @ (WorkflowState::Failed | WorkflowState::Indeterminate),
+                    status,
+                    detail,
+                }) => {
+                    let detail = format!("{status:?}: {detail}");
+                    self.tell_sender_queued_send_ended(&live, &workflow, state, &detail)
+                        .await?;
+                }
                 Err(error) => return Err(error.to_string()),
             }
         }
         Ok(attempted)
+    }
+
+    /// Tells the agent that sent a queued message that it was not delivered.
+    /// Its acknowledgement said the message was queued, and the failure is
+    /// otherwise posted only in the target's channel, which the sender does
+    /// not read. A sender outside Wakterm, or one no longer running, is not
+    /// told.
+    async fn tell_sender_queued_send_ended(
+        &self,
+        live: &LiveRouteSnapshot,
+        queued: &crate::store::StoredWorkflow,
+        state: WorkflowState,
+        detail: &str,
+    ) -> Result<(), String> {
+        if queued.workflow.observed_source.harness == "external" {
+            return Ok(());
+        }
+        let routes = (
+            self.store
+                .get_route(queued.workflow.target_route_id)
+                .await
+                .map_err(error_string)?,
+            self.store
+                .get_route(queued.workflow.source_route_id)
+                .await
+                .map_err(error_string)?,
+        );
+        let (Some(target), Some(sender)) = routes else {
+            return Ok(());
+        };
+        let Some(sender_binding) =
+            resolve_live(live, &sender, Some(&queued.workflow.observed_source))?
+        else {
+            return Ok(());
+        };
+        let outcome = if state == WorkflowState::Failed {
+            format!(
+                "was not delivered: {detail}. Nothing was typed into {}; send it again once that is fixed.",
+                queued.command.target
+            )
+        } else {
+            format!(
+                "may not have been delivered{}{detail}. Check {} before sending it again.",
+                if detail.is_empty() { "" } else { ": " },
+                queued.command.target
+            )
+        };
+        let command = SendCommand {
+            id: WorkflowId::new(Uuid::new_v5(
+                &queued.command.id.as_uuid(),
+                b"queued-send-ended",
+            )),
+            source: queued.command.target.clone(),
+            target: queued.command.source.clone(),
+            message: format!(
+                "[Panetone] Your queued message {} to {} (\"{}\") {outcome}",
+                queued.command.id,
+                queued.command.target,
+                crate::service::offline::request_summary(&queued.command.message)
+            ),
+            return_final: false,
+            steer: true,
+            reply: false,
+            timeout_ms: 0,
+        };
+        match self
+            .workflows
+            .submit(
+                command,
+                &target.with_agent(queued.workflow.observed_target.clone()),
+                &sender.with_agent(sender_binding),
+                now_ms(),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                tracing::warn!(error = %error, request = %queued.command.id, "the sender of a failed queued message was not told");
+                Ok(())
+            }
+        }
     }
 
     pub async fn terminal_once(&self) -> Result<usize, String> {
@@ -5359,9 +5447,9 @@ operation="$*"
 if [[ "$operation" == *"agent capabilities"* ]]; then
   printf '%s\n' '{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}'
 elif [[ "$operation" == *"agent catalog"* ]]; then
-  printf '%s\n' '{"schema":"wakterm.agent-api.v1","as_of_event_sequence":10,"agents":[{"agent_id":"agent-failure","incarnation_id":"inc-failure","pane_id":11,"name":"failure","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-27T00:00:00Z"},{"agent_id":"agent-success","incarnation_id":"inc-success","pane_id":12,"name":"success","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-27T00:00:00Z"}]}'
+  printf '%s\n' '{"schema":"wakterm.agent-api.v1","as_of_event_sequence":10,"agents":[{"agent_id":"agent-failure","incarnation_id":"inc-failure","pane_id":11,"name":"failure","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-27T00:00:00Z"},{"agent_id":"agent-success","incarnation_id":"inc-success","pane_id":12,"name":"success","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-27T00:00:00Z"},{"agent_id":"agent-source","incarnation_id":"inc-source","pane_id":1,"name":"source","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-27T00:00:00Z"}]}'
 elif [[ "$operation" == *"list --format json"* ]]; then
-  printf '%s\n' '[{"pane_id":11,"tab_id":11,"window_id":1,"effective_title":"failure"},{"pane_id":12,"tab_id":12,"window_id":1,"effective_title":"success"}]'
+  printf '%s\n' '[{"pane_id":11,"tab_id":11,"window_id":1,"effective_title":"failure"},{"pane_id":12,"tab_id":12,"window_id":1,"effective_title":"success"},{"pane_id":1,"tab_id":1,"window_id":1,"effective_title":"source"}]'
 else
   echo "unexpected fake invocation: $operation" >&2
   exit 9
@@ -5403,6 +5491,7 @@ fi
         let failed_target = target(901, "failure", 11);
         let submitted_target = target(902, "success", 12);
         let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        store.save_route(source.clone(), 1).await.unwrap();
         store.save_route(failed_target.clone(), 1).await.unwrap();
         store.save_route(submitted_target.clone(), 1).await.unwrap();
         let workflows = Arc::new(OfflineService::new(
@@ -5504,9 +5593,24 @@ fi
             WorkflowState::Completed
         );
         let channel_calls = workflows.channels().calls();
-        assert_eq!(channel_calls.len(), 8);
-        assert!(channel_calls[6].body.starts_with("[delivery-failed]"));
-        assert!(channel_calls[7].body.starts_with("[submitted]"));
+        assert!(
+            channel_calls
+                .iter()
+                .any(|call| call.body.starts_with("[delivery-failed]"))
+        );
+        // The sender, told only that its message was queued, hears that it
+        // failed, since the failure is posted in the target's channel.
+        let told = workflows
+            .wakterm()
+            .calls()
+            .into_iter()
+            .filter(|call| call.binding.agent_id == "agent-source")
+            .collect::<Vec<_>>();
+        assert_eq!(told.len(), 1);
+        assert!(told[0].prompt.contains(&format!(
+            "[Panetone] Your queued message {failed_id} to failure (\"request 903\") was not delivered: ObserverFailure:"
+        )));
+        assert!(told[0].prompt.contains("Nothing was typed into failure"));
         assert_eq!(store.status().await.unwrap().awaiting_target_idle, 1);
         drop(service);
         drop(workflows);
