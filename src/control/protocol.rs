@@ -15,6 +15,17 @@ pub struct ControlRequest {
     pub params: Value,
 }
 
+/// A page of the posts Panetone made to the owner's own channels.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FeedParams {
+    /// The feed position to read after. Omitted, the page is empty and its
+    /// `next` is the latest position, where a new reader starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
 /// A notice a local service posts to a route's private channel, the owner's
 /// Telegram topic or Signal chat, without an agent turn.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

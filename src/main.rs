@@ -10,8 +10,9 @@ use panetone::channels::{
     TelegramPoller,
 };
 use panetone::control::{
-    CONTROL_SCHEMA, ControlRequest, ControlServer, NotifyParams, OutputDispositionParams,
-    RouteEnsureParams, RouteInspectParams, SendParams, SourceAgent, request,
+    CONTROL_SCHEMA, ControlRequest, ControlServer, FeedParams, NotifyParams,
+    OutputDispositionParams, RouteEnsureParams, RouteInspectParams, SendParams, SourceAgent,
+    request,
 };
 use panetone::service::{
     ApprovalTapError, FormUpdate, InboundIngestor, ProductionService, SignalReceiver,
@@ -41,6 +42,9 @@ enum Command {
     Cancel(CancelArgs),
     /// Post a service's notice to a route's private channel, without an agent.
     Notify(NotifyArgs),
+    /// Follow the posts Panetone makes to the owner's own channels, one JSON
+    /// line each.
+    Watch(WatchArgs),
     /// Chat in a room: a route whose agents and people all see every message.
     Chat(ChatArgs),
     /// Inspect or establish durable workspace routes.
@@ -196,6 +200,17 @@ struct NotifyArgs {
 }
 
 #[derive(Args)]
+struct WatchArgs {
+    /// Resume after this feed position, the `seq` of the last line read; 0
+    /// reads every post ever made. Omitted, only posts made from now on are
+    /// printed.
+    #[arg(long)]
+    after: Option<i64>,
+    #[command(flatten)]
+    control: ControlSocketArgs,
+}
+
+#[derive(Args)]
 struct StatusArgs {
     #[command(flatten)]
     control: ControlSocketArgs,
@@ -339,6 +354,7 @@ async fn main() -> Result<()> {
         Command::Status(args) => run_status(args).await,
         Command::Cancel(args) => run_cancel(args).await,
         Command::Notify(args) => run_notify(args).await,
+        Command::Watch(args) => run_watch(args).await,
         Command::Chat(args) => {
             let name = args.name.unwrap_or_else(|| {
                 let login = std::env::var("USER").unwrap_or_else(|_| "you".into());
@@ -474,7 +490,13 @@ async fn run_production_daemon(args: ProductionArgs) -> Result<()> {
             capabilities.capabilities.iter().cloned().collect(),
             args.socket.clone(),
         )
-        .with_chat_archives(archives.clone()),
+        .with_chat_archives(archives.clone())
+        .with_feed_directory(
+            args.database
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join("feed-attachments"),
+        ),
     );
     let created_routes = handler
         .reconcile_live_routes(&live_routes)
@@ -1219,6 +1241,49 @@ async fn run_notify(args: NotifyArgs) -> Result<()> {
         Ok(())
     } else {
         bail!("the notice was rejected")
+    }
+}
+
+/// Prints each post of the feed as one JSON line, as Panetone makes them, and
+/// keeps going across daemon restarts. A reader saves each line's `seq` and
+/// passes the last one to `--after` when it starts again.
+async fn run_watch(args: WatchArgs) -> Result<()> {
+    use std::io::Write;
+    let socket = control_socket(args.control.socket)?;
+    let mut after = args.after;
+    let mut stdout = std::io::stdout().lock();
+    loop {
+        let page = request(
+            &socket,
+            &ControlRequest {
+                schema: CONTROL_SCHEMA.into(),
+                id: Uuid::new_v4(),
+                method: "feed".into(),
+                params: serde_json::to_value(FeedParams { after, limit: None })?,
+            },
+        )
+        .await;
+        let result = match page {
+            Ok(response) if response.ok => response.result.unwrap_or_default(),
+            Ok(response) => bail!("the feed was refused: {:?}", response.error),
+            // The daemon is restarting; the position read so far is kept.
+            Err(error) => {
+                eprintln!("panetone watch: {error}; retrying");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        let items = result["items"].as_array().cloned().unwrap_or_default();
+        for item in &items {
+            writeln!(stdout, "{item}")?;
+        }
+        stdout.flush()?;
+        let next = result["next"].as_i64();
+        let moved = next.is_some() && next != after;
+        after = next.or(after);
+        if !moved || items.is_empty() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     }
 }
 

@@ -4,7 +4,7 @@ mod server;
 
 pub use client::{ControlClientError, request};
 pub use protocol::{
-    CONTROL_SCHEMA, ControlError, ControlRequest, ControlResponse, NotifyParams,
+    CONTROL_SCHEMA, ControlError, ControlRequest, ControlResponse, FeedParams, NotifyParams,
     OutputDispositionParams, RouteEnsureParams, RouteInspectParams, SendParams, SourceAgent,
     error_response, success_response,
 };

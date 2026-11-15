@@ -958,6 +958,45 @@ impl StoreHandle {
         .await
     }
 
+    /// Outbox posts in the order they were queued, after a feed position,
+    /// with each post's position and queue time, and the latest position. A
+    /// position is the row's SQLite rowid, which only grows since posts are
+    /// never deleted.
+    pub async fn outbox_feed(
+        &self,
+        after: i64,
+        limit: u32,
+    ) -> StoreResult<(Vec<(i64, OutboxItem, i64)>, i64)> {
+        self.run(move |connection| {
+            let latest =
+                connection.query_row("SELECT coalesce(max(rowid), 0) FROM outbox", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+            let mut statement = connection.prepare(
+                "SELECT rowid, record_json, created_at_ms FROM outbox
+                 WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+            )?;
+            let rows = statement.query_map(params![after, limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            let mut posts = Vec::new();
+            for row in rows {
+                let (position, json, created_at_ms) = row?;
+                posts.push((
+                    position,
+                    serde_json::from_str::<OutboxItem>(&json)?,
+                    created_at_ms,
+                ));
+            }
+            Ok((posts, latest))
+        })
+        .await
+    }
+
     /// Delivered Telegram posts since a time that still carry approval
     /// buttons.
     pub async fn approval_posts_with_buttons(&self, since_ms: i64) -> StoreResult<Vec<OutboxItem>> {

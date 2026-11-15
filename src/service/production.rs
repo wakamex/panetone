@@ -11,7 +11,7 @@ use crate::archive::{ArchiveEntry, ChatArchives};
 use crate::channels::{ChannelDeliveryError, RealChannels, TelegramApprovalResponse};
 use crate::channels::{InboundMessage, TelegramFormTap};
 use crate::control::{
-    CONTROL_SCHEMA, ControlHandler, ControlRequest, ControlResponse, NotifyParams,
+    CONTROL_SCHEMA, ControlHandler, ControlRequest, ControlResponse, FeedParams, NotifyParams,
     OutputDispositionParams, RouteEnsureParams, RouteInspectParams, SendParams, error_response,
     success_response,
 };
@@ -71,6 +71,9 @@ pub struct ProductionService {
     /// restored agent is briefly unregistered or unobserved.
     health_candidates: tokio::sync::Mutex<BTreeSet<String>>,
     archives: ChatArchives,
+    /// Where the feed writes the files attached to posts, so a reader gets
+    /// paths. Without one, the feed lists attachments without paths.
+    feed_directory: Option<PathBuf>,
 }
 
 /// A question form message to update after an answer.
@@ -461,11 +464,17 @@ impl ProductionService {
             route_changes: tokio::sync::Mutex::new(()),
             health_candidates: tokio::sync::Mutex::new(BTreeSet::new()),
             archives: ChatArchives::default(),
+            feed_directory: None,
         }
     }
 
     pub fn with_chat_archives(mut self, archives: ChatArchives) -> Self {
         self.archives = archives;
+        self
+    }
+
+    pub fn with_feed_directory(mut self, directory: PathBuf) -> Self {
+        self.feed_directory = Some(directory);
         self
     }
 
@@ -2676,6 +2685,105 @@ impl ProductionService {
         success_response(id, json!({"routes": listed}))
     }
 
+    /// A page of the posts Panetone made to channels only the owner reads, in
+    /// the order they were queued, for a reader such as a phone app that
+    /// shows what Telegram shows. Posts to groups other people read are
+    /// passed over, and `next` moves past them too.
+    async fn handle_feed(&self, id: Uuid, params: FeedParams) -> ControlResponse {
+        let limit = params.limit.unwrap_or(100).clamp(1, 500);
+        let (posts, latest) = match self
+            .store
+            .outbox_feed(params.after.unwrap_or(i64::MAX), limit)
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => return internal(id, error),
+        };
+        let Some(after) = params.after else {
+            return success_response(id, json!({"items": [], "next": latest}));
+        };
+        let routes = match self.store.list_routes().await {
+            Ok(routes) => routes,
+            Err(error) => return internal(id, error),
+        };
+        let mut next = after;
+        let mut items = Vec::new();
+        for (position, post, queued_at_ms) in posts {
+            next = position;
+            if routes
+                .iter()
+                .any(|route| route.is_shared(post.kind, &post.destination))
+            {
+                continue;
+            }
+            let route = post
+                .route_id
+                .and_then(|route_id| routes.iter().find(|route| route.id == route_id))
+                .or_else(|| {
+                    routes.iter().find(|route| {
+                        route
+                            .channels
+                            .iter()
+                            .any(|binding| binding.serves(post.kind, &post.destination))
+                    })
+                });
+            let attachments = match self.feed_attachments(&post) {
+                Ok(attachments) => attachments,
+                Err(error) => return internal(id, error),
+            };
+            items.push(json!({
+                "seq": position,
+                "id": post.id,
+                "route": route.map(|route| route.title.clone()),
+                "channel": post.kind,
+                "from": post.source_agent.as_ref().map(|agent| json!({
+                    "agent_id": agent.agent_id,
+                    "harness": agent.harness,
+                })),
+                "text": post.body,
+                "attachments": attachments,
+                "actions": post.actions,
+                "time_ms": queued_at_ms,
+            }));
+        }
+        success_response(id, json!({"items": items, "next": next}))
+    }
+
+    /// Writes a post's attachments under the feed directory, one folder per
+    /// file content, and lists them with their paths.
+    fn feed_attachments(&self, post: &OutboxItem) -> Result<Vec<serde_json::Value>, String> {
+        post.attachments
+            .iter()
+            .map(|attachment| {
+                let path = match &self.feed_directory {
+                    Some(directory) => {
+                        let name = Path::new(&attachment.file_name)
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "attachment".into());
+                        let path = directory.join(&attachment.sha256).join(name);
+                        if !path.exists() {
+                            let bytes = attachment.bytes().map_err(error_string)?;
+                            std::fs::create_dir_all(
+                                path.parent().expect("an attachment path has a folder"),
+                            )
+                            .map_err(error_string)?;
+                            std::fs::write(&path, bytes).map_err(error_string)?;
+                        }
+                        Some(path)
+                    }
+                    None => None,
+                };
+                Ok(json!({
+                    "path": path,
+                    "name": attachment.file_name,
+                    "media_type": attachment.media_type,
+                    "size": attachment.size,
+                }))
+            })
+            .collect()
+    }
+
     /// Posts a local service's notice to a route's private channel through the
     /// outbox, so it reaches the owner without an agent turn and no caller
     /// handles channel credentials.
@@ -3154,6 +3262,10 @@ impl ControlHandler for ProductionService {
                 },
                 "send" => match serde_json::from_value::<SendParams>(request.params.clone()) {
                     Ok(params) => self.handle_send(request, params).await,
+                    Err(error) => invalid(request.id, error),
+                },
+                "feed" => match serde_json::from_value::<FeedParams>(request.params) {
+                    Ok(params) => self.handle_feed(request.id, params).await,
                     Err(error) => invalid(request.id, error),
                 },
                 "notify" => match serde_json::from_value::<NotifyParams>(request.params) {
@@ -4760,6 +4872,7 @@ fi
             route_changes: tokio::sync::Mutex::new(()),
             health_candidates: tokio::sync::Mutex::new(BTreeSet::new()),
             archives: ChatArchives::default(),
+            feed_directory: None,
         };
         let event = |sequence: u64, kind: &str, turn: &str, extra: serde_json::Value| {
             let mut value = serde_json::json!({
@@ -4891,6 +5004,133 @@ fi
         assert_eq!(service.replies_once().await.unwrap(), 0);
         drop(service);
         drop(workflows);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_feed_lists_posts_to_the_owners_channels_and_resumes_after_a_position() {
+        use base64::Engine;
+        let directory = tempdir().unwrap();
+        let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        let route = Route {
+            id: RouteId::new(Uuid::new_v4()),
+            title: "shamans".into(),
+            channels: vec![
+                ChannelBinding::Telegram { topic_id: 10 },
+                ChannelBinding::TelegramGroup {
+                    chat_id: -2001,
+                    allow_members: true,
+                },
+            ],
+            agent: None,
+        };
+        store.save_route(route.clone(), 1).await.unwrap();
+        let service = ProductionService::new(
+            store.clone(),
+            WaktermCli::new(
+                directory.path().join("wakterm-unused"),
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            RealChannels::default(),
+            SupervisorHandle::default(),
+            Vec::new(),
+            directory.path().join("control.sock"),
+        )
+        .with_feed_directory(directory.path().join("feed"));
+        let post =
+            |id: u128, route_id: Option<RouteId>, destination: &str, body: &str| OutboxItem {
+                id: EffectId::new(Uuid::from_u128(id)),
+                route_id,
+                sender_harness: Some("claude".into()),
+                source_agent: Some(AgentBinding {
+                    agent_id: "agent-1".into(),
+                    incarnation_id: "inc-1".into(),
+                    harness: "claude".into(),
+                    pane_id: Some(1),
+                }),
+                kind: ChannelKind::Telegram,
+                destination: destination.into(),
+                body: body.into(),
+                attachments: Vec::new(),
+                actions: Vec::new(),
+                state: OutboxState::Pending,
+                attempts: 0,
+                last_error: None,
+                external_receipt: None,
+                uncertain_attempts: 0,
+            };
+        let feed = |after: Option<i64>| {
+            let service = &service;
+            async move {
+                let response = service
+                    .handle_feed(Uuid::new_v4(), FeedParams { after, limit: None })
+                    .await;
+                assert!(response.ok, "{response:?}");
+                response.result.unwrap()
+            }
+        };
+
+        // A new reader starts after everything already posted.
+        store
+            .enqueue_outbox(None, post(1, Some(route.id), "10", "before the reader"), 1)
+            .await
+            .unwrap();
+        let start = feed(None).await;
+        assert_eq!(start["items"], json!([]));
+        let start = start["next"].as_i64().unwrap();
+
+        let mut with_file = post(2, Some(route.id), "10", "the chart");
+        let bytes = b"\x89PNG fake";
+        with_file
+            .attachments
+            .push(crate::domain::ChannelAttachment {
+                file_name: "../chart.png".into(),
+                media_type: "image/png".into(),
+                size: bytes.len() as u64,
+                sha256: "abc123".into(),
+                data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            });
+        store.enqueue_outbox(None, with_file, 2).await.unwrap();
+        // Posts to a group other people read are not the owner's own.
+        store
+            .enqueue_outbox(
+                None,
+                post(3, Some(route.id), "chat:-2001", "to the group"),
+                3,
+            )
+            .await
+            .unwrap();
+        // A notice without a route is matched to it by its channel.
+        store
+            .enqueue_outbox(None, post(4, None, "10", "[waiting] a notice"), 4)
+            .await
+            .unwrap();
+
+        let page = feed(Some(start)).await;
+        let items = page["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["text"], "the chart");
+        assert_eq!(items[0]["route"], "shamans");
+        assert_eq!(items[0]["from"]["harness"], "claude");
+        assert_eq!(items[0]["time_ms"], 2);
+        let path = items[0]["attachments"][0]["path"].as_str().unwrap();
+        assert_eq!(
+            Path::new(path),
+            directory.path().join("feed/abc123/chart.png")
+        );
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        assert_eq!(items[1]["text"], "[waiting] a notice");
+        assert_eq!(items[1]["route"], "shamans");
+        assert!(items[0]["seq"].as_i64() < items[1]["seq"].as_i64());
+
+        // Resuming from the last position read repeats nothing.
+        let next = page["next"].as_i64().unwrap();
+        assert_eq!(next, items[1]["seq"].as_i64().unwrap());
+        assert_eq!(feed(Some(next)).await["items"], json!([]));
+        // Position 0 replays every post to the owner's channels.
+        assert_eq!(feed(Some(0)).await["items"].as_array().unwrap().len(), 3);
+        drop(service);
         store.shutdown().await.unwrap();
     }
 
@@ -5559,6 +5799,7 @@ fi
             route_changes: tokio::sync::Mutex::new(()),
             health_candidates: tokio::sync::Mutex::new(BTreeSet::new()),
             archives: ChatArchives::default(),
+            feed_directory: None,
         };
 
         assert_eq!(service.busy_once().await.unwrap(), 2);
