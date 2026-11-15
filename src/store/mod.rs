@@ -240,6 +240,17 @@ pub struct StoredApproval {
     pub route_id: RouteId,
 }
 
+/// One outbox post as the feed reads it.
+#[derive(Clone, Debug)]
+pub struct FeedPost {
+    /// The post's rowid, its position in the feed.
+    pub position: i64,
+    pub post: OutboxItem,
+    pub queued_at_ms: i64,
+    /// The request a post about a send's delivery belongs to.
+    pub request_id: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct StoreHandle {
     sender: mpsc::Sender<Command>,
@@ -962,18 +973,14 @@ impl StoreHandle {
     /// with each post's position and queue time, and the latest position. A
     /// position is the row's SQLite rowid, which only grows since posts are
     /// never deleted.
-    pub async fn outbox_feed(
-        &self,
-        after: i64,
-        limit: u32,
-    ) -> StoreResult<(Vec<(i64, OutboxItem, i64)>, i64)> {
+    pub async fn outbox_feed(&self, after: i64, limit: u32) -> StoreResult<(Vec<FeedPost>, i64)> {
         self.run(move |connection| {
             let latest =
                 connection.query_row("SELECT coalesce(max(rowid), 0) FROM outbox", [], |row| {
                     row.get::<_, i64>(0)
                 })?;
             let mut statement = connection.prepare(
-                "SELECT rowid, record_json, created_at_ms FROM outbox
+                "SELECT rowid, record_json, created_at_ms, request_id FROM outbox
                  WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
             )?;
             let rows = statement.query_map(params![after, limit], |row| {
@@ -981,16 +988,18 @@ impl StoreHandle {
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             })?;
             let mut posts = Vec::new();
             for row in rows {
-                let (position, json, created_at_ms) = row?;
-                posts.push((
+                let (position, json, queued_at_ms, request_id) = row?;
+                posts.push(FeedPost {
                     position,
-                    serde_json::from_str::<OutboxItem>(&json)?,
-                    created_at_ms,
-                ));
+                    post: serde_json::from_str(&json)?,
+                    queued_at_ms,
+                    request_id,
+                });
             }
             Ok((posts, latest))
         })

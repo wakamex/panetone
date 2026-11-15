@@ -2708,7 +2708,13 @@ impl ProductionService {
         };
         let mut next = after;
         let mut items = Vec::new();
-        for (position, post, queued_at_ms) in posts {
+        for crate::store::FeedPost {
+            position,
+            post,
+            queued_at_ms,
+            request_id,
+        } in posts
+        {
             next = position;
             if routes
                 .iter()
@@ -2731,8 +2737,25 @@ impl ProductionService {
                 Ok(attachments) => attachments,
                 Err(error) => return internal(id, error),
             };
+            // A post about a send's delivery carries its request in the
+            // outbox row as well as in its header, so an agent's text that
+            // looks like one is still the agent's.
+            let status = crate::service::offline::request_status(&post.body)
+                .filter(|(_, id)| request_id.as_deref() == Some(id.to_string().as_str()));
+            let kind = if status.is_some() {
+                "request"
+            } else if post.source_agent.is_none() {
+                "notice"
+            } else if !post.actions.is_empty() {
+                "question"
+            } else {
+                "agent"
+            };
             items.push(json!({
                 "seq": position,
+                "kind": kind,
+                "request_id": status.map(|(_, id)| id),
+                "state": status.map(|(state, _)| state),
                 "id": post.id,
                 "route": route.map(|route| route.title.clone()),
                 "channel": post.kind,
@@ -5101,15 +5124,50 @@ fi
             )
             .await
             .unwrap();
-        // A notice without a route is matched to it by its channel.
+        // Panetone's own notice has no agent, and one without a route is
+        // matched to it by its channel.
+        let mut notice = post(4, None, "10", "[waiting] a notice");
+        notice.source_agent = None;
+        store.enqueue_outbox(None, notice, 4).await.unwrap();
+
+        // A send's delivery receipt, a question with buttons, and an agent's
+        // text that merely looks like a receipt.
+        let request = WorkflowId::new(Uuid::from_u128(77));
+        let receipt_body = format!(
+            "[queued] w3sim -> shamans\nRequest ID: {request}\ntarget is busy; delivery is durably queued"
+        );
         store
-            .enqueue_outbox(None, post(4, None, "10", "[waiting] a notice"), 4)
+            .enqueue_outbox(
+                Some(request),
+                post(5, Some(route.id), "10", &receipt_body),
+                5,
+            )
+            .await
+            .unwrap();
+        let mut question = post(6, Some(route.id), "10", "Input needed");
+        question.actions.push(OutboxAction {
+            id: "wakap:0123456789abcdef01234567:allow_once".into(),
+            label: "Allow once".into(),
+        });
+        store.enqueue_outbox(None, question, 6).await.unwrap();
+        store
+            .enqueue_outbox(None, post(7, Some(route.id), "10", &receipt_body), 7)
             .await
             .unwrap();
 
         let page = feed(Some(start)).await;
         let items = page["items"].as_array().unwrap();
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 5);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["agent", "notice", "request", "question", "agent"]
+        );
+        assert_eq!(items[2]["request_id"], request.to_string());
+        assert_eq!(items[2]["state"], "queued");
+        assert_eq!(items[4]["request_id"], json!(null));
         assert_eq!(items[0]["text"], "the chart");
         assert_eq!(items[0]["route"], "shamans");
         assert_eq!(items[0]["from"]["harness"], "claude");
@@ -5126,10 +5184,10 @@ fi
 
         // Resuming from the last position read repeats nothing.
         let next = page["next"].as_i64().unwrap();
-        assert_eq!(next, items[1]["seq"].as_i64().unwrap());
+        assert_eq!(next, items[4]["seq"].as_i64().unwrap());
         assert_eq!(feed(Some(next)).await["items"], json!([]));
         // Position 0 replays every post to the owner's channels.
-        assert_eq!(feed(Some(0)).await["items"].as_array().unwrap().len(), 3);
+        assert_eq!(feed(Some(0)).await["items"].as_array().unwrap().len(), 6);
         drop(service);
         store.shutdown().await.unwrap();
     }

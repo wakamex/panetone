@@ -92,6 +92,27 @@ impl ServiceAck {
 
 /// The first line of a request, shortened, to remind both sides what a
 /// reply answers.
+/// The first two lines of a post about a request's delivery, such as
+/// `[queued] w3sim -> w3carbon` and `Request ID: ...`.
+fn request_status_header(state: &str, command: &SendCommand) -> String {
+    format!(
+        "[{state}] {} -> {}\nRequest ID: {}",
+        command.source, command.target, command.id
+    )
+}
+
+/// The state and request ID of a post about a request's delivery, read from
+/// the header [`request_status_header`] writes.
+pub(crate) fn request_status(body: &str) -> Option<(&str, uuid::Uuid)> {
+    let mut lines = body.lines();
+    let (state, route) = lines.next()?.strip_prefix('[')?.split_once("] ")?;
+    let request_id = lines.next()?.strip_prefix("Request ID: ")?;
+    if state.is_empty() || state.contains(' ') || !route.contains(" -> ") {
+        return None;
+    }
+    Some((state, uuid::Uuid::parse_str(request_id).ok()?))
+}
+
 pub fn request_summary(message: &str) -> String {
     const MAX_CHARS: usize = 120;
     let line = message
@@ -496,10 +517,8 @@ impl OfflineService {
             kind: audit_kind,
             destination: audit_destination,
             body: format!(
-                "[pending] {} -> {}\nRequest ID: {}\n\n{}",
-                record.command.source,
-                record.command.target,
-                record.command.id,
+                "{}\n\n{}",
+                request_status_header("pending", &record.command),
                 record.command.message
             ),
             attachments: Vec::new(),
@@ -905,8 +924,8 @@ impl OfflineService {
             kind,
             destination,
             body: format!(
-                "[{purpose}] {} -> {}\nRequest ID: {}\n{detail}",
-                record.command.source, record.command.target, record.command.id
+                "{}\n{detail}",
+                request_status_header(purpose, &record.command)
             ),
             attachments: Vec::new(),
             actions: Vec::new(),
