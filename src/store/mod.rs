@@ -2103,6 +2103,9 @@ fn ingest_endchat_messages(
     // replies can be matched with its start, as Wakterm events are.
     let turn_key = format!("endchat_turn:{}", route_agents[0].agent.agent_id);
     let mut turn = get_metadata(&transaction, &turn_key)?.unwrap_or_default();
+    // Every profile numbers its log from 0, and an event ID must name one
+    // event across all agents, so it carries the profile's agent ID.
+    let event_id = |name: String| format!("{}#{name}", route_agents[0].agent.agent_id);
     for entry in messages {
         count += 1;
         let mut fields = serde_json::Map::new();
@@ -2113,18 +2116,18 @@ fn ingest_endchat_messages(
                     "input_sha256".into(),
                     DeliveryProof::input_sha256(text).into(),
                 );
-                ("turn_started", format!("endchat-{i}"), date)
+                ("turn_started", event_id(format!("{i}")), date)
             }
             crate::endchat::Entry::Agent { i, text, date } => {
                 fields.insert("text".into(), text.clone().into());
-                ("assistant_message", format!("endchat-{i}"), date)
+                ("assistant_message", event_id(format!("{i}")), date)
             }
             crate::endchat::Entry::TurnEnd { end, ok, date } => {
                 fields.insert(
                     "outcome".into(),
                     if *ok { "completed" } else { "aborted" }.into(),
                 );
-                ("turn_final", format!("endchat-end-{end}"), date)
+                ("turn_final", event_id(format!("end-{end}")), date)
             }
         };
         fields.insert("observed_at".into(), date.clone().into());

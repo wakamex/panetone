@@ -1729,3 +1729,54 @@ async fn output_observed_long_before_ingest_is_a_replay_and_is_not_posted() {
     assert_eq!(posts[0].body, "a new answer");
     store.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn two_endchat_profiles_whose_logs_both_start_at_zero_are_both_recorded() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+    for (n, profile) in ["/home/x/.endchat/debate", "/home/x/.endchat/shamans"]
+        .into_iter()
+        .enumerate()
+    {
+        let route = panetone::domain::Route {
+            id: panetone::domain::RouteId::new(Uuid::from_u128(700 + n as u128)),
+            title: format!("route-{n}"),
+            channels: vec![panetone::domain::ChannelBinding::Telegram {
+                topic_id: 70 + n as i64,
+            }],
+            agent: None,
+        };
+        store.save_route(route.clone(), 1).await.unwrap();
+        let entries = vec![
+            panetone::endchat::Entry::User {
+                i: 0,
+                text: "hi".into(),
+                date: "2026-11-15T23:00:00Z".into(),
+            },
+            panetone::endchat::Entry::Agent {
+                i: 1,
+                text: "hello".into(),
+                date: "2026-11-15T23:00:01Z".into(),
+            },
+            panetone::endchat::Entry::TurnEnd {
+                end: 2,
+                ok: true,
+                date: "2026-11-15T23:00:01Z".into(),
+            },
+        ];
+        let outcome = store
+            .ingest_endchat_messages(
+                route.id,
+                panetone::endchat::binding(profile),
+                entries,
+                format!("endchat_log_cursor:{}", route.id),
+                "{}".into(),
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.recorded, 3, "profile {profile}");
+    }
+    store.shutdown().await.unwrap();
+}
