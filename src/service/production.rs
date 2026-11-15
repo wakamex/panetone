@@ -2017,6 +2017,7 @@ impl ProductionService {
             last_error: None,
             external_receipt: None,
             uncertain_attempts: 0,
+            part: None,
         };
         for chunk in crate::domain::chunk_outbox(notice) {
             self.store
@@ -2142,6 +2143,7 @@ impl ProductionService {
             last_error: None,
             external_receipt: None,
             uncertain_attempts: 0,
+            part: None,
         };
         self.store
             .enqueue_outbox(None, notice, now_ms)
@@ -2446,6 +2448,7 @@ impl ProductionService {
                                 last_error: None,
                                 external_receipt: None,
                                 uncertain_attempts: 0,
+                                part: None,
                             },
                             now_ms(),
                         )
@@ -2710,12 +2713,45 @@ impl ProductionService {
         let mut items = Vec::new();
         for crate::store::FeedPost {
             position,
-            post,
-            queued_at_ms,
+            mut post,
+            mut queued_at_ms,
             request_id,
         } in posts
         {
             next = position;
+            // A message split to fit a channel's limits is listed once,
+            // whole, at its last part, when its earlier parts all exist.
+            if let Some(part) = post.part {
+                if part.index + 1 != part.count {
+                    continue;
+                }
+                let mut pieces = Vec::with_capacity(part.count);
+                for index in 0..part.index {
+                    match self
+                        .store
+                        .get_outbox(EffectId::chunk(part.message, index))
+                        .await
+                    {
+                        Ok(Some(found)) => pieces.push(found),
+                        Ok(None) => break,
+                        Err(error) => return internal(id, error),
+                    }
+                }
+                if pieces.len() == part.index {
+                    pieces.push((post, queued_at_ms));
+                    let mut pieces = pieces.into_iter();
+                    let (mut whole, first_queued_at_ms) =
+                        pieces.next().expect("a split message has parts");
+                    for (piece, _) in pieces {
+                        whole.body.push_str(&piece.body);
+                        whole.attachments.extend(piece.attachments);
+                        whole.actions.extend(piece.actions);
+                    }
+                    whole.id = part.message;
+                    post = whole;
+                    queued_at_ms = first_queued_at_ms;
+                }
+            }
             if routes
                 .iter()
                 .any(|route| route.is_shared(post.kind, &post.destination))
@@ -2876,6 +2912,7 @@ impl ProductionService {
             last_error: None,
             external_receipt: None,
             uncertain_attempts: 0,
+            part: None,
         };
         for chunk in crate::domain::chunk_outbox(notice) {
             if let Err(error) = self.store.enqueue_outbox(None, chunk, now_ms()).await {
@@ -3691,6 +3728,7 @@ mod tests {
                     last_error: None,
                     external_receipt: None,
                     uncertain_attempts: 0,
+                    part: None,
                 },
                 1,
             )
@@ -5082,6 +5120,7 @@ fi
                 last_error: None,
                 external_receipt: None,
                 uncertain_attempts: 0,
+                part: None,
             };
         let feed = |after: Option<i64>| {
             let service = &service;
@@ -5188,6 +5227,35 @@ fi
         assert_eq!(feed(Some(next)).await["items"], json!([]));
         // Position 0 replays every post to the owner's channels.
         assert_eq!(feed(Some(0)).await["items"].as_array().unwrap().len(), 6);
+
+        // A message split into parts for Telegram is one line, whole, at its
+        // last part, even with another post queued between its parts.
+        let long = "word ".repeat(1_000);
+        let parts = crate::domain::chunk_outbox(post(8, Some(route.id), "10", &long));
+        assert_eq!(parts.len(), 2);
+        store
+            .enqueue_outbox(None, parts[0].clone(), 8)
+            .await
+            .unwrap();
+        store
+            .enqueue_outbox(None, post(9, Some(route.id), "10", "between"), 9)
+            .await
+            .unwrap();
+        store
+            .enqueue_outbox(None, parts[1].clone(), 10)
+            .await
+            .unwrap();
+        let page = feed(Some(next)).await;
+        let items = page["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["text"], "between");
+        assert_eq!(items[1]["text"], long.as_str());
+        assert_eq!(items[1]["id"], Uuid::from_u128(8).to_string());
+        assert_eq!(items[1]["time_ms"], 8);
+        assert!(items[0]["seq"].as_i64() < items[1]["seq"].as_i64());
+        // Resuming after the post between the parts still gives it whole.
+        let resumed = feed(items[0]["seq"].as_i64()).await;
+        assert_eq!(resumed["items"][0]["text"], long.as_str());
         drop(service);
         store.shutdown().await.unwrap();
     }

@@ -528,6 +528,7 @@ impl OfflineService {
             last_error: None,
             external_receipt: None,
             uncertain_attempts: 0,
+            part: None,
         };
         if let Err(error) = self
             .deliver_channel_effect(
@@ -934,6 +935,7 @@ impl OfflineService {
             last_error: None,
             external_receipt: None,
             uncertain_attempts: 0,
+            part: None,
         };
         match self
             .deliver_channel_effect(record.command.id, item, now_ms, None, true)
@@ -1089,6 +1091,7 @@ impl OfflineService {
                 last_error: returned.mirror.last_error.clone(),
                 external_receipt: None,
                 uncertain_attempts: 0,
+                part: None,
             };
             returned.mirror.state = DeliveryState::Pending;
             returned.mirror.attempts += 1;

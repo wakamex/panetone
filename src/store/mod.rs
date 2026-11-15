@@ -454,6 +454,22 @@ impl StoreHandle {
             .await
     }
 
+    /// An outbox post by ID, with the time it was queued.
+    pub async fn get_outbox(&self, id: EffectId) -> StoreResult<Option<(OutboxItem, i64)>> {
+        self.run(move |connection| {
+            connection
+                .query_row(
+                    "SELECT record_json, created_at_ms FROM outbox WHERE effect_id = ?1",
+                    params![id.to_string()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?
+                .map(|(json, queued_at_ms)| Ok((serde_json::from_str(&json)?, queued_at_ms)))
+                .transpose()
+        })
+        .await
+    }
+
     pub async fn outbox_exists(&self, id: EffectId) -> StoreResult<bool> {
         self.run(move |connection| {
             Ok(connection
@@ -2044,6 +2060,7 @@ fn ingest_event(
             last_error: None,
             external_receipt: None,
             uncertain_attempts: 0,
+            part: None,
         };
         for chunk in crate::domain::chunk_outbox(item) {
             enqueue_outbox(transaction, None, &chunk, now_ms)?;

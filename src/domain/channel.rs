@@ -372,6 +372,20 @@ pub struct OutboxItem {
     /// message. A later attempt is labeled as a resend.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub uncertain_attempts: u32,
+    /// For one of the parts a message was split into to fit the channel's
+    /// limits, the message and the part's place in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<OutboxPart>,
+}
+
+/// Which part of a split message a post is.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OutboxPart {
+    /// The ID the whole message would have had.
+    pub message: EffectId,
+    /// From 0.
+    pub index: usize,
+    pub count: usize,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -403,12 +417,18 @@ pub fn chunk_outbox(mut item: OutboxItem) -> Vec<OutboxItem> {
             return vec![item];
         }
         let parent = item.id;
+        let count = chunks.len();
         return chunks
             .into_iter()
             .enumerate()
             .map(|(index, body)| {
                 item.id = EffectId::chunk(parent, index);
                 item.body = body;
+                item.part = Some(OutboxPart {
+                    message: parent,
+                    index,
+                    count,
+                });
                 if index > 0 {
                     item.attachments.clear();
                 }
@@ -422,12 +442,18 @@ pub fn chunk_outbox(mut item: OutboxItem) -> Vec<OutboxItem> {
             return vec![item];
         }
         let parent = item.id;
+        let count = chunks.len();
         return chunks
             .into_iter()
             .enumerate()
             .map(|(index, body)| {
                 item.id = EffectId::chunk(parent, index);
                 item.body = body;
+                item.part = Some(OutboxPart {
+                    message: parent,
+                    index,
+                    count,
+                });
                 if index > 0 {
                     item.actions.clear();
                 }
@@ -440,12 +466,18 @@ pub fn chunk_outbox(mut item: OutboxItem) -> Vec<OutboxItem> {
         return vec![item];
     }
     let parent = item.id;
+    let count = chunks.len();
     chunks
         .into_iter()
         .enumerate()
         .map(|(index, body)| {
             item.id = EffectId::chunk(parent, index);
             item.body = body;
+            item.part = Some(OutboxPart {
+                message: parent,
+                index,
+                count,
+            });
             item.clone()
         })
         .collect()
@@ -517,6 +549,7 @@ mod tests {
             last_error: None,
             external_receipt: None,
             uncertain_attempts: 0,
+            part: None,
         }
     }
 
