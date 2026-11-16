@@ -376,6 +376,20 @@ pub struct OutboxItem {
     /// limits, the message and the part's place in it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part: Option<OutboxPart>,
+    /// For a copy of a message the owner sent from a local client, the
+    /// message it copies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<OwnerPost>,
+}
+
+/// A post that copies the owner's own message into a channel, so the chat
+/// there shows what the owner said from another client.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OwnerPost {
+    /// The inbound message's ID, under which it is delivered to the agent.
+    pub request: EffectId,
+    /// The client it came from, such as gear.
+    pub via: String,
 }
 
 /// Which part of a split message a post is.
@@ -550,6 +564,7 @@ mod tests {
             external_receipt: None,
             uncertain_attempts: 0,
             part: None,
+            owner: None,
         }
     }
 

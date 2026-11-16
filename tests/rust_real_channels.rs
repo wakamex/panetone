@@ -131,6 +131,7 @@ fn item(kind: ChannelKind, destination: &str) -> OutboxItem {
         external_receipt: None,
         uncertain_attempts: 0,
         part: None,
+        owner: None,
     }
 }
 

@@ -12,8 +12,8 @@ use crate::channels::{ChannelDeliveryError, RealChannels, TelegramApprovalRespon
 use crate::channels::{InboundMessage, TelegramFormTap};
 use crate::control::{
     CONTROL_SCHEMA, ControlHandler, ControlRequest, ControlResponse, FeedParams, NotifyParams,
-    OutputDispositionParams, RouteEnsureParams, RouteInspectParams, SendParams, error_response,
-    success_response,
+    OutputDispositionParams, RouteEnsureParams, RouteInspectParams, SayParams, SendParams,
+    error_response, success_response,
 };
 use crate::domain::{
     AdmissionStatus, AgentBinding, ChannelBinding, ChannelKind, EffectId, OutboxAction, OutboxItem,
@@ -2018,6 +2018,7 @@ impl ProductionService {
             external_receipt: None,
             uncertain_attempts: 0,
             part: None,
+            owner: None,
         };
         for chunk in crate::domain::chunk_outbox(notice) {
             self.store
@@ -2144,6 +2145,7 @@ impl ProductionService {
             external_receipt: None,
             uncertain_attempts: 0,
             part: None,
+            owner: None,
         };
         self.store
             .enqueue_outbox(None, notice, now_ms)
@@ -2449,6 +2451,7 @@ impl ProductionService {
                                 external_receipt: None,
                                 uncertain_attempts: 0,
                                 part: None,
+                                owner: None,
                             },
                             now_ms(),
                         )
@@ -2778,7 +2781,9 @@ impl ProductionService {
             // looks like one is still the agent's.
             let status = crate::service::offline::request_status(&post.body)
                 .filter(|(_, id)| request_id.as_deref() == Some(id.to_string().as_str()));
-            let kind = if status.is_some() {
+            let kind = if post.owner.is_some() {
+                "owner"
+            } else if status.is_some() {
                 "request"
             } else if post.source_agent.is_none() {
                 "notice"
@@ -2790,7 +2795,12 @@ impl ProductionService {
             items.push(json!({
                 "seq": position,
                 "kind": kind,
-                "request_id": status.map(|(_, id)| id),
+                "request_id": post
+                    .owner
+                    .as_ref()
+                    .map(|owner| owner.request.as_uuid())
+                    .or(status.map(|(_, id)| id)),
+                "via": post.owner.as_ref().map(|owner| owner.via.clone()),
                 "state": status.map(|(state, _)| state),
                 "id": post.id,
                 "route": route.map(|route| route.title.clone()),
@@ -2841,6 +2851,108 @@ impl ProductionService {
                 }))
             })
             .collect()
+    }
+
+    /// Delivers a message the owner sends from a local client, such as a voice
+    /// app, as an inbound message in the route's private channel, so the
+    /// agent sees the owner talking and it is queued, steered and answered
+    /// like one the owner typed there. A copy is posted in that channel, so
+    /// the chat there holds the whole conversation.
+    async fn handle_say(&self, id: Uuid, params: SayParams) -> ControlResponse {
+        let via = params.via.as_deref().map(str::trim).unwrap_or("local");
+        if params.body.trim().is_empty()
+            || via.is_empty()
+            || via.chars().count() > 64
+            || via.contains('\n')
+        {
+            return error_response(
+                id,
+                "invalid_params",
+                "a message needs a non-empty body, and a client name must be one line of 1 to 64 characters",
+                None,
+            );
+        }
+        let routes = match self.store.list_routes().await {
+            Ok(routes) => routes,
+            Err(error) => return internal(id, error),
+        };
+        let route = match exact_route(&routes, &params.title) {
+            Ok(route) => route,
+            Err(detail) => return route_error(id, "", detail),
+        };
+        let Some((kind, destination)) = crate::service::offline::private_destination(route) else {
+            return error_response(
+                id,
+                "route_unavailable",
+                format!(
+                    "route {:?} has no channel only its owner reads",
+                    route.title
+                ),
+                None,
+            );
+        };
+        let namespace = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"https://panetone.dev/say/v1");
+        let request = EffectId::new(Uuid::new_v5(
+            &namespace,
+            params.id.unwrap_or_else(Uuid::new_v4).as_bytes(),
+        ));
+        let body = crate::domain::strip_invisible(params.body.trim());
+        let copy = OutboxItem {
+            id: EffectId::named(WorkflowId::new(request.as_uuid()), "owner-copy"),
+            route_id: Some(route.id),
+            sender_harness: None,
+            source_agent: None,
+            kind,
+            destination: destination.clone(),
+            body: format!("[via {via}] {body}"),
+            attachments: Vec::new(),
+            actions: Vec::new(),
+            state: OutboxState::Pending,
+            attempts: 0,
+            last_error: None,
+            external_receipt: None,
+            uncertain_attempts: 0,
+            part: None,
+            owner: Some(crate::domain::OwnerPost {
+                request,
+                via: via.to_owned(),
+            }),
+        };
+        let message = InboxItem {
+            id: request,
+            channel: kind,
+            external_id: format!("say:{request}"),
+            destination,
+            sender_id: None,
+            sender: None,
+            reply_to_external_id: None,
+            body,
+            state: "pending".into(),
+            created_at_ms: now_ms(),
+            receipt: None,
+            steering_acknowledged: None,
+            proof: None,
+            transcribed: false,
+        };
+        // The copy is queued first, so a reader of the feed sees the owner's
+        // message before any answer to it.
+        for chunk in crate::domain::chunk_outbox(copy) {
+            match self.store.outbox_exists(chunk.id).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => return internal(id, error),
+            }
+            if let Err(error) = self.store.enqueue_outbox(None, chunk, now_ms()).await {
+                return internal(id, error);
+            }
+        }
+        match self.store.accept_inbox(message).await {
+            Ok(accepted) => success_response(
+                id,
+                json!({"request_id": request, "accepted": accepted, "already_sent": !accepted}),
+            ),
+            Err(error) => internal(id, error),
+        }
     }
 
     /// Posts a local service's notice to a route's private channel through the
@@ -2913,6 +3025,7 @@ impl ProductionService {
             external_receipt: None,
             uncertain_attempts: 0,
             part: None,
+            owner: None,
         };
         for chunk in crate::domain::chunk_outbox(notice) {
             if let Err(error) = self.store.enqueue_outbox(None, chunk, now_ms()).await {
@@ -3328,6 +3441,10 @@ impl ControlHandler for ProductionService {
                     Ok(params) => self.handle_feed(request.id, params).await,
                     Err(error) => invalid(request.id, error),
                 },
+                "say" => match serde_json::from_value::<SayParams>(request.params) {
+                    Ok(params) => self.handle_say(request.id, params).await,
+                    Err(error) => invalid(request.id, error),
+                },
                 "notify" => match serde_json::from_value::<NotifyParams>(request.params) {
                     Ok(params) => self.handle_notify(request.id, params).await,
                     Err(error) => invalid(request.id, error),
@@ -3729,6 +3846,7 @@ mod tests {
                     external_receipt: None,
                     uncertain_attempts: 0,
                     part: None,
+                    owner: None,
                 },
                 1,
             )
@@ -5121,6 +5239,7 @@ fi
                 external_receipt: None,
                 uncertain_attempts: 0,
                 part: None,
+                owner: None,
             };
         let feed = |after: Option<i64>| {
             let service = &service;
@@ -5256,6 +5375,81 @@ fi
         // Resuming after the post between the parts still gives it whole.
         let resumed = feed(items[0]["seq"].as_i64()).await;
         assert_eq!(resumed["items"][0]["text"], long.as_str());
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_owner_says_something_from_a_local_client_as_if_typed_in_the_topic() {
+        let directory = tempdir().unwrap();
+        let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        let route = Route {
+            id: RouteId::new(Uuid::new_v4()),
+            title: "revng".into(),
+            channels: vec![ChannelBinding::Telegram { topic_id: 10 }],
+            agent: None,
+        };
+        store.save_route(route.clone(), 1).await.unwrap();
+        let service = ProductionService::new(
+            store.clone(),
+            WaktermCli::new(
+                directory.path().join("wakterm-unused"),
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            RealChannels::default(),
+            SupervisorHandle::default(),
+            Vec::new(),
+            directory.path().join("control.sock"),
+        );
+        let start = service
+            .handle_feed(Uuid::new_v4(), FeedParams::default())
+            .await
+            .result
+            .unwrap()["next"]
+            .as_i64();
+        let say = || SayParams {
+            title: "revng".into(),
+            body: "how far did the lift get?\n".into(),
+            id: Some(Uuid::from_u128(5)),
+            via: Some("gear".into()),
+        };
+
+        let said = service.handle_say(Uuid::new_v4(), say()).await;
+        assert!(said.ok, "{said:?}");
+        let request_id = said.result.as_ref().unwrap()["request_id"].clone();
+        // Delivered like a message the owner typed in the route's topic.
+        let pending = store.pending_inbox().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id.to_string(), request_id.as_str().unwrap());
+        assert_eq!(pending[0].channel, ChannelKind::Telegram);
+        assert_eq!(pending[0].destination, "10");
+        assert_eq!(pending[0].body, "how far did the lift get?");
+        // Copied into the topic, and listed in the feed as the owner's.
+        let outbox = store.pending_outbox().await.unwrap();
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].body, "[via gear] how far did the lift get?");
+        let feed = service
+            .handle_feed(
+                Uuid::new_v4(),
+                FeedParams {
+                    after: start,
+                    limit: None,
+                },
+            )
+            .await
+            .result
+            .unwrap();
+        assert_eq!(feed["items"][0]["kind"], "owner");
+        assert_eq!(feed["items"][0]["request_id"], request_id);
+        assert_eq!(feed["items"][0]["via"], "gear");
+        assert_eq!(feed["items"][0]["route"], "revng");
+
+        // A retry under the same ID sends nothing again.
+        let again = service.handle_say(Uuid::new_v4(), say()).await;
+        assert_eq!(again.result.unwrap()["already_sent"], true);
+        assert_eq!(store.pending_inbox().await.unwrap().len(), 1);
+        assert_eq!(store.pending_outbox().await.unwrap().len(), 1);
         drop(service);
         store.shutdown().await.unwrap();
     }

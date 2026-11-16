@@ -11,8 +11,8 @@ use panetone::channels::{
 };
 use panetone::control::{
     CONTROL_SCHEMA, ControlRequest, ControlServer, FeedParams, NotifyParams,
-    OutputDispositionParams, RouteEnsureParams, RouteInspectParams, SendParams, SourceAgent,
-    request,
+    OutputDispositionParams, RouteEnsureParams, RouteInspectParams, SayParams, SendParams,
+    SourceAgent, request,
 };
 use panetone::service::{
     ApprovalTapError, FormUpdate, InboundIngestor, ProductionService, SignalReceiver,
@@ -42,6 +42,8 @@ enum Command {
     Cancel(CancelArgs),
     /// Post a service's notice to a route's private channel, without an agent.
     Notify(NotifyArgs),
+    /// Send a route a message as its owner, as if typed in its private channel.
+    Say(SayArgs),
     /// Follow the posts Panetone makes to the owner's own channels, one JSON
     /// line each.
     Watch(WatchArgs),
@@ -193,6 +195,25 @@ struct NotifyArgs {
     from: Option<String>,
     /// Notice UUID, which makes a retry safe: a notice with an ID already
     /// posted posts nothing again.
+    #[arg(long)]
+    id: Option<Uuid>,
+    #[command(flatten)]
+    control: ControlSocketArgs,
+}
+
+#[derive(Args)]
+struct SayArgs {
+    /// The route whose agent gets the message.
+    #[arg(long = "to")]
+    title: String,
+    /// The message. If omitted, it is read from standard input.
+    message: Option<String>,
+    /// The client's name, shown on the copy in the route's channel as
+    /// `[via NAME]` (default: local).
+    #[arg(long = "as", value_name = "NAME")]
+    via: Option<String>,
+    /// Message UUID, which makes a retry safe: a message with an ID already
+    /// sent sends nothing again.
     #[arg(long)]
     id: Option<Uuid>,
     #[command(flatten)]
@@ -354,6 +375,7 @@ async fn main() -> Result<()> {
         Command::Status(args) => run_status(args).await,
         Command::Cancel(args) => run_cancel(args).await,
         Command::Notify(args) => run_notify(args).await,
+        Command::Say(args) => run_say(args).await,
         Command::Watch(args) => run_watch(args).await,
         Command::Chat(args) => {
             let name = args.name.unwrap_or_else(|| {
@@ -1209,17 +1231,48 @@ async fn run_cancel(args: CancelArgs) -> Result<()> {
     }
 }
 
-async fn run_notify(args: NotifyArgs) -> Result<()> {
-    let socket = control_socket(args.control.socket)?;
-    let body = match args.message {
-        Some(message) => message,
+/// The message argument, or standard input when it is omitted.
+fn message_or_stdin(message: Option<String>) -> Result<String> {
+    match message {
+        Some(message) => Ok(message),
         None => {
             let mut body = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut body)
-                .context("read the notice from standard input")?;
-            body
+                .context("read the message from standard input")?;
+            Ok(body)
         }
+    }
+}
+
+async fn run_say(args: SayArgs) -> Result<()> {
+    let socket = control_socket(args.control.socket)?;
+    let params = SayParams {
+        title: args.title,
+        body: message_or_stdin(args.message)?,
+        id: args.id,
+        via: args.via,
     };
+    let response = request(
+        &socket,
+        &ControlRequest {
+            schema: CONTROL_SCHEMA.into(),
+            id: Uuid::new_v4(),
+            method: "say".into(),
+            params: serde_json::to_value(params)?,
+        },
+    )
+    .await?;
+    println!("{}", serde_json::to_string(&response)?);
+    if response.ok {
+        Ok(())
+    } else {
+        bail!("the message was rejected")
+    }
+}
+
+async fn run_notify(args: NotifyArgs) -> Result<()> {
+    let socket = control_socket(args.control.socket)?;
+    let body = message_or_stdin(args.message)?;
     let params = NotifyParams {
         title: args.title,
         body,

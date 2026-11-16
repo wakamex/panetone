@@ -15,6 +15,21 @@ pub struct ControlRequest {
     pub params: Value,
 }
 
+/// A message the owner sends a route from a local client, delivered as if
+/// the owner had written it in the route's private channel.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SayParams {
+    /// The route's title.
+    pub title: String,
+    pub body: String,
+    /// Makes a retry safe: a message with an ID already sent sends nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<Uuid>,
+    /// The client's name, shown on the copy in the channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+}
+
 /// A page of the posts Panetone made to the owner's own channels.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FeedParams {

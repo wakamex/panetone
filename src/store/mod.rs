@@ -2061,6 +2061,7 @@ fn ingest_event(
             external_receipt: None,
             uncertain_attempts: 0,
             part: None,
+            owner: None,
         };
         for chunk in crate::domain::chunk_outbox(item) {
             enqueue_outbox(transaction, None, &chunk, now_ms)?;
