@@ -171,6 +171,7 @@ fn item(index: u128, kind: ChannelKind) -> OutboxItem {
         uncertain_attempts: 0,
         part: None,
         owner: None,
+        turn_end: None,
     }
 }
 

@@ -380,6 +380,18 @@ pub struct OutboxItem {
     /// message it copies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<OwnerPost>,
+    /// For a record of an agent's turn ending, which is kept for the feed and
+    /// never sent, the turn's last posted message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_end: Option<TurnEndPost>,
+}
+
+/// The end of an agent's turn, as the feed lists it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TurnEndPost {
+    /// The ID of the turn's last message posted to a channel, the one that
+    /// answers what started the turn, if the turn posted any.
+    pub final_post: Option<EffectId>,
 }
 
 /// A post that copies the owner's own message into a channel, so the chat
@@ -565,6 +577,7 @@ mod tests {
             uncertain_attempts: 0,
             part: None,
             owner: None,
+            turn_end: None,
         }
     }
 

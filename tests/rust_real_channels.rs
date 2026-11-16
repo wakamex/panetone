@@ -132,6 +132,7 @@ fn item(kind: ChannelKind, destination: &str) -> OutboxItem {
         uncertain_attempts: 0,
         part: None,
         owner: None,
+        turn_end: None,
     }
 }
 

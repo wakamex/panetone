@@ -1780,3 +1780,111 @@ async fn two_endchat_profiles_whose_logs_both_start_at_zero_are_both_recorded() 
     }
     store.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_turns_end_is_recorded_for_the_feed_naming_its_last_message() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let route = route();
+    store.save_route(route.clone(), 1).await.unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+    let event = |sequence: u64, kind: &str, text: Option<&str>| -> EventRecord {
+        let mut value = serde_json::json!({
+            "sequence": sequence,
+            "event_id": format!("event-{sequence}"),
+            "kind": kind,
+            "agent_id": "agent-zola",
+            "incarnation_id": "incarnation-zola-7",
+            "turn_id": "turn-1",
+            "observed_at": "2026-11-15T23:00:00Z",
+        });
+        if let Some(text) = text {
+            value["text"] = text.into();
+        }
+        serde_json::from_value(value).unwrap()
+    };
+    store
+        .ingest_agent_events(
+            100,
+            104,
+            vec![
+                event(101, "turn_started", None),
+                event(102, "assistant_message", Some("Checking the log...")),
+                event(
+                    103,
+                    "assistant_message",
+                    Some("The hub restarted at 18:02."),
+                ),
+                event(104, "turn_final", Some("The hub restarted at 18:02.")),
+            ],
+            live_agents(&route),
+            1_794_783_605_000,
+        )
+        .await
+        .unwrap();
+    let (posts, _) = store.outbox_feed(0, 100).await.unwrap();
+    assert_eq!(posts.len(), 3);
+    let end = posts[2]
+        .post
+        .turn_end
+        .as_ref()
+        .expect("the turn's end is recorded");
+    // The answer, not the progress note before it.
+    assert_eq!(end.final_post, Some(posts[1].post.id));
+    assert_eq!(posts[1].post.body, "The hub restarted at 18:02.");
+    // Kept for the feed, never sent.
+    assert_eq!(
+        posts[2].post.state,
+        panetone::domain::OutboxState::Delivered
+    );
+    assert_eq!(store.pending_outbox().await.unwrap().len(), 2);
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_endchat_turns_end_is_recorded_for_the_feed_too() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+    let route = panetone::domain::Route {
+        id: panetone::domain::RouteId::new(Uuid::from_u128(800)),
+        title: "debate".into(),
+        channels: vec![ChannelBinding::Telegram { topic_id: 80 }],
+        agent: None,
+    };
+    store.save_route(route.clone(), 1).await.unwrap();
+    store
+        .ingest_endchat_messages(
+            route.id,
+            panetone::endchat::binding("/home/x/.endchat/debate"),
+            vec![
+                panetone::endchat::Entry::User {
+                    i: 0,
+                    text: "hi".into(),
+                    date: "2026-11-15T23:00:00Z".into(),
+                },
+                panetone::endchat::Entry::Agent {
+                    i: 1,
+                    text: "hello".into(),
+                    date: "2026-11-15T23:00:01Z".into(),
+                },
+                panetone::endchat::Entry::TurnEnd {
+                    end: 2,
+                    ok: true,
+                    date: "2026-11-15T23:00:01Z".into(),
+                },
+            ],
+            "endchat_log_cursor:test".into(),
+            "{}".into(),
+            1_794_783_605_000,
+        )
+        .await
+        .unwrap();
+    let (posts, _) = store.outbox_feed(0, 100).await.unwrap();
+    assert_eq!(posts.len(), 2);
+    assert_eq!(
+        posts[1].post.turn_end.as_ref().unwrap().final_post,
+        Some(posts[0].post.id)
+    );
+    store.shutdown().await.unwrap();
+}

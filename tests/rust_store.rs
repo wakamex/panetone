@@ -458,6 +458,7 @@ async fn routes_outbox_inbox_and_metadata_are_durable_and_deduplicated() {
         uncertain_attempts: 0,
         part: None,
         owner: None,
+        turn_end: None,
     };
     store
         .enqueue_outbox(None, outbox.clone(), 100)
@@ -487,6 +488,7 @@ async fn routes_outbox_inbox_and_metadata_are_durable_and_deduplicated() {
         uncertain_attempts: 0,
         part: None,
         owner: None,
+        turn_end: None,
     };
     store
         .enqueue_outbox(None, delivered.clone(), 100)
@@ -632,6 +634,7 @@ async fn event_cursor_rebaseline_preserves_captured_delivery_work() {
         uncertain_attempts: 0,
         part: None,
         owner: None,
+        turn_end: None,
     };
     let requested = OutboxItem {
         id: EffectId::new(Uuid::from_u128(502)),

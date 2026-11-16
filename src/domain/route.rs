@@ -35,6 +35,14 @@ impl Route {
         })
     }
 
+    /// The route's first channel that admits no one but the owner.
+    pub fn private_destination(&self) -> Option<(ChannelKind, String)> {
+        self.channels
+            .iter()
+            .find(|binding| !binding.admits_members())
+            .map(ChannelBinding::destination)
+    }
+
     /// Whether a destination is one of the route's channels that people
     /// other than the owner read.
     pub fn is_shared(&self, kind: ChannelKind, destination: &str) -> bool {

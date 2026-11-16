@@ -530,6 +530,7 @@ impl OfflineService {
             uncertain_attempts: 0,
             part: None,
             owner: None,
+            turn_end: None,
         };
         if let Err(error) = self
             .deliver_channel_effect(
@@ -938,6 +939,7 @@ impl OfflineService {
             uncertain_attempts: 0,
             part: None,
             owner: None,
+            turn_end: None,
         };
         match self
             .deliver_channel_effect(record.command.id, item, now_ms, None, true)
@@ -1095,6 +1097,7 @@ impl OfflineService {
                 uncertain_attempts: 0,
                 part: None,
                 owner: None,
+                turn_end: None,
             };
             returned.mirror.state = DeliveryState::Pending;
             returned.mirror.attempts += 1;
@@ -1242,11 +1245,7 @@ pub(crate) fn channel_destination(route: &Route) -> Result<(ChannelKind, String)
 
 /// The route's first channel that admits no one but the owner.
 pub(crate) fn private_destination(route: &Route) -> Option<(ChannelKind, String)> {
-    route
-        .channels
-        .iter()
-        .find(|binding| !binding.admits_members())
-        .map(ChannelBinding::destination)
+    route.private_destination()
 }
 
 fn callback_envelope_from_value(workflow: &StoredWorkflow, returned: &ReturnDelivery) -> String {

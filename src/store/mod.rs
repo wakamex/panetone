@@ -2062,6 +2062,7 @@ fn ingest_event(
             uncertain_attempts: 0,
             part: None,
             owner: None,
+            turn_end: None,
         };
         for chunk in crate::domain::chunk_outbox(item) {
             enqueue_outbox(transaction, None, &chunk, now_ms)?;
@@ -2072,8 +2073,105 @@ fn ingest_event(
             outcome.remember_last_agent(candidate);
         }
     }
+    if event.kind == "turn_final"
+        && let Some(route) = route
+    {
+        record_turn_end(transaction, event, route, state == "projected", now_ms)?;
+    }
     insert_agent_event(transaction, event, route_id, state, &record_json, now_ms)?;
     outcome.recorded += 1;
+    Ok(())
+}
+
+/// The outbox ID of the post an agent event is projected to.
+fn event_post_id(incarnation_id: &str, event_id: &str) -> EffectId {
+    let namespace = Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        b"https://panetone.dev/wakterm/events/v1",
+    );
+    EffectId::new(Uuid::new_v5(
+        &namespace,
+        format!("{incarnation_id}\0{event_id}").as_bytes(),
+    ))
+}
+
+/// Records that an agent's turn ended, for the feed, naming the turn's last
+/// posted message. The record goes where that message went, or to the
+/// route's private channel, and is stored as delivered so it is never sent.
+fn record_turn_end(
+    transaction: &Transaction<'_>,
+    event: &EventRecord,
+    route: &Route,
+    // An aborted turn's end is itself posted, as a failure notice, which is
+    // then the turn's last message.
+    posted_itself: bool,
+    now_ms: i64,
+) -> StoreResult<()> {
+    let Some(turn_id) = event.fields.get("turn_id").and_then(|value| value.as_str()) else {
+        return Ok(());
+    };
+    let last = transaction
+        .query_row(
+            "SELECT event_id FROM agent_events
+             WHERE agent_id = ?1 AND incarnation_id = ?2 AND kind = 'assistant_message'
+               AND state = 'projected' AND json_extract(record_json, '$.turn_id') = ?3
+             ORDER BY sequence DESC LIMIT 1",
+            params![event.agent_id, event.incarnation_id, turn_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let final_post = if posted_itself {
+        Some(event_post_id(&event.incarnation_id, &event.event_id))
+    } else {
+        last.map(|event_id| event_post_id(&event.incarnation_id, &event_id))
+    };
+    // A long message is posted in parts under IDs derived from its own.
+    let posted = match final_post {
+        Some(id) => transaction
+            .query_row(
+                "SELECT record_json FROM outbox WHERE effect_id IN (?1, ?2) LIMIT 1",
+                params![id.to_string(), EffectId::chunk(id, 0).to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|json| serde_json::from_str::<OutboxItem>(&json))
+            .transpose()?,
+        None => None,
+    };
+    let Some((kind, destination)) = posted
+        .map(|post| (post.kind, post.destination))
+        .or_else(|| route.private_destination())
+    else {
+        return Ok(());
+    };
+    let marker = OutboxItem {
+        id: EffectId::named(
+            WorkflowId::new(event_post_id(&event.incarnation_id, &event.event_id).as_uuid()),
+            "turn-end",
+        ),
+        route_id: Some(route.id),
+        sender_harness: None,
+        source_agent: Some(AgentBinding {
+            agent_id: event.agent_id.clone(),
+            incarnation_id: event.incarnation_id.clone(),
+            harness: String::new(),
+            pane_id: None,
+        }),
+        kind,
+        destination,
+        body: String::new(),
+        attachments: Vec::new(),
+        actions: Vec::new(),
+        state: OutboxState::Delivered,
+        attempts: 0,
+        last_error: None,
+        external_receipt: None,
+        uncertain_attempts: 0,
+        part: None,
+        owner: None,
+        turn_end: Some(crate::domain::TurnEndPost { final_post }),
+    };
+    enqueue_outbox(transaction, None, &marker, now_ms)?;
     Ok(())
 }
 

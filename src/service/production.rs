@@ -2019,6 +2019,7 @@ impl ProductionService {
             uncertain_attempts: 0,
             part: None,
             owner: None,
+            turn_end: None,
         };
         for chunk in crate::domain::chunk_outbox(notice) {
             self.store
@@ -2146,6 +2147,7 @@ impl ProductionService {
             uncertain_attempts: 0,
             part: None,
             owner: None,
+            turn_end: None,
         };
         self.store
             .enqueue_outbox(None, notice, now_ms)
@@ -2452,6 +2454,7 @@ impl ProductionService {
                                 uncertain_attempts: 0,
                                 part: None,
                                 owner: None,
+                                turn_end: None,
                             },
                             now_ms(),
                         )
@@ -2781,7 +2784,9 @@ impl ProductionService {
             // looks like one is still the agent's.
             let status = crate::service::offline::request_status(&post.body)
                 .filter(|(_, id)| request_id.as_deref() == Some(id.to_string().as_str()));
-            let kind = if post.owner.is_some() {
+            let kind = if post.turn_end.is_some() {
+                "turn_end"
+            } else if post.owner.is_some() {
                 "owner"
             } else if status.is_some() {
                 "request"
@@ -2801,6 +2806,7 @@ impl ProductionService {
                     .map(|owner| owner.request.as_uuid())
                     .or(status.map(|(_, id)| id)),
                 "via": post.owner.as_ref().map(|owner| owner.via.clone()),
+                "final_id": post.turn_end.as_ref().and_then(|end| end.final_post),
                 "state": status.map(|(state, _)| state),
                 "id": post.id,
                 "route": route.map(|route| route.title.clone()),
@@ -2917,6 +2923,7 @@ impl ProductionService {
                 request,
                 via: via.to_owned(),
             }),
+            turn_end: None,
         };
         let message = InboxItem {
             id: request,
@@ -3026,6 +3033,7 @@ impl ProductionService {
             uncertain_attempts: 0,
             part: None,
             owner: None,
+            turn_end: None,
         };
         for chunk in crate::domain::chunk_outbox(notice) {
             if let Err(error) = self.store.enqueue_outbox(None, chunk, now_ms()).await {
@@ -3847,6 +3855,7 @@ mod tests {
                     uncertain_attempts: 0,
                     part: None,
                     owner: None,
+                    turn_end: None,
                 },
                 1,
             )
@@ -5240,6 +5249,7 @@ fi
                 uncertain_attempts: 0,
                 part: None,
                 owner: None,
+                turn_end: None,
             };
         let feed = |after: Option<i64>| {
             let service = &service;

@@ -6,8 +6,9 @@ mod workflow;
 pub use channel::{
     ChannelAttachment, ChannelBinding, ChannelKind, MAX_CHANNEL_ATTACHMENT_BYTES,
     MAX_CHANNEL_ATTACHMENT_TOTAL_BYTES, MAX_CHANNEL_ATTACHMENTS, OutboxAction, OutboxItem,
-    OutboxPart, OutboxState, OwnerPost, SIGNAL_DIRECT_PREFIX, TELEGRAM_CHAT_PREFIX, chunk_outbox,
-    signal_group_account, strip_invisible, telegram_chat_destination, telegram_chat_id,
+    OutboxPart, OutboxState, OwnerPost, SIGNAL_DIRECT_PREFIX, TELEGRAM_CHAT_PREFIX, TurnEndPost,
+    chunk_outbox, signal_group_account, strip_invisible, telegram_chat_destination,
+    telegram_chat_id,
 };
 pub use ids::{EffectId, RouteId, WorkflowId};
 pub use route::{AgentBinding, Route};
