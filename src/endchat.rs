@@ -208,7 +208,7 @@ pub fn read(profile: &str, cursor: &LogCursor) -> std::io::Result<(Vec<Entry>, L
         .filter(|file| *file >= cursor.file)
     {
         let path = directory.join(&file);
-        let start = if file == cursor.file {
+        let mut start = if file == cursor.file {
             cursor.offset
         } else {
             0
@@ -219,6 +219,19 @@ pub fn read(profile: &str, cursor: &LogCursor) -> std::io::Result<(Vec<Entry>, L
             continue;
         }
         let bytes = std::fs::read(&path)?;
+        // A day file rewritten in place, as when endchat repairs its log, can
+        // move the bytes under the saved position; the record number finds
+        // it again.
+        if start > 0 && bytes.get(start as usize - 1) != Some(&b'\n') {
+            start = lines_from(&bytes, 0)
+                .into_iter()
+                .find(|(line, _)| {
+                    serde_json::from_slice::<Record>(line)
+                        .is_ok_and(|record| record.i >= cursor.next_i)
+                })
+                .map_or(bytes.len(), |(line, after)| after - line.len() - 1)
+                as u64;
+        }
         let mut pages = String::new();
         let mut first = None;
         let mut complete_at = start as usize;
@@ -310,6 +323,59 @@ mod tests {
         let mut existing = std::fs::read_to_string(path).unwrap_or_default();
         existing.push_str(text);
         std::fs::write(path, existing).unwrap();
+    }
+
+    #[test]
+    fn reading_resumes_at_the_next_record_after_the_log_is_rewritten() {
+        let directory = tempfile::tempdir().unwrap();
+        let profile = directory.path().to_str().unwrap();
+        std::fs::create_dir_all(directory.path().join("main")).unwrap();
+        let day = directory.path().join("main/2026-10-19.jsonl");
+        let long = "x".repeat(500);
+        append(
+            &day,
+            &[
+                record(0, "user", "hi", false),
+                record(1, "tool", &long, false),
+                record(2, "agent", "done", false),
+            ]
+            .concat(),
+        );
+        let (_, cursor) = read(profile, &LogCursor::default()).unwrap();
+        assert_eq!(cursor.next_i, 3);
+        // A repair empties a record, which shortens the file below the saved
+        // position, and the chat goes on.
+        std::fs::write(
+            &day,
+            [
+                record(0, "user", "hi", false),
+                record(1, "tool", "", false),
+                record(2, "agent", "done", false),
+                record(3, "user", "still there?", false),
+                record(4, "agent", "yes", false),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let (entries, cursor) = read(profile, &cursor).unwrap();
+        let date = "2026-10-19T12:00:00Z".to_owned();
+        assert_eq!(
+            entries,
+            [
+                Entry::User {
+                    i: 3,
+                    text: "still there?".into(),
+                    date: date.clone()
+                },
+                Entry::Agent {
+                    i: 4,
+                    text: "yes".into(),
+                    date
+                },
+            ]
+        );
+        assert_eq!(cursor.next_i, 5);
+        assert_eq!(cursor.offset, std::fs::metadata(&day).unwrap().len());
     }
 
     #[test]

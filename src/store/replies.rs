@@ -276,6 +276,17 @@ pub(super) fn find_tags(body: &str) -> Option<Tagged> {
     Some(Tagged { sections, clean })
 }
 
+/// Whether an agent, or its route, still owes anyone a reply.
+pub(super) fn owes_reply(
+    transaction: &Transaction<'_>,
+    agent_id: &str,
+    route_id: RouteId,
+) -> StoreResult<bool> {
+    Ok(open_debts(transaction)?
+        .iter()
+        .any(|debt| debt.target_agent_id == agent_id || debt.target_route_id == route_id))
+}
+
 /// Settles or reports a tag an agent wrote, in the event ingest transaction.
 /// Returns whether the tag matched an open debt.
 #[allow(clippy::too_many_arguments)]

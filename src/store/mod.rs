@@ -1897,6 +1897,11 @@ fn ingest_event(
             (None, Some(body)) if event.kind == "assistant_message" => replies::find_tags(body),
             _ => None,
         };
+        // Whether the message is a reply: its tag answered a request, or the
+        // agent owes one it failed to name. A tag written while nothing is
+        // owed is reported to the agent, but its message is posted as if it
+        // had no tag.
+        let mut answered = false;
         for (index, (kind, named, section)) in tagged
             .iter()
             .flat_map(|tagged| tagged.sections.iter())
@@ -1906,7 +1911,7 @@ fn ingest_event(
                 &Uuid::NAMESPACE_URL,
                 b"https://panetone.dev/replies/tagged/v1",
             );
-            replies::record_tag(
+            answered |= replies::record_tag(
                 transaction,
                 EffectId::new(Uuid::new_v5(
                     &namespace,
@@ -1995,9 +2000,11 @@ fn ingest_event(
         };
         // A reply never appears in a group whose other members are not
         // its audience; the route's Telegram topic shows it instead.
+        let is_reply = tagged.is_some()
+            && (answered || replies::owes_reply(transaction, &event.agent_id, route.id)?);
         let destination = match (&tagged, destination) {
             (Some(tagged), _) if tagged.clean.is_empty() => None,
-            (Some(_), Some((kind, group))) if route.is_shared(kind, &group) => route
+            (Some(_), Some((kind, group))) if is_reply && route.is_shared(kind, &group) => route
                 .telegram_topic()
                 .map(|topic_id| (ChannelKind::Telegram, topic_id.to_string())),
             (_, destination) => destination,

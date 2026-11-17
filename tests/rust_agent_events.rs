@@ -1888,3 +1888,55 @@ async fn an_endchat_turns_end_is_recorded_for_the_feed_too() {
     );
     store.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_reply_tag_written_while_nothing_is_owed_does_not_move_the_message() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let mut route = route();
+    for binding in &mut route.channels {
+        if let ChannelBinding::Signal { allow_members, .. } = binding {
+            *allow_members = true;
+        }
+    }
+    store.save_route(route.clone(), 1).await.unwrap();
+    store
+        .set_metadata(
+            "route_output_preferences_v1".into(),
+            serde_json::json!({route.id.to_string(): "sig"}).to_string(),
+        )
+        .await
+        .unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+    let message: EventRecord = serde_json::from_value(serde_json::json!({
+        "sequence": 101,
+        "event_id": "event-101",
+        "kind": "assistant_message",
+        "agent_id": "agent-zola",
+        "incarnation_id": "incarnation-zola-7",
+        "turn_id": "turn-1",
+        "observed_at": "2026-10-16T12:00:00Z",
+        "text": "The two answers contradict each other.\n[panetone:reply]",
+    }))
+    .unwrap();
+    store
+        .ingest_agent_events(100, 101, vec![message], live_agents(&route), 3)
+        .await
+        .unwrap();
+    // Posted to the group the chat is in, without the tag.
+    let posts = store.pending_outbox().await.unwrap();
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].kind, ChannelKind::Signal);
+    assert_eq!(posts[0].destination, "signal-zola");
+    assert_eq!(posts[0].body, "The two answers contradict each other.");
+    // The stray tag is still reported to the agent.
+    assert_eq!(
+        store
+            .unreported_reply_tags("agent-zola".into())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    store.shutdown().await.unwrap();
+}
