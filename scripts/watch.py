@@ -75,11 +75,33 @@ def snippet(text, limit=80):
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def report_id(keys):
+def report_id(keys, occurrences=None):
     """The request ID for a report of these problems. It is the same for the
     same problems, so resending a report whose send failed or was not confirmed
-    never delivers it twice."""
-    return str(uuid.uuid5(REPORT_NAMESPACE, "\n".join(sorted(keys))))
+    never delivers it twice. A problem that went away and came back is a new
+    occurrence, counted in `occurrences`, and gets a new ID."""
+    occurrences = occurrences or {}
+    names = [f"{key}#{occurrences[key]}" if occurrences.get(key) else key for key in keys]
+    return str(uuid.uuid5(REPORT_NAMESPACE, "\n".join(sorted(names))))
+
+
+def send_report(new, message, occurrences):
+    """Sends a report, returning the completed process. An ID Panetone has
+    seen with other content belongs to an earlier occurrence the count did
+    not record, so the problems are counted as new occurrences once more."""
+    def send():
+        return subprocess.run(
+            ["panetone", "send", "--from", ROUTE, "--to", ROUTE, "--id", report_id(new, occurrences), message],
+            capture_output=True,
+            text=True,
+        )
+
+    sent = send()
+    if sent.returncode != 0 and "idempotency_conflict" in sent.stdout:
+        for key in new:
+            occurrences[key] = occurrences.get(key, 0) + 1
+        sent = send()
+    return sent
 
 
 def run_json(*command):
@@ -108,12 +130,18 @@ def main():
     tasks = task_problems(daemon_status()["result"]["tasks"])
 
     first_run = not STATE.exists()
-    seen = set() if first_run else set(json.loads(STATE.read_text())["seen"])
+    state = {} if first_run else json.loads(STATE.read_text())
+    seen = set(state.get("seen", []))
+    occurrences = state.get("occurrences", {})
 
     found = {**store, **tasks}
     new = {key: text for key, text in found.items() if key not in seen}
-    # A recovered task is forgotten, so its next failure is reported again.
-    seen = {key for key in seen if not key.startswith("task:") or key in tasks}
+    # A recovered task is forgotten, so its next failure is reported again,
+    # as a new occurrence with its own report ID.
+    recovered = {key for key in seen if key.startswith("task:") and key not in tasks}
+    for key in recovered:
+        occurrences[key] = occurrences.get(key, 0) + 1
+    seen -= recovered
 
     print(f"{len(found)} known problems, {len(new)} new{' (baseline run, not reported)' if first_run else ''}")
 
@@ -121,11 +149,7 @@ def main():
     if new and not first_run:
         lines = [f"- {text}" for text in sorted(new.values())]
         message = REPORT_HEADER + "\n" + "\n".join(lines)
-        sent = subprocess.run(
-            ["panetone", "send", "--from", ROUTE, "--to", ROUTE, "--id", report_id(new), message],
-            capture_output=True,
-            text=True,
-        )
+        sent = send_report(new, message, occurrences)
         if sent.returncode != 0:
             # The problems stay unreported, so the next run sends them again
             # with the same ID while they are the same problems.
@@ -133,7 +157,9 @@ def main():
             found = {key: text for key, text in found.items() if key not in new}
             status = 1
     STATE.parent.mkdir(parents=True, exist_ok=True)
-    STATE.write_text(json.dumps({"seen": sorted(seen | found.keys())}, indent=1) + "\n")
+    STATE.write_text(
+        json.dumps({"seen": sorted(seen | found.keys()), "occurrences": occurrences}, indent=1) + "\n"
+    )
     return status
 
 

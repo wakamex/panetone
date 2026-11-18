@@ -4,7 +4,7 @@ import unittest
 from unittest import mock
 
 import watch
-from watch import daemon_status, report_id, store_problems, task_problems
+from watch import daemon_status, report_id, send_report, store_problems, task_problems
 
 
 class TaskProblems(unittest.TestCase):
@@ -35,6 +35,35 @@ class ReportId(unittest.TestCase):
     def test_the_same_problems_get_the_same_request_id(self):
         self.assertEqual(report_id({"task:a": "x", "inbox:b": "y"}), report_id({"inbox:b": "z", "task:a": "w"}))
         self.assertNotEqual(report_id({"task:a": "x"}), report_id({"task:a": "x", "inbox:b": "y"}))
+
+    def test_an_id_used_for_other_content_is_retried_as_a_new_occurrence(self):
+        ids = []
+
+        def fake_run(command, **kwargs):
+            ids.append(command[command.index("--id") + 1])
+            conflict = len(ids) == 1
+            return subprocess.CompletedProcess(
+                command,
+                1 if conflict else 0,
+                stdout='{"ok": false, "error": {"code": "idempotency_conflict"}}' if conflict else "{}",
+                stderr="",
+            )
+
+        occurrences = {}
+        with mock.patch("watch.subprocess.run", fake_run):
+            sent = send_report({"task:endchat": "retrying"}, "report", occurrences)
+        self.assertEqual(sent.returncode, 0)
+        self.assertEqual(occurrences, {"task:endchat": 1})
+        self.assertEqual(len(ids), 2)
+        self.assertNotEqual(ids[0], ids[1])
+
+    def test_a_problem_that_came_back_gets_a_new_request_id(self):
+        first = report_id({"task:a": "x"})
+        self.assertEqual(report_id({"task:a": "x"}, {}), first)
+        self.assertNotEqual(report_id({"task:a": "x"}, {"task:a": 1}), first)
+        self.assertNotEqual(
+            report_id({"task:a": "x"}, {"task:a": 1}), report_id({"task:a": "x"}, {"task:a": 2})
+        )
 
 
 class StoreProblems(unittest.TestCase):
