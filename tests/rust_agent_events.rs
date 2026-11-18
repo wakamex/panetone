@@ -1996,3 +1996,65 @@ async fn a_restarted_endchat_log_is_recorded_and_a_record_read_again_is_skipped(
     assert_eq!(ingest(turn("2026-11-15T23:00:04Z")).await, 0);
     store.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn catching_up_on_an_endchat_log_posts_only_the_last_turns_late_output() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+    let route = panetone::domain::Route {
+        id: panetone::domain::RouteId::new(Uuid::from_u128(820)),
+        title: "w3end".into(),
+        channels: vec![ChannelBinding::Telegram { topic_id: 82 }],
+        agent: None,
+    };
+    store.save_route(route.clone(), 1).await.unwrap();
+    let (morning, evening) = ("2026-11-15T09:00:00Z", "2026-11-15T21:00:00Z");
+    store
+        .ingest_endchat_messages(
+            route.id,
+            panetone::endchat::binding("/home/x/.endchat/w3end"),
+            vec![
+                panetone::endchat::Entry::User {
+                    i: 0,
+                    text: "start".into(),
+                    date: morning.into(),
+                },
+                panetone::endchat::Entry::Agent {
+                    i: 1,
+                    text: "old progress".into(),
+                    date: morning.into(),
+                },
+                panetone::endchat::Entry::TurnEnd {
+                    end: 2,
+                    ok: true,
+                    date: morning.into(),
+                },
+                panetone::endchat::Entry::User {
+                    i: 2,
+                    text: "and now?".into(),
+                    date: evening.into(),
+                },
+                panetone::endchat::Entry::Agent {
+                    i: 3,
+                    text: "latest answer".into(),
+                    date: evening.into(),
+                },
+            ],
+            "endchat_log_cursor:test".into(),
+            "{}".into(),
+            // Hours after both turns, as after a long stall.
+            1_794_783_605_000,
+        )
+        .await
+        .unwrap();
+    let bodies = store
+        .pending_outbox()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|post| post.body)
+        .collect::<Vec<_>>();
+    assert_eq!(bodies, ["latest answer"]);
+    store.shutdown().await.unwrap();
+}

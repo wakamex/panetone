@@ -2209,6 +2209,16 @@ fn ingest_endchat_messages(
     // replies can be matched with its start, as Wakterm events are.
     let turn_key = format!("endchat_turn:{}", route_agents[0].agent.agent_id);
     let mut turn = get_metadata(&transaction, &turn_key)?.unwrap_or_default();
+    // Catching up on a log, as after a stall, reads many turns at once; only
+    // the last one's late output is still news, the rest is stale replay.
+    let last_turn = messages
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            crate::endchat::Entry::User { i, date, .. } => Some(format!("endchat-{i}@{date}")),
+            _ => None,
+        })
+        .unwrap_or_else(|| turn.clone());
     // Every profile numbers its log from 0, and a profile's log can be
     // started over, while an event ID must name one event across all agents
     // and all time, so it carries the profile's agent ID and the record's
@@ -2262,6 +2272,23 @@ fn ingest_endchat_messages(
             incarnation_id: route_agents[0].agent.incarnation_id.clone(),
             fields,
         };
+        if kind == "assistant_message"
+            && turn != last_turn
+            && event
+                .observed_at_ms()
+                .is_some_and(|observed| now_ms - observed > STALE_OUTPUT_MS)
+        {
+            insert_agent_event(
+                &transaction,
+                &event,
+                Some(route_id),
+                "stale",
+                &serde_json::to_string(&event)?,
+                now_ms,
+            )?;
+            outcome.recorded += 1;
+            continue;
+        }
         ingest_event(
             &transaction,
             &event,
