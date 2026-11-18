@@ -2209,33 +2209,49 @@ fn ingest_endchat_messages(
     // replies can be matched with its start, as Wakterm events are.
     let turn_key = format!("endchat_turn:{}", route_agents[0].agent.agent_id);
     let mut turn = get_metadata(&transaction, &turn_key)?.unwrap_or_default();
-    // Every profile numbers its log from 0, and an event ID must name one
-    // event across all agents, so it carries the profile's agent ID.
-    let event_id = |name: String| format!("{}#{name}", route_agents[0].agent.agent_id);
+    // Every profile numbers its log from 0, and a profile's log can be
+    // started over, while an event ID must name one event across all agents
+    // and all time, so it carries the profile's agent ID and the record's
+    // own time.
+    let event_id =
+        |name: String, date: &str| format!("{}#{name}@{date}", route_agents[0].agent.agent_id);
     for entry in messages {
-        count += 1;
         let mut fields = serde_json::Map::new();
         let (kind, event_id, date) = match entry {
             crate::endchat::Entry::User { i, text, date } => {
-                turn = format!("endchat-{i}");
+                turn = format!("endchat-{i}@{date}");
                 fields.insert(
                     "input_sha256".into(),
                     DeliveryProof::input_sha256(text).into(),
                 );
-                ("turn_started", event_id(format!("{i}")), date)
+                ("turn_started", event_id(format!("{i}"), date), date)
             }
             crate::endchat::Entry::Agent { i, text, date } => {
                 fields.insert("text".into(), text.clone().into());
-                ("assistant_message", event_id(format!("{i}")), date)
+                ("assistant_message", event_id(format!("{i}"), date), date)
             }
             crate::endchat::Entry::TurnEnd { end, ok, date } => {
                 fields.insert(
                     "outcome".into(),
                     if *ok { "completed" } else { "aborted" }.into(),
                 );
-                ("turn_final", event_id(format!("end-{end}")), date)
+                ("turn_final", event_id(format!("end-{end}"), date), date)
             }
         };
+        // A record read again, as after its log was rewritten, was already
+        // recorded.
+        if transaction
+            .query_row(
+                "SELECT 1 FROM agent_events WHERE event_id = ?1 AND incarnation_id = ?2",
+                params![event_id, route_agents[0].agent.incarnation_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            continue;
+        }
+        count += 1;
         fields.insert("observed_at".into(), date.clone().into());
         fields.insert("turn_id".into(), turn.clone().into());
         let event = EventRecord {

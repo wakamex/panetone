@@ -1940,3 +1940,59 @@ async fn a_reply_tag_written_while_nothing_is_owed_does_not_move_the_message() {
     );
     store.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_restarted_endchat_log_is_recorded_and_a_record_read_again_is_skipped() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+    let route = panetone::domain::Route {
+        id: panetone::domain::RouteId::new(Uuid::from_u128(810)),
+        title: "w3end".into(),
+        channels: vec![ChannelBinding::Telegram { topic_id: 81 }],
+        agent: None,
+    };
+    store.save_route(route.clone(), 1).await.unwrap();
+    let turn = |date: &str| {
+        vec![
+            panetone::endchat::Entry::User {
+                i: 0,
+                text: "hi".into(),
+                date: date.into(),
+            },
+            panetone::endchat::Entry::Agent {
+                i: 1,
+                text: "hello".into(),
+                date: date.into(),
+            },
+            panetone::endchat::Entry::TurnEnd {
+                end: 2,
+                ok: true,
+                date: date.into(),
+            },
+        ]
+    };
+    let ingest = |entries| {
+        let store = store.clone();
+        async move {
+            store
+                .ingest_endchat_messages(
+                    route.id,
+                    panetone::endchat::binding("/home/x/.endchat/w3end"),
+                    entries,
+                    "endchat_log_cursor:test".into(),
+                    "{}".into(),
+                    1_794_783_605_000,
+                )
+                .await
+                .unwrap()
+                .recorded
+        }
+    };
+    assert_eq!(ingest(turn("2026-11-15T23:00:00Z")).await, 3);
+    // The log was started over, so its numbers repeat with later times.
+    assert_eq!(ingest(turn("2026-11-15T23:00:04Z")).await, 3);
+    // Reading the same records again records nothing and fails nothing.
+    assert_eq!(ingest(turn("2026-11-15T23:00:04Z")).await, 0);
+    store.shutdown().await.unwrap();
+}

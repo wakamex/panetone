@@ -1187,6 +1187,9 @@ impl ProductionService {
     pub async fn endchat_once(&self) -> Result<usize, String> {
         let profiles = self.endchat_profiles().await?;
         let mut projected = 0;
+        // One profile's failure must not hold up the others' messages; the
+        // first failure is reported once every profile has been read.
+        let mut failure = None;
         for (route_id, profile) in profiles {
             let Ok(route_id) = Uuid::parse_str(&route_id).map(RouteId::new) else {
                 continue;
@@ -1208,12 +1211,19 @@ impl ProductionService {
                     .map_err(error_string)?;
                 continue;
             };
-            let (messages, next) = crate::endchat::read(&profile, &cursor)
-                .map_err(|error| format!("cannot read the endchat log in {profile}: {error}"))?;
+            let (messages, next) = match crate::endchat::read(&profile, &cursor) {
+                Ok(read) => read,
+                Err(error) => {
+                    failure.get_or_insert(format!(
+                        "cannot read the endchat log in {profile}: {error}"
+                    ));
+                    continue;
+                }
+            };
             if next == cursor {
                 continue;
             }
-            let outcome = self
+            match self
                 .store
                 .ingest_endchat_messages(
                     route_id,
@@ -1224,10 +1234,17 @@ impl ProductionService {
                     now_ms(),
                 )
                 .await
-                .map_err(error_string)?;
-            projected += outcome.visible_outputs as usize;
+            {
+                Ok(outcome) => projected += outcome.visible_outputs as usize,
+                Err(error) => {
+                    failure.get_or_insert(format!("endchat profile {profile}: {error}"));
+                }
+            }
         }
-        Ok(projected)
+        match failure {
+            Some(failure) => Err(failure),
+            None => Ok(projected),
+        }
     }
 
     /// Wakterm's live routes, with each route an endchat profile serves bound to
@@ -5801,7 +5818,7 @@ fi
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(turn.turn_id, "endchat-3");
+        assert_eq!(turn.turn_id, "endchat-3@2099-01-01T00:00:00Z");
         assert!(!turn.superseded && !turn.started_by_reminder);
         drop(service);
         store.shutdown().await.unwrap();
