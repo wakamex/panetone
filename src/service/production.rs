@@ -103,6 +103,12 @@ impl From<String> for ApprovalTapError {
     }
 }
 
+/// How long after it arrived a message refused under an exited agent
+/// process's admission ID is still offered to its replacement.
+const INBOX_REDELIVERY_MS: i64 = 30 * 60 * 1000;
+/// How many new admission IDs a message is offered under.
+const MAX_ADMISSION_ROUNDS: u32 = 3;
+
 /// Route health metadata key: reported agent problems by problem key.
 const ROUTE_HEALTH_KEY: &str = "route_health";
 
@@ -1692,7 +1698,7 @@ impl ProductionService {
                 .map_err(error_string)?;
             let receipt = match self
                 .wakterm
-                .admit(item.id, &binding, &item.body, false, 0)
+                .admit(item.admission_id(), &binding, &item.body, false, 0)
                 .await
             {
                 Ok(receipt) => receipt,
@@ -1705,7 +1711,9 @@ impl ProductionService {
                     return Err(error.to_string());
                 }
             };
-            receipt.validate(item.id, &binding).map_err(error_string)?;
+            receipt
+                .validate(item.admission_id(), &binding)
+                .map_err(error_string)?;
             item.receipt = Some(receipt.clone());
             let mut saved_as = "admission_prepared";
             item.state = match receipt.status {
@@ -1785,6 +1793,11 @@ impl ProductionService {
                     await_proof(&mut item, &detail);
                     "awaiting_proof"
                 }
+                // Asking again cannot change these answers.
+                AdmissionStatus::Invalid | AdmissionStatus::Unsupported => {
+                    self.settle_refused_inbox(&mut item, route, &binding, &receipt)
+                        .await?
+                }
                 _ => "pending",
             }
             .into();
@@ -1795,6 +1808,58 @@ impl ProductionService {
                 .map_err(error_string)?;
         }
         Ok(attempted)
+    }
+
+    /// What becomes of a message Wakterm refused for good. An admission ID
+    /// Wakterm already holds for different input belongs to an agent process
+    /// that has since exited, as after a reboot: if the agent never recorded
+    /// the message, a fresh one is offered it under a new ID while the
+    /// message is still recent. Otherwise its sender is told it was not
+    /// delivered.
+    async fn settle_refused_inbox(
+        &self,
+        item: &mut InboxItem,
+        route: &Route,
+        binding: &AgentBinding,
+        receipt: &crate::domain::AdmissionReceipt,
+    ) -> Result<&'static str, String> {
+        let detail = receipt
+            .detail
+            .clone()
+            .unwrap_or_else(|| format!("{:?}", receipt.status));
+        if detail.contains("already used for different input") {
+            if self
+                .store
+                .input_recorded_since(
+                    binding.agent_id.clone(),
+                    DeliveryProof::input_sha256(&item.body),
+                    item.created_at_ms,
+                )
+                .await
+                .map_err(error_string)?
+            {
+                return Ok("delivered");
+            }
+            if now_ms() - item.created_at_ms < INBOX_REDELIVERY_MS
+                && item.admission_round < MAX_ADMISSION_ROUNDS
+            {
+                item.admission_round += 1;
+                item.receipt = None;
+                tracing::info!(message = %item.id, round = item.admission_round, "offering a message again under a new admission ID");
+                return Ok("pending");
+            }
+        }
+        let body = format!(
+            "[undelivered] {} did not receive your message: {detail}. Send it again if it still matters.",
+            route.title
+        );
+        if let Err(error) = self
+            .notify_sender(item, route, "undelivered", body, Vec::new())
+            .await
+        {
+            tracing::warn!(error = %error, "undelivered notice was not posted");
+        }
+        Ok("failed")
     }
 
     /// Settles inbound messages whose delivery Wakterm did not confirm. One is
@@ -2957,6 +3022,7 @@ impl ProductionService {
             steering_acknowledged: None,
             proof: None,
             transcribed: false,
+            admission_round: 0,
         };
         // The copy is queued first, so a reader of the feed sees the owner's
         // message before any answer to it.
@@ -4801,6 +4867,7 @@ fi
                 steering_acknowledged: None,
                 proof: None,
                 transcribed: false,
+                admission_round: 0,
             })
             .await
             .unwrap();
@@ -5751,6 +5818,7 @@ fi
                 steering_acknowledged: None,
                 proof: None,
                 transcribed: false,
+                admission_round: 0,
             })
             .await
             .unwrap();
@@ -6266,6 +6334,7 @@ fi
                 steering_acknowledged: None,
                 proof: None,
                 transcribed: false,
+                admission_round: 0,
             })
             .await
             .unwrap();
@@ -6286,6 +6355,122 @@ fi
         assert_eq!(fs::read_to_string(prompt).unwrap(), body);
         assert_eq!(store.status().await.unwrap().pending_inbox, 0);
         assert!(store.pending_outbox().await.unwrap().is_empty());
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_message_refused_under_an_exited_process_is_offered_again_while_recent() {
+        let directory = tempdir().unwrap();
+        let binary = directory.path().join("wakterm-fake");
+        // Wakterm still holds both messages' first admission IDs for an agent
+        // process that has since exited.
+        fs::write(
+            &binary,
+            r#"#!/bin/bash
+set -euo pipefail
+operation="$*"
+request=""; previous=""
+for argument in "$@"; do
+  if [[ "$previous" == "--request-id" ]]; then request="$argument"; fi
+  previous="$argument"
+done
+if [[ "$operation" == *"agent capabilities"* ]]; then
+  echo '{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}'
+elif [[ "$operation" == *"agent catalog"* ]]; then
+  echo '{"schema":"wakterm.agent-api.v1","as_of_event_sequence":10,"agents":[{"agent_id":"agent-route","incarnation_id":"inc-route-2","pane_id":1,"name":"route","harness":"claude","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-11-12T00:00:00Z"}]}'
+elif [[ "$operation" == *"list --format json"* ]]; then
+  echo '[{"pane_id":1,"tab_id":2,"window_id":3,"effective_title":"route"}]'
+elif [[ "$operation" == *"agent admit"* ]]; then
+  cat >/dev/null
+  if [[ "$request" == 00000000-0000-0000-0000-0000000000* ]]; then
+    echo '{"schema":"wakterm.agent-api.v1","request_id":"'"$request"'","status":"invalid","definitive":true,"prompt_written":false,"agent_id":"agent-route","incarnation_id":"inc-route-2","detail":"request_id was already used for different input"}'
+  else
+    echo '{"schema":"wakterm.agent-api.v1","request_id":"'"$request"'","status":"accepted","definitive":true,"prompt_written":true,"agent_id":"agent-route","incarnation_id":"inc-route-2","detail":null}'
+  fi
+else
+  echo "unexpected fake invocation: $operation" >&2
+  exit 9
+fi
+"#,
+        )
+        .unwrap();
+        crate::test_support::seal_executable(&binary);
+        let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        store
+            .save_route(
+                Route {
+                    id: RouteId::new(Uuid::new_v4()),
+                    title: "route".into(),
+                    channels: vec![ChannelBinding::Telegram { topic_id: 10 }],
+                    agent: None,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let message = |id: u128, age_ms: i64| InboxItem {
+            id: EffectId::new(Uuid::from_u128(id)),
+            channel: ChannelKind::Telegram,
+            external_id: format!("update-{id}"),
+            destination: "10".into(),
+            sender_id: Some("42".into()),
+            sender: Some("Mihai".into()),
+            reply_to_external_id: None,
+            body: format!("message {id}"),
+            state: "pending".into(),
+            created_at_ms: now_ms() - age_ms,
+            receipt: None,
+            steering_acknowledged: None,
+            proof: None,
+            transcribed: false,
+            admission_round: 0,
+        };
+        let (recent, old) = (
+            EffectId::new(Uuid::from_u128(1)),
+            EffectId::new(Uuid::from_u128(2)),
+        );
+        store.accept_inbox(message(1, 60_000)).await.unwrap();
+        store
+            .accept_inbox(message(2, 7 * 24 * 60 * 60 * 1000))
+            .await
+            .unwrap();
+        let service = ProductionService::new(
+            store.clone(),
+            WaktermCli::new(
+                binary,
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            RealChannels::default(),
+            SupervisorHandle::default(),
+            vec!["event_stream.v1".into()],
+            directory.path().join("control.sock"),
+        );
+        let state = |id: EffectId| {
+            let store = store.clone();
+            async move {
+                let rows = store.pending_inbox().await.unwrap();
+                rows.into_iter()
+                    .find(|item| item.id == id)
+                    .map(|item| item.admission_round)
+            }
+        };
+
+        service.inbox_once().await.unwrap();
+        // The recent message waits for a new admission ID; the week-old one
+        // is not delivered, and its sender is told.
+        assert_eq!(state(recent).await, Some(1));
+        assert_eq!(state(old).await, None);
+        let notices = store.pending_outbox().await.unwrap();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].body.starts_with("[undelivered] route did not receive your message: request_id was already used for different input."));
+
+        // Offered under its new ID, the recent message is delivered, and the
+        // refused one is never asked about again.
+        service.inbox_once().await.unwrap();
+        assert_eq!(store.status().await.unwrap().pending_inbox, 0);
+        assert_eq!(service.inbox_once().await.unwrap(), 0);
         drop(service);
         store.shutdown().await.unwrap();
     }
@@ -6346,6 +6531,7 @@ fi
                 steering_acknowledged: None,
                 proof: None,
                 transcribed: false,
+                admission_round: 0,
             })
             .await
             .unwrap();
@@ -6476,6 +6662,7 @@ fi
             steering_acknowledged: None,
             proof: None,
             transcribed: false,
+            admission_round: 0,
         };
         store.accept_inbox(item.clone()).await.unwrap();
         item.state = "awaiting_proof".into();
@@ -6617,6 +6804,7 @@ fi
                 steering_acknowledged: None,
                 proof: None,
                 transcribed: false,
+                admission_round: 0,
             })
             .await
             .unwrap();
@@ -6658,6 +6846,7 @@ fi
                 steering_acknowledged: None,
                 proof: None,
                 transcribed: false,
+                admission_round: 0,
             })
             .await
             .unwrap();
@@ -6739,6 +6928,7 @@ fi
             steering_acknowledged: None,
             proof: None,
             transcribed: false,
+            admission_round: 0,
         };
         let notice_for = |outbox: Vec<OutboxItem>, needle: &str| {
             outbox
@@ -6878,6 +7068,7 @@ fi
                 steering_acknowledged: None,
                 proof: None,
                 transcribed: false,
+                admission_round: 0,
             })
             .await
             .unwrap();

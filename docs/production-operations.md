@@ -198,6 +198,13 @@ The event, outbox, inbox, busy-target and return workers retry a failed pass in 
   repeated request with its first receipt. A steer into a busy turn that a
   restart interrupted may have been typed, so a send becomes indeterminate and
   a channel message waits for proof.
+- An inbound message Wakterm refuses for good, as invalid or unsupported, is
+  not retried: it becomes `failed` and its sender gets one `[undelivered]`
+  notice. When the refusal is an admission ID Wakterm already holds for
+  different input, which happens when an agent process exited mid-admission,
+  as at a reboot, the message counts as delivered if the agent recorded it,
+  and otherwise, while it is under 30 minutes old, it is offered again under a
+  new admission ID derived from its own, up to three times.
 - Preserve the database before manual repair.
 - Attribute Wakterm client, mux, Telegram, Signal, and Panetone failures to one
   layer before changing code.

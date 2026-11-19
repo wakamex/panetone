@@ -129,6 +129,28 @@ pub struct InboxItem {
     /// Its audio has been transcribed into the body, for a route that asks.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub transcribed: bool,
+    /// How many times it was offered to Wakterm under a new admission ID,
+    /// because an earlier ID belonged to an agent process that has exited.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub admission_round: u32,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+impl InboxItem {
+    /// The request ID Wakterm admits the message under: its own ID, or one
+    /// derived from it for each later round.
+    pub fn admission_id(&self) -> EffectId {
+        match self.admission_round {
+            0 => self.id,
+            round => EffectId::named(
+                WorkflowId::new(self.id.as_uuid()),
+                &format!("admission-{round}"),
+            ),
+        }
+    }
 }
 
 /// Wakterm recording input with the message's hash for the target agent
@@ -861,6 +883,31 @@ impl StoreHandle {
                        AND json_extract(record_json, '$.request_id') = ?1
                      LIMIT 1",
                     params![request_id.to_string()],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some())
+        })
+        .await
+    }
+
+    /// Whether an agent, under any of its processes, recorded input with this
+    /// hash since a time.
+    pub async fn input_recorded_since(
+        &self,
+        agent_id: String,
+        input_sha256: String,
+        since_ms: i64,
+    ) -> StoreResult<bool> {
+        self.run(move |connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT 1 FROM agent_events
+                     WHERE agent_id = ?1 AND created_at_ms >= ?2
+                       AND kind IN ('input_accepted', 'turn_started')
+                       AND json_extract(record_json, '$.input_sha256') = ?3
+                     LIMIT 1",
+                    params![agent_id, since_ms, input_sha256],
                     |_| Ok(()),
                 )
                 .optional()?

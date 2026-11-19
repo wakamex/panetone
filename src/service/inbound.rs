@@ -91,6 +91,7 @@ impl InboundIngestor {
             steering_acknowledged: None,
             proof: None,
             transcribed: false,
+            admission_round: 0,
         };
         Ok(self.store.accept_inbox(item).await?)
     }
