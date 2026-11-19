@@ -1068,7 +1068,11 @@ async fn an_unacknowledged_steer_waits_for_the_target_to_record_it() {
     let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
     store.initialize_event_cursor(100).await.unwrap();
     let wakterm = FakeWakterm::new(contract());
-    wakterm.script_receipts([AdmissionStatus::Busy, AdmissionStatus::Busy]);
+    wakterm.script_receipts([
+        AdmissionStatus::Busy,
+        AdmissionStatus::Busy,
+        AdmissionStatus::Busy,
+    ]);
     wakterm.leave_steering_unacknowledged();
     let service = OfflineService::new(store.clone(), wakterm, RecordingChannels::default());
     let (source, target) = routes();
@@ -1081,7 +1085,8 @@ async fn an_unacknowledged_steer_waits_for_the_target_to_record_it() {
     };
     let taken = send(130);
     let lost = send(131);
-    for request in [&taken, &lost] {
+    let answered = send(132);
+    for request in [&taken, &lost, &answered] {
         let ack = service
             .submit(request.clone(), &source, &target, 100)
             .await
@@ -1115,17 +1120,30 @@ async fn an_unacknowledged_steer_waits_for_the_target_to_record_it() {
         "input_sha256": panetone::store::DeliveryProof::input_sha256(typed),
     }))
     .unwrap();
+    // The third is never recorded as input, but the target answers it.
+    let reply: panetone::wakterm::EventRecord = serde_json::from_value(serde_json::json!({
+        "sequence": 102,
+        "event_id": "reply-event-102",
+        "kind": "assistant_message",
+        "agent_id": "agent-target",
+        "incarnation_id": "target-incarnation-1",
+        "turn_id": "turn-2",
+        "text": format!("Answer.\n[panetone:reply {}]", answered.id),
+    }))
+    .unwrap();
     store.save_route(target.clone(), 1).await.unwrap();
     let agents = vec![panetone::store::RouteAgent {
         route_id: target.id,
         agent: target.agent.clone().unwrap(),
     }];
     store
-        .ingest_agent_events(100, 101, vec![event], agents, 300)
+        .ingest_agent_events(100, 102, vec![event, reply], agents, 300)
         .await
         .unwrap();
-    assert_eq!(service.settle_steered_sends(300).await.unwrap(), 1);
+    // The first is recorded, and the third's reply shows it was taken.
+    assert_eq!(service.settle_steered_sends(300).await.unwrap(), 2);
     assert_eq!(state(taken.id).await, WorkflowState::Completed);
+    assert_eq!(state(answered.id).await, WorkflowState::Completed);
     assert_eq!(state(lost.id).await, WorkflowState::Submitted);
 
     // The second is never recorded: its sender is told when the window ends.
@@ -1137,7 +1155,15 @@ async fn an_unacknowledged_steer_waits_for_the_target_to_record_it() {
         1
     );
     assert_eq!(state(lost.id).await, WorkflowState::Indeterminate);
-    let notice = service.wakterm().calls().last().unwrap().clone();
+    // Only the lost message's sender is told.
+    let notices = service
+        .wakterm()
+        .calls()
+        .into_iter()
+        .filter(|call| call.prompt.starts_with("[Panetone unconfirmed send]"))
+        .collect::<Vec<_>>();
+    assert_eq!(notices.len(), 1);
+    let notice = notices[0].clone();
     assert_eq!(notice.binding.agent_id, "agent-source");
     assert!(notice.prompt.starts_with(&format!(
         "[Panetone unconfirmed send] Your message to target (request {}, \"question 131\") may not have arrived",

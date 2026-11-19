@@ -72,6 +72,7 @@ class StoreProblems(unittest.TestCase):
         for table, key in [("outbox", "effect_id"), ("inbox", "effect_id"), ("workflows", "request_id")]:
             self.db.execute(f"CREATE TABLE {table} ({key} TEXT, channel TEXT, state TEXT, record_json TEXT, created_at_ms INTEGER)")
         self.db.execute("CREATE TABLE return_deliveries (request_id TEXT, agent_state TEXT, record_json TEXT)")
+        self.db.execute("CREATE TABLE reply_messages (effect_id TEXT, kind TEXT, record_json TEXT)")
 
     def test_reports_failed_unconfirmed_and_stuck_records_only(self):
         rows = [
@@ -85,10 +86,13 @@ class StoreProblems(unittest.TestCase):
             ("workflows", "w1", None, "indeterminate", '{"command": {"source": "a", "target": "b"}}', 0),
             ("workflows", "w2", None, "failed", '{"command": {"source": "a", "target": "b"}}', 0),
             ("workflows", "w3", None, "indeterminate", '{"command": {"source": "p", "target": "p", "message": "Panetone watch found new problems:\\n- x"}}', 0),
+            # Unconfirmed, but its target has replied, so it took the message.
+            ("workflows", "w4", None, "indeterminate", '{"command": {"source": "a", "target": "b"}}', 0),
         ]
         for table, key, channel, state, record, created in rows:
             self.db.execute(f"INSERT INTO {table} VALUES (?, ?, ?, ?, ?)", (key, channel, state, record, created))
         self.db.execute("INSERT INTO return_deliveries VALUES ('r1', 'indeterminate', '{\"result\": {\"message\": \"x\"}}')")
+        self.db.execute("INSERT INTO reply_messages VALUES ('m1', 'final', '{\"request_id\": \"w4\"}')")
         problems = store_problems(self.db, 1_000_000_000)
         self.assertEqual(
             sorted(problems),

@@ -850,6 +850,25 @@ impl StoreHandle {
         .await
     }
 
+    /// Whether the target of a send has answered it with a tagged reply or
+    /// progress update, which shows it took the message.
+    pub async fn request_answered(&self, request_id: WorkflowId) -> StoreResult<bool> {
+        self.run(move |connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT 1 FROM reply_messages
+                     WHERE kind IN ('final', 'progress')
+                       AND json_extract(record_json, '$.request_id') = ?1
+                     LIMIT 1",
+                    params![request_id.to_string()],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some())
+        })
+        .await
+    }
+
     pub async fn input_recorded(&self, proof: DeliveryProof) -> StoreResult<bool> {
         self.request(|reply| Command::InputRecorded { proof, reply })
             .await

@@ -49,7 +49,11 @@ def store_problems(connection, now_ms):
         "SELECT request_id, json_extract(record_json, '$.command.source'),"
         " json_extract(record_json, '$.command.target')"
         " FROM workflows WHERE state = 'indeterminate'"
-        " AND coalesce(json_extract(record_json, '$.command.message'), '') NOT LIKE ?",
+        " AND coalesce(json_extract(record_json, '$.command.message'), '') NOT LIKE ?"
+        # A reply or progress update from the target shows it took the message.
+        " AND NOT EXISTS (SELECT 1 FROM reply_messages"
+        "   WHERE kind IN ('final', 'progress')"
+        "   AND json_extract(reply_messages.record_json, '$.request_id') = workflows.request_id)",
         (REPORT_HEADER + "%",),
     ):
         problems[f"workflow:{request_id}"] = f"send {source} -> {target} unconfirmed ({request_id})"

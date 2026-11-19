@@ -859,7 +859,12 @@ impl OfflineService {
             let Some(proof) = record.proof.clone() else {
                 continue;
             };
-            let next = if self.store.input_recorded(proof.clone()).await? {
+            // A reply from the target shows it took the message even when
+            // its record of the input never matched, as for a harness that
+            // records input late or wrapped.
+            let next = if self.store.input_recorded(proof.clone()).await?
+                || self.store.request_answered(record.command.id).await?
+            {
                 WorkflowState::Completed
             } else if now_ms >= proof.deadline_ms {
                 self.notify_unconfirmed_send(&record, &proof).await;
