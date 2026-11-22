@@ -15,6 +15,19 @@ pub struct ControlRequest {
     pub params: Value,
 }
 
+/// The owner's answer, from a local client, to an agent's question or
+/// approval: one of the actions its post carries, as a Telegram button tap.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AnswerParams {
+    /// The route's title.
+    pub title: String,
+    /// The action's ID, as the feed lists it, such as `wakap:REQUEST:option_1`.
+    pub action: String,
+    /// The client's name, shown on the copy in the channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+}
+
 /// A message the owner sends a route from a local client, delivered as if
 /// the owner had written it in the route's private channel.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

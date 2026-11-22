@@ -11,9 +11,9 @@ use crate::archive::{ArchiveEntry, ChatArchives};
 use crate::channels::{ChannelDeliveryError, RealChannels, TelegramApprovalResponse};
 use crate::channels::{InboundMessage, TelegramFormTap};
 use crate::control::{
-    CONTROL_SCHEMA, ControlHandler, ControlRequest, ControlResponse, FeedParams, NotifyParams,
-    OutputDispositionParams, RouteEnsureParams, RouteInspectParams, SayParams, SendParams,
-    error_response, success_response,
+    AnswerParams, CONTROL_SCHEMA, ControlHandler, ControlRequest, ControlResponse, FeedParams,
+    NotifyParams, OutputDispositionParams, RouteEnsureParams, RouteInspectParams, SayParams,
+    SendParams, error_response, success_response,
 };
 use crate::domain::{
     AdmissionStatus, AgentBinding, ChannelBinding, ChannelKind, EffectId, OutboxAction, OutboxItem,
@@ -144,11 +144,21 @@ impl ProductionService {
                 .to_string()
                 .into());
         }
+        self.answer_approval(&stored, &response.choice_id).await
+    }
+
+    /// Answers an agent's open question or approval with one of its choices,
+    /// as the owner's tap on its button does. Returns the choice's label.
+    async fn answer_approval(
+        &self,
+        stored: &crate::store::StoredApproval,
+        choice_id: &str,
+    ) -> Result<String, ApprovalTapError> {
         let choice = stored
             .request
             .choices
             .iter()
-            .find(|choice| choice.id == response.choice_id)
+            .find(|choice| choice.id == choice_id)
             .ok_or_else(|| "approval choice is no longer available".to_string())?;
         // Claude puts a refused prompt back in its input box to be edited,
         // which a Telegram owner cannot reach, and the draft then blocks every
@@ -2941,6 +2951,110 @@ impl ProductionService {
             .collect()
     }
 
+    /// Answers an agent's question or approval for the owner from a local
+    /// client, as a tap on the action's Telegram button does, and posts a copy
+    /// of the answer in the route's private channel.
+    async fn handle_answer(&self, id: Uuid, params: AnswerParams) -> ControlResponse {
+        let via = params.via.as_deref().map(str::trim).unwrap_or("local");
+        if via.is_empty() || via.chars().count() > 64 || via.contains('\n') {
+            return error_response(
+                id,
+                "invalid_params",
+                "a client name must be one line of 1 to 64 characters",
+                None,
+            );
+        }
+        let Some((request_id, choice_id)) = params
+            .action
+            .strip_prefix("wakap:")
+            .and_then(|rest| rest.split_once(':'))
+        else {
+            return error_response(
+                id,
+                "unknown_action",
+                "the action is not a question or approval choice",
+                None,
+            );
+        };
+        let routes = match self.store.list_routes().await {
+            Ok(routes) => routes,
+            Err(error) => return internal(id, error),
+        };
+        let route = match exact_route(&routes, &params.title) {
+            Ok(route) => route,
+            Err(detail) => return route_error(id, "", detail),
+        };
+        let stored = match self.store.get_approval(request_id.to_owned()).await {
+            Ok(Some(stored)) if stored.route_id == route.id => stored,
+            Ok(_) => {
+                return error_response(
+                    id,
+                    "unknown_action",
+                    format!("route {:?} has no question with this action", route.title),
+                    None,
+                );
+            }
+            Err(error) => return internal(id, error),
+        };
+        if !stored
+            .request
+            .choices
+            .iter()
+            .any(|choice| choice.id == choice_id)
+        {
+            return error_response(
+                id,
+                "unknown_action",
+                "the question has no such choice",
+                None,
+            );
+        }
+        let answer = match self.answer_approval(&stored, choice_id).await {
+            Ok(answer) => answer,
+            Err(ApprovalTapError::Closed) => {
+                return error_response(
+                    id,
+                    "question_closed",
+                    "the question was already answered or closed, so nothing was sent",
+                    None,
+                );
+            }
+            Err(ApprovalTapError::Failed(detail)) => {
+                return error_response(id, "answer_failed", detail, None);
+            }
+        };
+        if let Some((kind, destination)) = route.private_destination() {
+            let namespace = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"https://panetone.dev/answer/v1");
+            let copy_id = EffectId::new(Uuid::new_v5(&namespace, params.action.as_bytes()));
+            let copy = OutboxItem {
+                id: copy_id,
+                route_id: Some(route.id),
+                sender_harness: None,
+                source_agent: None,
+                kind,
+                destination,
+                body: format!("[via {via}] answered: {answer}"),
+                attachments: Vec::new(),
+                actions: Vec::new(),
+                state: OutboxState::Pending,
+                attempts: 0,
+                last_error: None,
+                external_receipt: None,
+                uncertain_attempts: 0,
+                part: None,
+                owner: Some(crate::domain::OwnerPost {
+                    request: copy_id,
+                    via: via.to_owned(),
+                }),
+                turn_end: None,
+            };
+            if let Err(error) = self.store.enqueue_outbox(None, copy, now_ms()).await {
+                tracing::warn!(error = %error, "the copy of an answer was not posted");
+            }
+        }
+        success_response(id, json!({"answered": answer}))
+    }
+
     /// Delivers a message the owner sends from a local client, such as a voice
     /// app, as an inbound message in the route's private channel, so the
     /// agent sees the owner talking and it is queued, steered and answered
@@ -3530,6 +3644,10 @@ impl ControlHandler for ProductionService {
                 },
                 "feed" => match serde_json::from_value::<FeedParams>(request.params) {
                     Ok(params) => self.handle_feed(request.id, params).await,
+                    Err(error) => invalid(request.id, error),
+                },
+                "answer" => match serde_json::from_value::<AnswerParams>(request.params) {
+                    Ok(params) => self.handle_answer(request.id, params).await,
                     Err(error) => invalid(request.id, error),
                 },
                 "say" => match serde_json::from_value::<SayParams>(request.params) {
@@ -4358,6 +4476,191 @@ fi
         assert!(request.contains("\"message_id\":555"));
         assert!(request.contains("\"inline_keyboard\":[]"));
         assert_eq!(service.strip_closed_approval_buttons().await.unwrap(), 0);
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_local_client_answers_a_question_as_its_button_would() {
+        let directory = tempdir().unwrap();
+        let calls = directory.path().join("approval-args.log");
+        let binary = directory.path().join("wakterm-fake");
+        // Wakterm takes option_1; for option_2 the question has just closed.
+        fs::write(
+            &binary,
+            format!(
+                r#"#!/bin/bash
+set -euo pipefail
+operation="$*"
+if [[ "$operation" == *"agent capabilities"* ]]; then
+  echo '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1","approval_control.v1"]}}'
+elif [[ "$operation" == *"agent approval"* ]]; then
+  printf '%s\n' "$@" >> '{}'
+  if [[ "$operation" == *"option_2"* ]]; then
+    echo 'unexpected response Ok(ErrorResponse(ErrorResponse {{ reason: "Error: Claude does not report a dialog open" }}))' >&2
+    exit 1
+  fi
+  echo '{{"schema":"wakterm.agent-approval.v1","request_id":"0880b9d13ff777a7a165a79b","agent_id":"agent-route","incarnation_id":"inc-route","choice_id":"option_1","resolved":true}}'
+else
+  echo "unexpected fake invocation: $operation" >&2
+  exit 9
+fi
+"#,
+                calls.display()
+            ),
+        )
+        .unwrap();
+        crate::test_support::seal_executable(&binary);
+        let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        let route = Route {
+            id: RouteId::new(Uuid::new_v4()),
+            title: "re-opus".into(),
+            channels: vec![ChannelBinding::Telegram { topic_id: 10 }],
+            agent: None,
+        };
+        store.save_route(route.clone(), 1).await.unwrap();
+        store
+            .save_route(
+                Route {
+                    id: RouteId::new(Uuid::new_v4()),
+                    title: "other".into(),
+                    channels: vec![ChannelBinding::Telegram { topic_id: 11 }],
+                    agent: None,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        store.initialize_event_cursor(100).await.unwrap();
+        let asked: crate::wakterm::EventRecord = serde_json::from_value(json!({
+            "sequence": 101,
+            "event_id": "question-101",
+            "kind": "approval_requested",
+            "agent_id": "agent-route",
+            "incarnation_id": "inc-route",
+            "observed_at": "2026-11-21T23:22:55Z",
+            "approval": {
+                "schema": "wakterm.agent-approval.v1",
+                "kind": "user_question",
+                "request_id": "0880b9d13ff777a7a165a79b",
+                "agent_id": "agent-route",
+                "incarnation_id": "inc-route",
+                "turn_id": "turn-1",
+                "item_id": "item-1",
+                "observed_at": "2026-11-21T23:22:55Z",
+                "prompt": "Should this project take it on?",
+                "reason": null,
+                "command": null,
+                "cwd": null,
+                "choices": [
+                    {"id": "option_1", "label": "Build it here"},
+                    {"id": "option_2", "label": "Feasibility probe first"}
+                ]
+            }
+        }))
+        .unwrap();
+        store
+            .ingest_agent_events(
+                100,
+                101,
+                vec![asked],
+                vec![RouteAgent {
+                    route_id: route.id,
+                    agent: AgentBinding {
+                        agent_id: "agent-route".into(),
+                        incarnation_id: "inc-route".into(),
+                        harness: "claude".into(),
+                        pane_id: Some(1),
+                    },
+                }],
+                2,
+            )
+            .await
+            .unwrap();
+        let service = ProductionService::new(
+            store.clone(),
+            WaktermCli::new(
+                binary,
+                directory.path().join("mux.sock"),
+                Duration::from_secs(2),
+            ),
+            RealChannels::default(),
+            SupervisorHandle::default(),
+            Vec::new(),
+            directory.path().join("control.sock"),
+        );
+        let answer = |title: &str, action: &str| AnswerParams {
+            title: title.into(),
+            action: action.into(),
+            via: Some("gear".into()),
+        };
+        let code = |response: ControlResponse| response.error.map(|error| error.code);
+
+        let answered = service
+            .handle_answer(
+                Uuid::new_v4(),
+                answer("re-opus", "wakap:0880b9d13ff777a7a165a79b:option_1"),
+            )
+            .await;
+        assert_eq!(answered.result.unwrap()["answered"], "Build it here");
+        assert!(
+            fs::read_to_string(&calls)
+                .unwrap()
+                .contains("--choice\noption_1\n")
+        );
+        let copies = store
+            .pending_outbox()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|post| post.owner.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].body, "[via gear] answered: Build it here");
+        assert_eq!(copies[0].destination, "10");
+
+        assert_eq!(
+            code(
+                service
+                    .handle_answer(
+                        Uuid::new_v4(),
+                        answer("re-opus", "wakap:0880b9d13ff777a7a165a79b:option_2")
+                    )
+                    .await
+            ),
+            Some("question_closed".into())
+        );
+        assert_eq!(
+            code(
+                service
+                    .handle_answer(
+                        Uuid::new_v4(),
+                        answer("re-opus", "wakap:0880b9d13ff777a7a165a79b:option_9")
+                    )
+                    .await
+            ),
+            Some("unknown_action".into())
+        );
+        // Another route's agent cannot be answered through this route.
+        assert_eq!(
+            code(
+                service
+                    .handle_answer(
+                        Uuid::new_v4(),
+                        answer("other", "wakap:0880b9d13ff777a7a165a79b:option_1")
+                    )
+                    .await
+            ),
+            Some("unknown_action".into())
+        );
+        assert_eq!(
+            code(
+                service
+                    .handle_answer(Uuid::new_v4(), answer("re-opus", "form:abc:submit"))
+                    .await
+            ),
+            Some("unknown_action".into())
+        );
         drop(service);
         store.shutdown().await.unwrap();
     }

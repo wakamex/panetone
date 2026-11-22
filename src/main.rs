@@ -10,7 +10,7 @@ use panetone::channels::{
     TelegramPoller,
 };
 use panetone::control::{
-    CONTROL_SCHEMA, ControlRequest, ControlServer, FeedParams, NotifyParams,
+    AnswerParams, CONTROL_SCHEMA, ControlRequest, ControlServer, FeedParams, NotifyParams,
     OutputDispositionParams, RouteEnsureParams, RouteInspectParams, SayParams, SendParams,
     SourceAgent, request,
 };
@@ -44,6 +44,8 @@ enum Command {
     Notify(NotifyArgs),
     /// Send a route a message as its owner, as if typed in its private channel.
     Say(SayArgs),
+    /// Answer an agent's question as its owner, as its Telegram button would.
+    Answer(AnswerArgs),
     /// Follow the posts Panetone makes to the owner's own channels, one JSON
     /// line each.
     Watch(WatchArgs),
@@ -197,6 +199,23 @@ struct NotifyArgs {
     /// posted posts nothing again.
     #[arg(long)]
     id: Option<Uuid>,
+    #[command(flatten)]
+    control: ControlSocketArgs,
+}
+
+#[derive(Args)]
+struct AnswerArgs {
+    /// The route whose agent asked.
+    #[arg(long = "to")]
+    title: String,
+    /// The action to press, as the feed lists it, such as
+    /// `wakap:REQUEST:option_1`.
+    #[arg(long)]
+    action: String,
+    /// The client's name, shown on the copy in the route's channel as
+    /// `[via NAME]` (default: local).
+    #[arg(long = "as", value_name = "NAME")]
+    via: Option<String>,
     #[command(flatten)]
     control: ControlSocketArgs,
 }
@@ -376,6 +395,7 @@ async fn main() -> Result<()> {
         Command::Cancel(args) => run_cancel(args).await,
         Command::Notify(args) => run_notify(args).await,
         Command::Say(args) => run_say(args).await,
+        Command::Answer(args) => run_answer(args).await,
         Command::Watch(args) => run_watch(args).await,
         Command::Chat(args) => {
             let name = args.name.unwrap_or_else(|| {
@@ -1241,6 +1261,31 @@ fn message_or_stdin(message: Option<String>) -> Result<String> {
                 .context("read the message from standard input")?;
             Ok(body)
         }
+    }
+}
+
+async fn run_answer(args: AnswerArgs) -> Result<()> {
+    let socket = control_socket(args.control.socket)?;
+    let params = AnswerParams {
+        title: args.title,
+        action: args.action,
+        via: args.via,
+    };
+    let response = request(
+        &socket,
+        &ControlRequest {
+            schema: CONTROL_SCHEMA.into(),
+            id: Uuid::new_v4(),
+            method: "answer".into(),
+            params: serde_json::to_value(params)?,
+        },
+    )
+    .await?;
+    println!("{}", serde_json::to_string(&response)?);
+    if response.ok {
+        Ok(())
+    } else {
+        bail!("the answer was rejected")
     }
 }
 
