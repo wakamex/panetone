@@ -26,12 +26,13 @@ fn route(id: u128, title: &str, agent: AgentBinding, topic_id: i64) -> Route {
 
 async fn recording_telegram(
     order_log: std::path::PathBuf,
+    posts: usize,
 ) -> (String, tokio::task::JoinHandle<Vec<serde_json::Value>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let mut captured = Vec::new();
-        for message_id in [701, 702] {
+        for message_id in (701..).take(posts) {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut received = Vec::new();
             let header_end = loop {
@@ -131,7 +132,7 @@ fi
     let source = route(1, "Source", source_binding, 101);
     let target = route(2, "Target", target_binding, 202);
 
-    let (telegram_base, telegram_server) = recording_telegram(order_log.clone()).await;
+    let (telegram_base, telegram_server) = recording_telegram(order_log.clone(), 1).await;
     let channels = RealChannels {
         telegram: Some(
             TelegramClient::new(telegram_base, "fake-token", -1001, Duration::from_secs(2))
@@ -162,23 +163,19 @@ fi
         .unwrap();
     assert_eq!(replay, first);
 
+    // The audit line, then the prompt; a send that went straight in posts no
+    // [submitted] line.
     let telegram = telegram_server.await.unwrap();
-    assert_eq!(telegram.len(), 2);
+    assert_eq!(telegram.len(), 1);
     assert!(
         telegram[0]["text"]
             .as_str()
             .unwrap()
             .starts_with("[pending]")
     );
-    assert!(
-        telegram[1]["text"]
-            .as_str()
-            .unwrap()
-            .starts_with("[submitted]")
-    );
     assert_eq!(
         fs::read_to_string(&order_log).unwrap(),
-        "telegram\nwakterm\ntelegram\n"
+        "telegram\nwakterm\n"
     );
     let workflow = store.get_workflow(command.id).await.unwrap().unwrap();
     assert_eq!(workflow.workflow.state, WorkflowState::Completed);
@@ -233,7 +230,7 @@ fi
         101,
     );
     let target = route(2, "Target", target_binding, 202);
-    let (telegram_base, telegram_server) = recording_telegram(order_log).await;
+    let (telegram_base, telegram_server) = recording_telegram(order_log, 2).await;
     let channels = RealChannels {
         telegram: Some(
             TelegramClient::new(telegram_base, "fake-token", -1001, Duration::from_secs(2))

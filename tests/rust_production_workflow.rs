@@ -796,8 +796,10 @@ async fn production_workflow_resolves_live_routes_and_survives_restart() {
     );
     assert!(report.status.success());
     assert_eq!(fs::read_to_string(&admissions).unwrap().lines().count(), 2);
+    // Each send's [pending] line; one that went straight in posts no
+    // [submitted] line.
     let messages = telegram.sent_messages();
-    assert_eq!(messages.len(), 4);
+    assert_eq!(messages.len(), 2);
     assert!(messages.iter().any(|message| {
         message["message_thread_id"] == 102
             && message["text"].as_str().unwrap().contains("do the work")
@@ -827,7 +829,7 @@ async fn production_workflow_resolves_live_routes_and_survives_restart() {
     );
     assert!(duplicate_after_restart.status.success());
     assert_eq!(fs::read_to_string(&admissions).unwrap().lines().count(), 2);
-    assert_eq!(telegram.sent_messages().len(), 4);
+    assert_eq!(telegram.sent_messages().len(), 2);
     restarted.stop();
 }
 

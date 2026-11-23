@@ -90,7 +90,7 @@ async fn audit_is_visible_before_exact_target_admission() {
         .await
         .unwrap();
     assert!(ack.submitted);
-    assert_eq!(service.channels().calls().len(), 2);
+    assert_eq!(service.channels().calls().len(), 1);
     assert!(service.channels().calls()[0].body.starts_with("[pending]"));
     assert_eq!(service.wakterm().calls().len(), 1);
     assert_eq!(
@@ -154,7 +154,7 @@ async fn long_audit_is_fully_delivered_in_durable_chunks_before_admission() {
         .unwrap();
 
     let calls = service.channels().calls();
-    assert_eq!(calls.len(), 4);
+    assert_eq!(calls.len(), 3);
     assert_eq!(
         calls[..3]
             .iter()
@@ -167,7 +167,11 @@ async fn long_audit_is_fully_delivered_in_durable_chunks_before_admission() {
             .iter()
             .all(|call| call.body.encode_utf16().count() <= 3900)
     );
-    assert!(calls[3].body.starts_with("[submitted]"));
+    assert!(
+        calls
+            .iter()
+            .all(|call| !call.body.starts_with("[submitted]"))
+    );
     assert_eq!(service.wakterm().calls().len(), 1);
     drop(service);
     store.shutdown().await.unwrap();
@@ -547,9 +551,9 @@ async fn callback_busy_is_queued_with_one_visible_mirror_and_the_same_callback_i
         .unwrap();
     assert_eq!(returned.agent.state, DeliveryState::Pending);
     assert_eq!(returned.mirror.state, DeliveryState::Delivered);
-    assert_eq!(service.channels().calls().len(), 3);
+    assert_eq!(service.channels().calls().len(), 2);
     assert!(
-        service.channels().calls()[2]
+        service.channels().calls()[1]
             .body
             .contains("[Panetone asynchronous final return]")
     );
@@ -557,7 +561,7 @@ async fn callback_busy_is_queued_with_one_visible_mirror_and_the_same_callback_i
     let delivered = service.retry_pending_return(request.id, 300).await.unwrap();
     assert_eq!(delivered.agent.state, DeliveryState::Delivered);
     assert_eq!(delivered.agent.effect_id, callback_id);
-    assert_eq!(service.channels().calls().len(), 3);
+    assert_eq!(service.channels().calls().len(), 2);
     assert_eq!(service.wakterm().calls().len(), 2);
     assert_eq!(service.wakterm().calls()[1].request_id, callback_id);
     drop(service);
@@ -593,7 +597,7 @@ async fn missing_source_agent_keeps_the_result_visible_and_durable() {
     assert_eq!(returned.mirror.state, DeliveryState::Delivered);
     assert_eq!(store.status().await.unwrap().unresolved_returns, 1);
     assert!(
-        service.channels().calls()[2]
+        service.channels().calls()[1]
             .body
             .contains("source has gone away")
     );
@@ -629,7 +633,7 @@ async fn unrelated_terminal_identity_is_rejected_without_a_callback_or_mirror() 
         service.accept_terminal(terminal, &source, 200).await,
         Err(ServiceError::TerminalIdentity)
     ));
-    assert_eq!(service.channels().calls().len(), 2);
+    assert_eq!(service.channels().calls().len(), 1);
     assert_eq!(service.wakterm().calls().len(), 1);
     drop(service);
     store.shutdown().await.unwrap();
@@ -727,7 +731,7 @@ async fn crash_after_audit_effect_replays_only_the_at_least_once_audit() {
         .unwrap();
     assert!(ack.submitted);
     assert_eq!(replacement.wakterm().calls().len(), 1);
-    assert_eq!(replacement.channels().calls().len(), 2);
+    assert_eq!(replacement.channels().calls().len(), 1);
     drop(replacement);
     reopened.shutdown().await.unwrap();
 }
@@ -767,7 +771,7 @@ async fn crash_after_durable_acceptance_finishes_without_a_second_prompt() {
         .unwrap();
     assert!(ack.submitted);
     assert!(replacement.wakterm().calls().is_empty());
-    assert_eq!(replacement.channels().calls().len(), 1);
+    assert!(replacement.channels().calls().is_empty());
     drop(replacement);
     reopened.shutdown().await.unwrap();
 }

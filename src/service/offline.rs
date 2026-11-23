@@ -834,8 +834,14 @@ impl OfflineService {
                 },
             )
         };
-        self.post_target_status(&record, target_channel, purpose, detail, now_ms)
-            .await?;
+        // A send that went straight in is confirmed only seconds after its
+        // [pending] line, so its [submitted] line would add nothing; one that
+        // waited in the queue, was steered or is unconfirmed is still told.
+        let was_queued = record.response.is_some();
+        if purpose != "submitted" || record.proof.is_some() || was_queued {
+            self.post_target_status(&record, target_channel, purpose, detail, now_ms)
+                .await?;
+        }
         record.response = Some(serde_json::to_value(&ack)?);
         if record.proof.is_some() {
             // Settled by settle_steered_sends once the target records it.
