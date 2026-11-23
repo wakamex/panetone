@@ -671,17 +671,30 @@ impl ProductionService {
         Ok(created)
     }
 
+    /// Sends the oldest pending post of each channel, the channels side by
+    /// side, so one channel's rate limit or outage never holds up the other's
+    /// posts. Each channel's posts still go in the order they were queued.
     pub async fn outbox_once(&self) -> Result<usize, String> {
-        let Some(mut item) = self
-            .store
-            .pending_outbox()
-            .await
-            .map_err(error_string)?
-            .into_iter()
-            .next()
-        else {
-            return Ok(0);
-        };
+        let pending = self.store.pending_outbox().await.map_err(error_string)?;
+        let oldest = |kind: ChannelKind| pending.iter().find(|item| item.kind == kind).cloned();
+        let (telegram, signal) = tokio::join!(
+            async {
+                match oldest(ChannelKind::Telegram) {
+                    Some(item) => self.deliver_outbox_item(item).await,
+                    None => Ok(0),
+                }
+            },
+            async {
+                match oldest(ChannelKind::Signal) {
+                    Some(item) => self.deliver_outbox_item(item).await,
+                    None => Ok(0),
+                }
+            },
+        );
+        Ok(telegram? + signal?)
+    }
+
+    async fn deliver_outbox_item(&self, mut item: OutboxItem) -> Result<usize, String> {
         let expected_attempts = item.attempts;
         item.state = OutboxState::Delivering;
         item.attempts += 1;
@@ -4087,6 +4100,54 @@ mod tests {
 
     const INACTIVE: &str =
         "Failed to send message: the connection was closed (ChatServiceInactiveException)";
+
+    #[tokio::test]
+    async fn a_failing_channel_does_not_hold_up_the_other_channels_posts() {
+        let directory = tempdir().unwrap();
+        let socket = directory.path().join("signal.sock");
+        let (store, service, id) = signal_outbox_service(directory.path(), &socket).await;
+        // An older Telegram post that cannot be sent, as during a rate limit.
+        store
+            .enqueue_outbox(
+                None,
+                OutboxItem {
+                    id: EffectId::new(Uuid::from_u128(76)),
+                    route_id: None,
+                    sender_harness: None,
+                    source_agent: None,
+                    kind: ChannelKind::Telegram,
+                    destination: "10".into(),
+                    body: "stuck".into(),
+                    attachments: Vec::new(),
+                    actions: Vec::new(),
+                    state: OutboxState::Pending,
+                    attempts: 0,
+                    last_error: None,
+                    external_receipt: None,
+                    uncertain_attempts: 0,
+                    part: None,
+                    owner: None,
+                    turn_end: None,
+                },
+                0,
+            )
+            .await
+            .unwrap();
+        let server = scripted_signal(&socket, vec![SignalReply::Posted]);
+        // One pass tries both channels, so the Signal post goes out.
+        assert_eq!(service.outbox_once().await.unwrap(), 2);
+        assert_eq!(server.await.unwrap(), ["reply"]);
+        assert!(
+            store
+                .pending_outbox()
+                .await
+                .unwrap()
+                .iter()
+                .all(|item| item.id != id)
+        );
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn outbox_labels_a_retry_after_an_attempt_that_may_have_posted() {
