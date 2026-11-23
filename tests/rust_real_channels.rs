@@ -75,41 +75,57 @@ async fn http_server(
 }
 
 async fn raw_http_server(response: &'static [u8]) -> (String, JoinHandle<CapturedRawHttp>) {
+    let (base, task) = raw_http_server_answering(vec![response]).await;
+    (
+        base,
+        tokio::spawn(async move { task.await.unwrap().remove(0) }),
+    )
+}
+
+/// A server that answers one request with each response in turn, each on
+/// its own connection.
+async fn raw_http_server_answering(
+    responses: Vec<&'static [u8]>,
+) -> (String, JoinHandle<Vec<CapturedRawHttp>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut received = Vec::new();
-        let header_end = loop {
-            let mut chunk = [0_u8; 1024];
-            let read = stream.read(&mut chunk).await.unwrap();
-            assert!(read > 0);
-            received.extend_from_slice(&chunk[..read]);
-            if let Some(position) = received.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
-                break position + 4;
+        let mut captured = Vec::new();
+        for response in responses {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0_u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0);
+                received.extend_from_slice(&chunk[..read]);
+                if let Some(position) = received.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let headers = String::from_utf8(received[..header_end].to_vec()).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap();
+            while received.len() - header_end < content_length {
+                let mut chunk = [0_u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0);
+                received.extend_from_slice(&chunk[..read]);
             }
-        };
-        let headers = String::from_utf8(received[..header_end].to_vec()).unwrap();
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                line.to_ascii_lowercase()
-                    .strip_prefix("content-length: ")
-                    .and_then(|value| value.trim().parse::<usize>().ok())
-            })
-            .unwrap();
-        while received.len() - header_end < content_length {
-            let mut chunk = [0_u8; 1024];
-            let read = stream.read(&mut chunk).await.unwrap();
-            assert!(read > 0);
-            received.extend_from_slice(&chunk[..read]);
+            stream.write_all(response).await.unwrap();
+            captured.push(CapturedRawHttp {
+                request_line: headers.lines().next().unwrap().to_owned(),
+                headers,
+                body: received[header_end..header_end + content_length].to_vec(),
+            });
         }
-        stream.write_all(response).await.unwrap();
-        CapturedRawHttp {
-            request_line: headers.lines().next().unwrap().to_owned(),
-            headers,
-            body: received[header_end..header_end + content_length].to_vec(),
-        }
+        captured
     });
     (format!("http://{address}"), task)
 }
@@ -270,6 +286,49 @@ async fn telegram_sends_multiple_images_as_one_media_group() {
     assert!(body.contains("two scenes"));
     assert!(body.contains("first"));
     assert!(body.contains("second"));
+}
+
+#[tokio::test]
+async fn telegram_sends_photos_and_other_files_of_one_post_as_two_groups() {
+    let photos = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"ok\":true,\"result\":{\"message_id\":406}}";
+    let others = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"ok\":true,\"result\":[{\"message_id\":407},{\"message_id\":408}]}";
+    let (base, requests) = raw_http_server_answering(vec![photos, others]).await;
+    let telegram = TelegramClient::new(&base, "fake-token", -1001, Duration::from_secs(2)).unwrap();
+    let mut message = item(ChannelKind::Telegram, "77");
+    message.body = "all four characters".into();
+    let attachment = |name: &str, media_type: &str| ChannelAttachment {
+        file_name: name.into(),
+        media_type: media_type.into(),
+        size: 5,
+        sha256: "unused".into(),
+        data_base64: "Zmlyc3Q=".into(),
+    };
+    message.attachments = vec![
+        attachment("all-rows.png", "image/png"),
+        attachment("tomato-thinking.gif", "image/gif"),
+        attachment("girl-thinking.gif", "image/gif"),
+    ];
+
+    let receipt = telegram.send(&message).await.unwrap();
+    assert_eq!(receipt.external_id, "406");
+    let requests = requests.await.unwrap();
+    // The photo with the text as its caption, then the other files.
+    assert_eq!(
+        requests[0].request_line,
+        "POST /botfake-token/sendPhoto HTTP/1.1"
+    );
+    let first = String::from_utf8(requests[0].body.clone()).unwrap();
+    assert!(first.contains("filename=\"all-rows.png\"") && first.contains("all four characters"));
+    assert_eq!(
+        requests[1].request_line,
+        "POST /botfake-token/sendMediaGroup HTTP/1.1"
+    );
+    let second = String::from_utf8(requests[1].body.clone()).unwrap();
+    assert!(
+        second.contains("filename=\"tomato-thinking.gif\"")
+            && second.contains("filename=\"girl-thinking.gif\"")
+    );
+    assert!(!second.contains("all four characters"));
 }
 
 #[tokio::test]

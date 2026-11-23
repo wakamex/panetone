@@ -552,6 +552,27 @@ async fn telegram_send_attachments(
     target: TelegramTarget,
     item: &OutboxItem,
 ) -> Result<DeliveryReceipt, ChannelDeliveryError> {
+    // Telegram groups photos and documents separately, so a post with both
+    // goes as the photos, with the text as their caption, and then the
+    // other files.
+    let (photos, files): (Vec<_>, Vec<_>) =
+        item.attachments.iter().cloned().partition(telegram_photo);
+    if !photos.is_empty() && !files.is_empty() {
+        let mut first = item.clone();
+        first.attachments = photos;
+        let receipt = Box::pin(telegram_send_attachments(
+            client, base, token, target, &first,
+        ))
+        .await?;
+        let mut rest = item.clone();
+        rest.attachments = files;
+        rest.body = String::new();
+        Box::pin(telegram_send_attachments(
+            client, base, token, target, &rest,
+        ))
+        .await?;
+        return Ok(receipt);
+    }
     if item.attachments.len() > 1 {
         return telegram_send_media_group(client, base, token, target, item).await;
     }
@@ -588,12 +609,6 @@ async fn telegram_send_media_group(
     item: &OutboxItem,
 ) -> Result<DeliveryReceipt, ChannelDeliveryError> {
     let photos = item.attachments.iter().all(telegram_photo);
-    if !photos && item.attachments.iter().any(telegram_photo) {
-        return Err(ChannelDeliveryError::Rejected {
-            kind: item.kind,
-            detail: "Telegram cannot combine photos and documents in one media group".into(),
-        });
-    }
     let media_kind = if photos { "photo" } else { "document" };
     let media = item
         .attachments
