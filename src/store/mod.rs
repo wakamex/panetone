@@ -479,6 +479,32 @@ impl StoreHandle {
             .await
     }
 
+    /// Saves an outbox post as `item`, normally marked as being delivered,
+    /// only if it is still in state `from`, so that the outbox worker and a
+    /// workflow delivering its own post never both send it. Returns whether
+    /// this caller claimed the post.
+    pub async fn claim_outbox(
+        &self,
+        item: OutboxItem,
+        from: OutboxState,
+        now_ms: i64,
+    ) -> StoreResult<bool> {
+        self.run(move |connection| {
+            Ok(connection.execute(
+                "UPDATE outbox SET state = ?2, record_json = ?3, updated_at_ms = ?4
+                 WHERE effect_id = ?1 AND state = ?5",
+                params![
+                    item.id.to_string(),
+                    outbox_name(item.state),
+                    serde_json::to_string(&item)?,
+                    now_ms,
+                    outbox_name(from),
+                ],
+            )? == 1)
+        })
+        .await
+    }
+
     /// An outbox post by ID, with the time it was queued.
     pub async fn get_outbox(&self, id: EffectId) -> StoreResult<Option<(OutboxItem, i64)>> {
         self.run(move |connection| {

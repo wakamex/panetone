@@ -19,6 +19,9 @@ use crate::store::{
 /// waits for the target to record taking it. Wakterm submits a steer an agent
 /// left in its input box when the turn ends, following it for 10 minutes.
 const SEND_PROOF_WINDOW_MS: i64 = 10 * 60 * 1000;
+/// How long a workflow waits for the outbox worker to finish sending a post
+/// it took first; longer than a Telegram send's own deadline.
+const OUTBOX_HANDOFF_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 use crate::wakterm::{
     ContractError, EventRead, FakeWakterm, TerminalResult, WaktermCli, WaktermCliError,
 };
@@ -386,10 +389,16 @@ impl OfflineService {
                     chunk.id
                 )));
             }
+            let from = chunk.state;
             chunk.state = OutboxState::Delivering;
             chunk.attempts += 1;
             chunk.last_error = None;
-            self.store.save_outbox(chunk.clone(), now_ms).await?;
+            // The outbox worker may have taken the post since it was queued;
+            // it is then sent once, by the worker, and its result used here.
+            if !self.store.claim_outbox(chunk.clone(), from, now_ms).await? {
+                last_receipt = self.await_outbox_delivery(chunk.id).await?;
+                continue;
+            }
             let routes = match chunk.kind {
                 ChannelKind::Signal => self.store.list_routes().await?,
                 ChannelKind::Telegram => Vec::new(),
@@ -414,6 +423,39 @@ impl OfflineService {
             }
         }
         Ok(last_receipt)
+    }
+
+    /// Waits for the outbox worker to finish sending a post, and returns its
+    /// receipt.
+    async fn await_outbox_delivery(&self, id: EffectId) -> Result<String, ServiceError> {
+        let deadline = std::time::Instant::now() + OUTBOX_HANDOFF_WAIT;
+        loop {
+            match self.store.get_outbox(id).await? {
+                Some((item, _)) if item.state == OutboxState::Delivered => {
+                    return Ok(item.external_receipt.unwrap_or_default());
+                }
+                Some((item, _))
+                    if matches!(item.state, OutboxState::Failed | OutboxState::Indeterminate) =>
+                {
+                    return Err(ServiceError::Adapter(format!(
+                        "outbox post {id} ended {:?}: {}",
+                        item.state,
+                        item.last_error.unwrap_or_default()
+                    )));
+                }
+                None => {
+                    return Err(ServiceError::Adapter(format!(
+                        "outbox post {id} is missing"
+                    )));
+                }
+                Some(_) if std::time::Instant::now() >= deadline => {
+                    return Err(ServiceError::Adapter(format!(
+                        "outbox post {id} is still being delivered by the outbox worker"
+                    )));
+                }
+                Some(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            }
+        }
     }
 
     pub async fn consume_fixture_events(

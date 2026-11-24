@@ -697,10 +697,15 @@ impl ProductionService {
         let expected_attempts = item.attempts;
         item.state = OutboxState::Delivering;
         item.attempts += 1;
-        self.store
-            .save_outbox(item.clone(), now_ms())
+        // A workflow may be sending its own post at this moment.
+        if !self
+            .store
+            .claim_outbox(item.clone(), OutboxState::Pending, now_ms())
             .await
-            .map_err(error_string)?;
+            .map_err(error_string)?
+        {
+            return Ok(0);
+        }
         let attempt = OutboxItem {
             body: item.attempt_body(),
             ..item.clone()

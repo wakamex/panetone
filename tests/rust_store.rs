@@ -668,3 +668,53 @@ async fn event_cursor_rebaseline_preserves_captured_delivery_work() {
     );
     store.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn only_one_sender_claims_a_pending_outbox_post() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let pending = OutboxItem {
+        id: EffectId::new(Uuid::from_u128(51)),
+        route_id: None,
+        sender_harness: None,
+        source_agent: None,
+        kind: ChannelKind::Telegram,
+        destination: "12".into(),
+        body: "[pending] source -> target".into(),
+        attachments: Vec::new(),
+        actions: Vec::new(),
+        state: OutboxState::Pending,
+        attempts: 0,
+        last_error: None,
+        external_receipt: None,
+        uncertain_attempts: 0,
+        part: None,
+        owner: None,
+        turn_end: None,
+    };
+    store
+        .enqueue_outbox(None, pending.clone(), 100)
+        .await
+        .unwrap();
+    let delivering = OutboxItem {
+        state: OutboxState::Delivering,
+        attempts: 1,
+        ..pending
+    };
+    // The workflow and the outbox worker both read it as pending; only the
+    // first to claim it sends it.
+    assert!(
+        store
+            .claim_outbox(delivering.clone(), OutboxState::Pending, 101)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .claim_outbox(delivering, OutboxState::Pending, 101)
+            .await
+            .unwrap()
+    );
+    assert!(store.pending_outbox().await.unwrap().is_empty());
+    store.shutdown().await.unwrap();
+}
