@@ -57,6 +57,35 @@ class ReportId(unittest.TestCase):
         self.assertEqual(len(ids), 2)
         self.assertNotEqual(ids[0], ids[1])
 
+    def test_a_route_whose_agent_is_away_is_waited_for(self):
+        ids = []
+
+        def fake_run(command, **kwargs):
+            ids.append(command[command.index("--id") + 1])
+            away = len(ids) < 3
+            return subprocess.CompletedProcess(
+                command,
+                1 if away else 0,
+                stdout='{"ok": false, "error": {"code": "source_route_unavailable"}}' if away else "{}",
+                stderr="",
+            )
+
+        with mock.patch("watch.subprocess.run", fake_run):
+            sent = send_report({"task:endchat": "retrying"}, "report", {}, interval=0)
+        self.assertEqual(sent.returncode, 0)
+        self.assertEqual(len(set(ids)), 1, "the same request is sent again")
+        self.assertEqual(len(ids), 3)
+
+    def test_an_agent_that_stays_away_still_fails_the_run(self):
+        def fake_run(command, **kwargs):
+            return subprocess.CompletedProcess(
+                command, 1, stdout='{"ok": false, "error": {"code": "target_route_unavailable"}}', stderr=""
+            )
+
+        with mock.patch("watch.subprocess.run", fake_run):
+            sent = send_report({"task:endchat": "retrying"}, "report", {}, tries=3, interval=0)
+        self.assertEqual(sent.returncode, 1)
+
     def test_a_problem_that_came_back_gets_a_new_request_id(self):
         first = report_id({"task:a": "x"})
         self.assertEqual(report_id({"task:a": "x"}, {}), first)

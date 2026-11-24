@@ -89,16 +89,30 @@ def report_id(keys, occurrences=None):
     return str(uuid.uuid5(REPORT_NAMESPACE, "\n".join(sorted(names))))
 
 
-def send_report(new, message, occurrences):
+# Refusals that mean the route's agent is away for the moment, as while a mux
+# restart brings the agents back; nothing was accepted, so the same request
+# can be sent again.
+AGENT_AWAY = ("source_route_unavailable", "target_route_unavailable")
+
+
+def send_report(new, message, occurrences, tries=40, interval=3):
     """Sends a report, returning the completed process. An ID Panetone has
     seen with other content belongs to an earlier occurrence the count did
-    not record, so the problems are counted as new occurrences once more."""
+    not record, so the problems are counted as new occurrences once more. A
+    route whose agent is away is waited for up to two minutes, as a daemon
+    restart is."""
     def send():
-        return subprocess.run(
-            ["panetone", "send", "--from", ROUTE, "--to", ROUTE, "--id", report_id(new, occurrences), message],
-            capture_output=True,
-            text=True,
-        )
+        for attempt in range(tries):
+            sent = subprocess.run(
+                ["panetone", "send", "--from", ROUTE, "--to", ROUTE, "--id", report_id(new, occurrences), message],
+                capture_output=True,
+                text=True,
+            )
+            if sent.returncode == 0 or not any(code in sent.stdout for code in AGENT_AWAY):
+                return sent
+            if attempt < tries - 1:
+                time.sleep(interval)
+        return sent
 
     sent = send()
     if sent.returncode != 0 and "idempotency_conflict" in sent.stdout:
