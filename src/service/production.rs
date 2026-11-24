@@ -1174,7 +1174,26 @@ impl ProductionService {
                 text.push_str(&room_intro(&route.title, &members, member));
                 text.push_str("\n\n");
             }
-            if batch.len() > 1 {
+            // A long backlog is cut to its newest messages, so the prompt stays
+            // readable; the ones left out are said to be.
+            let mut size = 0;
+            let kept = batch
+                .iter()
+                .rev()
+                .take_while(|delivery| {
+                    size += delivery.text.len();
+                    size <= ROOM_BATCH_CHARS
+                })
+                .count()
+                .max(1);
+            let skipped = batch.drain(..batch.len() - kept).collect::<Vec<_>>();
+            if !skipped.is_empty() {
+                text.push_str(&format!(
+                    "{} room messages since your last turn, oldest first; {} earlier ones are left out:\n\n",
+                    batch.len(),
+                    skipped.len()
+                ));
+            } else if batch.len() > 1 {
                 text.push_str(&format!(
                     "{} room messages since your last turn, oldest first:\n\n",
                     batch.len()
@@ -1241,6 +1260,12 @@ impl ProductionService {
             if !introduced && state == "delivered" {
                 self.store
                     .set_metadata(intro_key, "1".into())
+                    .await
+                    .map_err(error_string)?;
+            }
+            for delivery in skipped {
+                self.store
+                    .set_room_delivery(delivery, "skipped".into())
                     .await
                     .map_err(error_string)?;
             }
@@ -3942,6 +3967,10 @@ fn reminder_body(owed: &[ReplyDebt], invalid: &[ReplyMessage]) -> String {
     );
     body
 }
+
+/// The most text of room messages one prompt carries; a longer backlog keeps
+/// its newest messages.
+const ROOM_BATCH_CHARS: usize = 24_000;
 
 /// What an agent is told the first time a room message reaches it.
 fn room_intro(title: &str, members: &str, member: bool) -> String {
@@ -7070,6 +7099,42 @@ fi
             })
             .collect::<Vec<_>>();
         assert_eq!(lines, ["Mihai: which PR first?", "gamma: The tools PR."]);
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_long_backlog_reaches_an_agent_as_its_newest_messages() {
+        let directory = tempdir().unwrap();
+        let (service, store, _route, admitted) =
+            room_fixture(directory.path(), &["claude", "agy"]).await;
+        service
+            .handle_room("room.open", &json!({"title": "game"}))
+            .await
+            .unwrap();
+        for index in 1..=4 {
+            let text = format!("message {index} {}", "x".repeat(10_000));
+            service
+                .handle_room(
+                    "room.say",
+                    &json!({"title": "game", "name": "Mihai", "text": text}),
+                )
+                .await
+                .unwrap();
+        }
+        // Two of the four fit in a prompt, for each of the two agents.
+        assert_eq!(service.rooms_once().await.unwrap(), 4);
+        for (_, prompt) in admitted_prompts(&admitted) {
+            assert!(
+                prompt.contains("2 room messages since your last turn, oldest first; 2 earlier ones are left out:"),
+                "{}",
+                &prompt[..200]
+            );
+            assert!(!prompt.contains("message 2 "));
+            assert!(prompt.contains("message 3 ") && prompt.contains("message 4 "));
+        }
+        // The left-out messages are not offered again.
+        assert_eq!(service.rooms_once().await.unwrap(), 0);
         drop(service);
         store.shutdown().await.unwrap();
     }
