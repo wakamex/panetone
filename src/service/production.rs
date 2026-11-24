@@ -3185,6 +3185,7 @@ impl ProductionService {
                 );
             }
             Err(ApprovalTapError::Failed(detail)) => {
+                tracing::warn!(route = %route.title, action = %params.action, via, error = %detail, "question answer was refused");
                 return error_response(id, "answer_failed", detail, None);
             }
         };
@@ -3286,7 +3287,10 @@ impl ProductionService {
                     None,
                 );
             }
-            Err(detail) => return error_response(id, "answer_failed", detail, None),
+            Err(detail) => {
+                tracing::warn!(route = %route.title, action = %params.action, via, error = %detail, "question form answer was refused");
+                return error_response(id, "answer_failed", detail, None);
+            }
         };
         if let Err(error) = self
             .channels
