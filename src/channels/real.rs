@@ -13,7 +13,7 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep_until, timeout};
 
-use crate::domain::{ChannelKind, OutboxItem, SIGNAL_DIRECT_PREFIX};
+use crate::domain::{ChannelKind, OutboxAction, OutboxItem, SIGNAL_DIRECT_PREFIX};
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const TELEGRAM_GROUP_INTERVAL: Duration = Duration::from_millis(3100);
@@ -184,6 +184,47 @@ impl TelegramClient {
                     "sendChatAction returned HTTP {}",
                     response.status().as_u16()
                 ),
+            })
+        }
+    }
+
+    /// Replaces a posted message's text and buttons. Telegram refuses an edit
+    /// that changes nothing, which counts as done.
+    pub async fn edit_message(
+        &self,
+        message_id: i64,
+        text: &str,
+        actions: &[OutboxAction],
+    ) -> Result<(), ChannelDeliveryError> {
+        let kind = ChannelKind::Telegram;
+        let keyboard = actions
+            .iter()
+            .map(|action| vec![json!({"text": action.label, "callback_data": action.id})])
+            .collect::<Vec<_>>();
+        let response = self
+            .http
+            .post(format!(
+                "{}/bot{}/editMessageText",
+                self.api_base, self.token
+            ))
+            .json(&json!({
+                "chat_id": self.chat_id,
+                "message_id": message_id,
+                "text": text,
+                "link_preview_options": {"is_disabled": true},
+                "reply_markup": {"inline_keyboard": keyboard},
+            }))
+            .send()
+            .await
+            .map_err(|error| map_http_error(kind, &error))?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if status.is_success() || body.contains("message is not modified") {
+            Ok(())
+        } else {
+            Err(ChannelDeliveryError::Rejected {
+                kind,
+                detail: format!("editMessageText returned HTTP {}", status.as_u16()),
             })
         }
     }
@@ -457,6 +498,20 @@ impl RealChannels {
             .as_ref()
             .ok_or(ChannelDeliveryError::NotConfigured(ChannelKind::Telegram))?
             .remove_buttons(message_id)
+            .await
+    }
+
+    /// Replaces the text and buttons of a message the default bot posted.
+    pub async fn edit_telegram_message(
+        &self,
+        message_id: i64,
+        text: &str,
+        actions: &[OutboxAction],
+    ) -> Result<(), ChannelDeliveryError> {
+        self.telegram
+            .as_ref()
+            .ok_or(ChannelDeliveryError::NotConfigured(ChannelKind::Telegram))?
+            .edit_message(message_id, text, actions)
             .await
     }
 

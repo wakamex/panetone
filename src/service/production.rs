@@ -289,12 +289,31 @@ impl ProductionService {
     /// Applies a tap on a question form message and returns the confirmation
     /// to show, with the form's updated text and buttons.
     pub async fn answer_form_tap(&self, tap: &TelegramFormTap) -> Result<FormUpdate, String> {
-        let stored = self.form_request(&tap.request_id, &tap.destination).await?;
-        let mut state = self.form_state(&tap.request_id).await?;
+        self.apply_form_action(
+            &tap.request_id,
+            &tap.destination,
+            tap.message_id,
+            tap.action,
+        )
+        .await
+    }
+
+    /// Applies one action on a question form, from a Telegram tap or a local
+    /// client: an option is recorded in the form's answers, and submit, chat
+    /// and cancel close the form through Wakterm.
+    async fn apply_form_action(
+        &self,
+        request_id: &str,
+        destination: &str,
+        message_id: i64,
+        action: FormAction,
+    ) -> Result<FormUpdate, String> {
+        let stored = self.form_request(request_id, destination).await?;
+        let mut state = self.form_state(request_id).await?;
         if state.closed.is_some() {
             return Err("this form was already answered".into());
         }
-        let toast = match tap.action {
+        let toast = match action {
             FormAction::Option { question, option } => {
                 form::tap(&stored.request, &mut state, question, option)?
             }
@@ -318,10 +337,10 @@ impl ProductionService {
                     .await?
             }
         };
-        self.save_form_state(&tap.request_id, &state).await?;
+        self.save_form_state(request_id, &state).await?;
         Ok(FormUpdate {
             toast,
-            message_id: tap.message_id,
+            message_id,
             text: form::text(&stored.request, &state),
             actions: form::actions(&stored.request, &state),
         })
@@ -3105,6 +3124,11 @@ impl ProductionService {
                 None,
             );
         }
+        if let Some((request_id, action)) = form::parse_callback(&params.action) {
+            return self
+                .answer_form(id, &params, via, &request_id, action)
+                .await;
+        }
         let Some((request_id, choice_id)) = params
             .action
             .strip_prefix("wakap:")
@@ -3194,6 +3218,124 @@ impl ProductionService {
             }
         }
         success_response(id, json!({"answered": answer}))
+    }
+
+    /// Applies a question form action for the owner from a local client, as
+    /// the Telegram tap would, shows the result on the form's Telegram
+    /// message, and returns the form's new text and buttons; no buttons means
+    /// the form is closed. Closing it posts a copy in the route's private
+    /// channel.
+    async fn answer_form(
+        &self,
+        id: Uuid,
+        params: &AnswerParams,
+        via: &str,
+        request_id: &str,
+        action: FormAction,
+    ) -> ControlResponse {
+        let routes = match self.store.list_routes().await {
+            Ok(routes) => routes,
+            Err(error) => return internal(id, error),
+        };
+        let route = match exact_route(&routes, &params.title) {
+            Ok(route) => route,
+            Err(detail) => return route_error(id, "", detail),
+        };
+        let post = match self.store.form_post(request_id.to_owned()).await {
+            Ok(Some(post)) if post.route_id == Some(route.id) => post,
+            Ok(_) => {
+                return error_response(
+                    id,
+                    "unknown_action",
+                    format!(
+                        "route {:?} has no question form with this action",
+                        route.title
+                    ),
+                    None,
+                );
+            }
+            Err(error) => return internal(id, error),
+        };
+        if !post.actions.iter().any(|known| known.id == params.action)
+            && !matches!(action, FormAction::Option { .. })
+        {
+            return error_response(id, "unknown_action", "the form has no such button", None);
+        }
+        let Some(message_id) = post
+            .external_receipt
+            .as_deref()
+            .and_then(|receipt| receipt.parse::<i64>().ok())
+        else {
+            return error_response(
+                id,
+                "answer_failed",
+                "the form's Telegram message is not known",
+                None,
+            );
+        };
+        let update = match self
+            .apply_form_action(request_id, &post.destination, message_id, action)
+            .await
+        {
+            Ok(update) => update,
+            Err(detail) if detail.contains("already answered") => {
+                return error_response(
+                    id,
+                    "question_closed",
+                    "the form was already answered or closed, so nothing was sent",
+                    None,
+                );
+            }
+            Err(detail) => return error_response(id, "answer_failed", detail, None),
+        };
+        if let Err(error) = self
+            .channels
+            .edit_telegram_message(update.message_id, &update.text, &update.actions)
+            .await
+        {
+            tracing::warn!(message_id = update.message_id, error = %error, "question form edit failed");
+        }
+        let closed = update.actions.is_empty();
+        if closed && let Some((kind, destination)) = route.private_destination() {
+            let namespace = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"https://panetone.dev/answer/v1");
+            let copy_id = EffectId::new(Uuid::new_v5(&namespace, params.action.as_bytes()));
+            let copy = OutboxItem {
+                id: copy_id,
+                route_id: Some(route.id),
+                sender_harness: None,
+                source_agent: None,
+                kind,
+                destination,
+                body: format!("[via {via}] {}", update.toast),
+                attachments: Vec::new(),
+                actions: Vec::new(),
+                state: OutboxState::Pending,
+                attempts: 0,
+                last_error: None,
+                external_receipt: None,
+                uncertain_attempts: 0,
+                part: None,
+                owner: Some(crate::domain::OwnerPost {
+                    request: copy_id,
+                    via: via.to_owned(),
+                }),
+                turn_end: None,
+            };
+            if let Err(error) = self.store.enqueue_outbox(None, copy, now_ms()).await {
+                tracing::warn!(error = %error, "the copy of a form answer was not posted");
+            }
+        }
+        success_response(
+            id,
+            json!({
+                "answered": update.toast,
+                "form": {
+                    "text": update.text,
+                    "actions": update.actions,
+                    "closed": closed,
+                },
+            }),
+        )
     }
 
     /// Delivers a message the owner sends from a local client, such as a voice
@@ -5192,17 +5334,69 @@ fi
             .unwrap();
         assert!(update.text.contains("Answer: \"new chrome profile\""));
 
-        let update = service
-            .answer_form_tap(&tap(FormAction::Submit))
-            .await
-            .unwrap();
-        assert_eq!(update.toast, "Submitted.");
-        assert!(update.actions.is_empty());
+        // A local client presses the same buttons through panetone answer, by
+        // the ids the feed lists, and gets the form back to redraw.
+        let answer = |action: String| {
+            let service = &service;
+            async move {
+                let response = service
+                    .handle_answer(
+                        Uuid::new_v4(),
+                        AnswerParams {
+                            title: "route".into(),
+                            action,
+                            via: Some("gear".into()),
+                        },
+                    )
+                    .await;
+                serde_json::to_value(response).unwrap()
+            }
+        };
+        let edge = update
+            .actions
+            .iter()
+            .find(|action| action.label.contains("Edge"))
+            .unwrap()
+            .id
+            .clone();
+        let pressed = answer(edge).await;
+        assert_eq!(pressed["result"]["answered"], "Browser: Edge", "{pressed}");
+        assert!(
+            pressed["result"]["form"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Answer: Edge")
+        );
+        assert_eq!(pressed["result"]["form"]["closed"], false);
+        assert!(
+            pressed["result"]["form"]["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action["label"].as_str().unwrap().contains("Edge"))
+        );
+        let submitted = answer("wakf:0123456789abcdef01234567:submit".into()).await;
+        assert_eq!(submitted["result"]["answered"], "Submitted.", "{submitted}");
+        assert_eq!(submitted["result"]["form"]["closed"], true);
+        assert_eq!(submitted["result"]["form"]["actions"], json!([]));
+        assert!(
+            store
+                .pending_outbox()
+                .await
+                .unwrap()
+                .iter()
+                .any(|post| post.body == "[via gear] Submitted.")
+        );
+        let again = answer("wakf:0123456789abcdef01234567:submit".into()).await;
+        assert_eq!(again["error"]["code"], "question_closed", "{again}");
         let args = fs::read_to_string(&calls).unwrap();
         assert!(args.contains("--choice\nsubmit\n--answers\n"));
-        assert!(args.contains(
-            r#"[{"question":0,"text":"new chrome profile"},{"choices":["option_1"],"question":1}]"#
-        ));
+        assert!(
+            args.contains(
+                r#"[{"choices":["option_2"],"question":0},{"choices":["option_1"],"question":1}]"#
+            ),
+            "{args}"
+        );
         assert_eq!(
             service
                 .answer_form_tap(&tap(FormAction::Cancel))

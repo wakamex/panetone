@@ -1139,6 +1139,28 @@ impl StoreHandle {
         .await
     }
 
+    /// The latest delivered Telegram post of a question form, by the form's
+    /// request ID, which its buttons carry as `wakf:REQUEST:...`.
+    pub async fn form_post(&self, request_id: String) -> StoreResult<Option<OutboxItem>> {
+        self.run(move |connection| {
+            connection
+                .query_row(
+                    "SELECT record_json FROM outbox
+                     WHERE channel = 'telegram' AND state = 'delivered'
+                       AND EXISTS (
+                           SELECT 1 FROM json_each(record_json, '$.actions')
+                           WHERE json_extract(value, '$.id') LIKE 'wakf:' || ?1 || ':%')
+                     ORDER BY rowid DESC LIMIT 1",
+                    params![request_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .map(|json| Ok(serde_json::from_str::<OutboxItem>(&json)?))
+                .transpose()
+        })
+        .await
+    }
+
     pub async fn status(&self) -> StoreResult<StoreStatus> {
         self.request(|reply| Command::Status { reply }).await
     }
