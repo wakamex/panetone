@@ -572,11 +572,7 @@ impl ProductionService {
                     next_after_sequence,
                     latest_sequence,
                 } => {
-                    let route_agents = if events.iter().any(|event| {
-                        event.kind == "agent_lifecycle"
-                            || event.kind == "approval_requested"
-                            || event.visible_output_body().is_ok_and(|body| body.is_some())
-                    }) {
+                    let route_agents = if events.iter().any(needs_routes) {
                         let live = self.live_routes().await.map_err(error_string)?;
                         self.reconcile_live_routes(&live).await?;
                         let routes = self.store.list_routes().await.map_err(error_string)?;
@@ -4116,6 +4112,17 @@ fn reminder_body(owed: &[ReplyDebt], invalid: &[ReplyMessage]) -> String {
     body
 }
 
+/// Whether ingesting an event needs the agents' current routes: for visible
+/// output, a question, a lifecycle change, or a turn's end, which records the
+/// turn for the feed, posts a room member's answer, and tells the owner when
+/// their message got none.
+fn needs_routes(event: &crate::wakterm::EventRecord) -> bool {
+    matches!(
+        event.kind.as_str(),
+        "agent_lifecycle" | "approval_requested" | "turn_final"
+    ) || event.visible_output_body().is_ok_and(|body| body.is_some())
+}
+
 /// The most text of room messages one prompt carries; a longer backlog keeps
 /// its newest messages.
 const ROOM_BATCH_CHARS: usize = 24_000;
@@ -7432,6 +7439,39 @@ fi
         );
         drop(service);
         store.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn a_turns_end_alone_in_a_batch_still_gets_the_agents_routes() {
+        let event = |kind: &str, fields: serde_json::Value| -> crate::wakterm::EventRecord {
+            let mut value = json!({
+                "sequence": 1, "event_id": "e", "kind": kind,
+                "agent_id": "a", "incarnation_id": "i", "turn_id": "t",
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            serde_json::from_value(value).unwrap()
+        };
+        // Codex reports a turn's end apart from its last message.
+        assert!(needs_routes(&event(
+            "turn_final",
+            json!({"outcome": "completed", "text": "done"})
+        )));
+        assert!(needs_routes(&event(
+            "turn_final",
+            json!({"outcome": "completed"})
+        )));
+        assert!(needs_routes(&event(
+            "assistant_message",
+            json!({"text": "hi"})
+        )));
+        assert!(!needs_routes(&event("turn_started", json!({}))));
+        assert!(!needs_routes(&event(
+            "input_accepted",
+            json!({"input_role": "start"})
+        )));
     }
 
     #[test]
