@@ -2010,15 +2010,7 @@ fn ingest_event(
             rooms::room_of(rooms, route.id),
             event.kind == "assistant_message" && approval.is_none(),
             visible_body.as_deref(),
-        ) && (room_id == route.id
-            || room_marked
-            || event
-                .fields
-                .get("turn_id")
-                .and_then(|value| value.as_str())
-                .map(|turn_id| rooms::is_room_turn(transaction, &event.agent_id, turn_id))
-                .transpose()?
-                .unwrap_or(false))
+        ) && (room_id == route.id || room_marked || rooms::is_room_turn(transaction, event)?)
         {
             let text = tagged
                 .as_ref()

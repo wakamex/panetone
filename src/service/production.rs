@@ -6843,6 +6843,130 @@ fi
         store.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn a_codex_member_joins_from_turns_a_room_message_started() {
+        let directory = tempdir().unwrap();
+        let (service, store, _game, admitted) =
+            room_fixture_in_tabs(directory.path(), &[("claude", "alpha"), ("codex", "gamma")])
+                .await;
+        let route = |id: u128, title: &str, topic_id: i64| Route {
+            id: RouteId::new(Uuid::from_u128(id)),
+            title: title.into(),
+            channels: vec![ChannelBinding::Telegram { topic_id }],
+            agent: None,
+        };
+        let routes = [
+            route(701, "alpha", 71),
+            route(703, "gamma", 73),
+            route(710, "duo", 79),
+        ];
+        for route in &routes {
+            store.save_route(route.clone(), 1).await.unwrap();
+        }
+        service
+            .handle_room(
+                "room.open",
+                &json!({"title": "duo", "members": ["alpha", "gamma"]}),
+            )
+            .await
+            .unwrap();
+        service
+            .handle_room(
+                "room.say",
+                &json!({"title": "duo", "name": "Mihai", "text": "which PR first?"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(service.rooms_once().await.unwrap(), 2);
+        let prompt = admitted_prompts(&admitted)
+            .into_iter()
+            .find(|(agent, _)| agent == "agent-codex")
+            .unwrap()
+            .1;
+        let hash = |text: &str| DeliveryProof::input_sha256(text);
+        let live = service.live_routes().await.unwrap();
+        let agents = project_live_routes(&routes, &live).unwrap();
+        // Codex records a turn's input on the input_accepted after its start,
+        // and reuses one turn ID for several turns.
+        let events = vec![
+            room_event(101, "turn_started", "codex", "t1", json!({})),
+            room_event(
+                102,
+                "input_accepted",
+                "codex",
+                "t1",
+                json!({"input_sha256": hash(&prompt)}),
+            ),
+            room_event(
+                103,
+                "assistant_message",
+                "codex",
+                "t1",
+                json!({"text": "The tools PR."}),
+            ),
+            room_event(
+                104,
+                "turn_final",
+                "codex",
+                "t1",
+                json!({"outcome": "completed"}),
+            ),
+            room_event(105, "turn_started", "codex", "t1", json!({})),
+            room_event(
+                106,
+                "input_accepted",
+                "codex",
+                "t1",
+                json!({"input_sha256": hash("job finished")}),
+            ),
+            room_event(
+                107,
+                "assistant_message",
+                "codex",
+                "t1",
+                json!({"text": "noted the job"}),
+            ),
+            // Room input after a work input does not make a work turn a room turn.
+            room_event(
+                108,
+                "input_accepted",
+                "codex",
+                "t1",
+                json!({"input_sha256": hash(&prompt)}),
+            ),
+            room_event(
+                109,
+                "assistant_message",
+                "codex",
+                "t1",
+                json!({"text": "still working"}),
+            ),
+        ];
+        store
+            .ingest_agent_events(100, 109, events, agents, now_ms())
+            .await
+            .unwrap();
+        let transcript = service
+            .handle_room("room.poll", &json!({"title": "duo", "after": 0}))
+            .await
+            .unwrap();
+        let lines = transcript["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| {
+                format!(
+                    "{}: {}",
+                    message["name"].as_str().unwrap(),
+                    message["text"].as_str().unwrap()
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lines, ["Mihai: which PR first?", "gamma: The tools PR."]);
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
     #[test]
     fn the_room_marker_is_found_only_on_its_own_line_outside_code() {
         use crate::store::rooms_take_marker as take;

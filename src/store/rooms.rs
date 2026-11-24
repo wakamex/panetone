@@ -97,23 +97,60 @@ pub fn take_marker(body: &str) -> Option<String> {
 }
 
 /// Whether the turn of an agent's event was started by a room message.
+///
+/// The turn's input is the first one recorded from its latest start: Claude
+/// and agy put it on `turn_started`, while Codex records it on the
+/// `input_accepted` that follows and reuses one turn ID for several turns.
 pub(super) fn is_room_turn(
     connection: &Connection,
-    agent_id: &str,
-    turn_id: &str,
+    event: &crate::wakterm::EventRecord,
 ) -> StoreResult<bool> {
+    let Some(turn_id) = event.fields.get("turn_id").and_then(|value| value.as_str()) else {
+        return Ok(false);
+    };
+    let Some(started) = connection
+        .query_row(
+            "SELECT sequence FROM agent_events
+             WHERE agent_id = ?1 AND incarnation_id = ?2 AND sequence < ?3
+               AND kind = 'turn_started' AND json_extract(record_json, '$.turn_id') = ?4
+             ORDER BY sequence DESC LIMIT 1",
+            params![
+                event.agent_id,
+                event.incarnation_id,
+                event.sequence as i64,
+                turn_id
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    else {
+        return Ok(false);
+    };
     Ok(connection
         .query_row(
-            "SELECT 1 FROM agent_events input JOIN room_deliveries delivery
-               ON delivery.agent_id = input.agent_id
-              AND json_extract(input.record_json, '$.input_sha256') IN (
+            "SELECT 1 FROM (
+                 SELECT json_extract(record_json, '$.input_sha256') AS input_sha256
+                 FROM agent_events
+                 WHERE agent_id = ?1 AND incarnation_id = ?2
+                   AND sequence >= ?3 AND sequence < ?4
+                   AND kind IN ('turn_started', 'input_accepted')
+                   AND json_extract(record_json, '$.turn_id') = ?5
+                   AND json_extract(record_json, '$.input_sha256') IS NOT NULL
+                 ORDER BY sequence LIMIT 1
+             ) input JOIN room_deliveries delivery
+               ON delivery.agent_id = ?1
+              AND input.input_sha256 IN (
                   json_extract(delivery.record_json, '$.input_sha256'),
                   json_extract(delivery.record_json, '$.tab_expanded_sha256')
               )
-             WHERE input.agent_id = ?1 AND input.kind = 'turn_started'
-               AND json_extract(input.record_json, '$.turn_id') = ?2
              LIMIT 1",
-            params![agent_id, turn_id],
+            params![
+                event.agent_id,
+                event.incarnation_id,
+                started,
+                event.sequence as i64,
+                turn_id
+            ],
             |_| Ok(()),
         )
         .optional()?
