@@ -2004,97 +2004,27 @@ fn ingest_event(
             )?;
         }
         // In a room, an agent's message joins the transcript and goes to the
-        // room's other agents. A member route's agent joins only from turns
-        // a room message started, or with a marked message.
+        // room's other agents. A member route's agent joins with a marked
+        // message here, and from a room turn with its final message, when
+        // the turn ends; its notes along the way stay on its own route.
         if let (Some((room_id, settings)), true, Some(body)) = (
             rooms::room_of(rooms, route.id),
             event.kind == "assistant_message" && approval.is_none(),
             visible_body.as_deref(),
-        ) && (room_id == route.id || room_marked || rooms::is_room_turn(transaction, event)?)
+        ) && (room_id == route.id || room_marked)
         {
-            let text = tagged
-                .as_ref()
-                .map_or(body, |tagged| tagged.clean.as_str())
-                .lines()
-                .filter(|line| !line.trim_start().starts_with("[panetone:attach "))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !text.trim().is_empty() {
-                let recipients = if settings.paused {
-                    Vec::new()
-                } else {
-                    route_agents
-                        .iter()
-                        .filter(|candidate| {
-                            (candidate.route_id == room_id
-                                || settings.members.contains(&candidate.route_id))
-                                && candidate.agent.agent_id != event.agent_id
-                        })
-                        .map(|candidate| candidate.agent.agent_id.clone())
-                        .collect()
-                };
-                let harness = route_agent.map(|candidate| candidate.agent.harness.clone());
-                rooms::post(
-                    transaction,
-                    room_id,
-                    RoomMessage {
-                        id: 0,
-                        kind: "agent".into(),
-                        speaker: event.agent_id.clone(),
-                        harness: harness.clone(),
-                        text: text.trim().to_owned(),
-                        created_at_ms: now_ms,
-                    },
-                    &recipients,
-                )?;
-                // A member's own channel shows its output as usual; the room's
-                // channel shows it too, under the agent's name.
-                if room_id != route.id
-                    && let Some((kind, destination)) = routes
-                        .iter()
-                        .find(|candidate| candidate.id == room_id)
-                        .and_then(Route::private_destination)
-                {
-                    let names: std::collections::BTreeMap<String, String> =
-                        get_metadata(transaction, ROOM_NAMES_KEY)?
-                            .map(|json| serde_json::from_str(&json))
-                            .transpose()?
-                            .unwrap_or_default();
-                    let name = names
-                        .get(&event.agent_id)
-                        .cloned()
-                        .unwrap_or_else(|| route.title.clone());
-                    let namespace = Uuid::new_v5(
-                        &Uuid::NAMESPACE_URL,
-                        b"https://panetone.dev/rooms/members/v1",
-                    );
-                    let item = OutboxItem {
-                        id: EffectId::new(Uuid::new_v5(
-                            &namespace,
-                            format!("{}\0{}", event.incarnation_id, event.event_id).as_bytes(),
-                        )),
-                        route_id: Some(room_id),
-                        sender_harness: harness,
-                        source_agent: route_agent.map(|candidate| candidate.agent.clone()),
-                        kind,
-                        destination,
-                        body: format!("{name}: {}", text.trim()),
-                        attachments: Vec::new(),
-                        actions: Vec::new(),
-                        state: OutboxState::Pending,
-                        attempts: 0,
-                        last_error: None,
-                        external_receipt: None,
-                        uncertain_attempts: 0,
-                        part: None,
-                        owner: None,
-                        turn_end: None,
-                    };
-                    for chunk in crate::domain::chunk_outbox(item) {
-                        enqueue_outbox(transaction, None, &chunk, now_ms)?;
-                    }
-                }
-            }
+            let text = tagged.as_ref().map_or(body, |tagged| tagged.clean.as_str());
+            post_to_room(
+                transaction,
+                routes,
+                route_agents,
+                route,
+                route_agent,
+                (room_id, settings),
+                event,
+                text,
+                now_ms,
+            )?;
         }
         let destination = if approval.is_some() {
             route
@@ -2213,9 +2143,161 @@ fn ingest_event(
         && let Some(route) = route
     {
         record_turn_end(transaction, event, route, state == "projected", now_ms)?;
+        if let Some(text) = member_room_answer(transaction, rooms, route, event, now_ms)? {
+            let room = rooms::room_of(rooms, route.id).expect("the answer's room exists");
+            post_to_room(
+                transaction,
+                routes,
+                route_agents,
+                route,
+                route_agent,
+                room,
+                event,
+                &text,
+                now_ms,
+            )?;
+        }
     }
     insert_agent_event(transaction, event, route_id, state, &record_json, now_ms)?;
     outcome.recorded += 1;
+    Ok(())
+}
+
+/// The answer a member route's agent gives its room when a room turn ends:
+/// the turn's final message, unless it says nothing, was already posted with
+/// the room marker, or is a replay of an old turn.
+fn member_room_answer(
+    transaction: &Transaction<'_>,
+    rooms: &std::collections::BTreeMap<String, RoomSettings>,
+    route: &Route,
+    event: &EventRecord,
+    now_ms: i64,
+) -> StoreResult<Option<String>> {
+    if !rooms::room_of(rooms, route.id).is_some_and(|(room_id, _)| room_id != route.id)
+        || event.fields.get("outcome").and_then(|value| value.as_str()) == Some("aborted")
+    {
+        return Ok(None);
+    }
+    let Some(text) = event
+        .fields
+        .get("text")
+        .and_then(|value| value.as_str())
+        .map(strip_memory_citations)
+        .filter(|text| !text.trim().is_empty() && text.trim() != NO_REPLY)
+    else {
+        return Ok(None);
+    };
+    if rooms::take_marker(&text).is_some()
+        || (event
+            .observed_at_ms()
+            .is_some_and(|observed| now_ms - observed > STALE_OUTPUT_MS)
+            && !is_latest_turn(transaction, event)?)
+        || !rooms::is_room_turn(transaction, event)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(
+        replies::find_tags(&text).map_or(text, |tagged| tagged.clean),
+    ))
+}
+
+/// Adds an agent's message to its room's transcript, queues it for the room's
+/// other agents, and, for a member route's agent, posts it to the room
+/// route's channel under the agent's name.
+#[allow(clippy::too_many_arguments)]
+fn post_to_room(
+    transaction: &Transaction<'_>,
+    routes: &[Route],
+    route_agents: &[RouteAgent],
+    route: &Route,
+    route_agent: Option<&RouteAgent>,
+    (room_id, settings): (RouteId, &RoomSettings),
+    event: &EventRecord,
+    text: &str,
+    now_ms: i64,
+) -> StoreResult<()> {
+    let text = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("[panetone:attach "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(());
+    }
+    let recipients = if settings.paused {
+        Vec::new()
+    } else {
+        route_agents
+            .iter()
+            .filter(|candidate| {
+                (candidate.route_id == room_id || settings.members.contains(&candidate.route_id))
+                    && candidate.agent.agent_id != event.agent_id
+            })
+            .map(|candidate| candidate.agent.agent_id.clone())
+            .collect()
+    };
+    let harness = route_agent.map(|candidate| candidate.agent.harness.clone());
+    rooms::post(
+        transaction,
+        room_id,
+        RoomMessage {
+            id: 0,
+            kind: "agent".into(),
+            speaker: event.agent_id.clone(),
+            harness: harness.clone(),
+            text: text.to_owned(),
+            created_at_ms: now_ms,
+        },
+        &recipients,
+    )?;
+    // A member's own channel shows its output as usual; the room's channel
+    // shows it too, under the agent's name.
+    let Some((kind, destination)) = (room_id != route.id)
+        .then(|| routes.iter().find(|candidate| candidate.id == room_id))
+        .flatten()
+        .and_then(Route::private_destination)
+    else {
+        return Ok(());
+    };
+    let names: std::collections::BTreeMap<String, String> =
+        get_metadata(transaction, ROOM_NAMES_KEY)?
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?
+            .unwrap_or_default();
+    let name = names
+        .get(&event.agent_id)
+        .cloned()
+        .unwrap_or_else(|| route.title.clone());
+    let namespace = Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        b"https://panetone.dev/rooms/members/v1",
+    );
+    let item = OutboxItem {
+        id: EffectId::new(Uuid::new_v5(
+            &namespace,
+            format!("{}\0{}", event.incarnation_id, event.event_id).as_bytes(),
+        )),
+        route_id: Some(room_id),
+        sender_harness: harness,
+        source_agent: route_agent.map(|candidate| candidate.agent.clone()),
+        kind,
+        destination,
+        body: format!("{name}: {text}"),
+        attachments: Vec::new(),
+        actions: Vec::new(),
+        state: OutboxState::Pending,
+        attempts: 0,
+        last_error: None,
+        external_receipt: None,
+        uncertain_attempts: 0,
+        part: None,
+        owner: None,
+        turn_end: None,
+    };
+    for chunk in crate::domain::chunk_outbox(item) {
+        enqueue_outbox(transaction, None, &chunk, now_ms)?;
+    }
     Ok(())
 }
 

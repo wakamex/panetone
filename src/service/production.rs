@@ -3930,7 +3930,7 @@ fn room_intro(title: &str, members: &str, member: bool) -> String {
     );
     if member {
         intro.push_str(&format!(
-            " You keep your own chat: room messages reach you once you are not busy, each in a turn of its own, and only your replies in those turns reach the room. To post a message from any other turn to the room, such as a result the others are waiting for, put {ROOM_MARKER} on its own line in it."
+            " You keep your own chat: room messages reach you once you are not busy, each in a turn of its own, and the final message of each such turn is your answer to the room; what you write along the way stays in your own chat. To post a message from any other turn to the room, such as a result the others are waiting for, put {ROOM_MARKER} on its own line in it."
         ));
     }
     intro
@@ -6669,8 +6669,18 @@ fi
 
         let live = service.live_routes().await.unwrap();
         let agents = project_live_routes(&routes, &live).unwrap();
+        let final_of = |sequence, agent, turn, text: &str| {
+            room_event(
+                sequence,
+                "turn_final",
+                agent,
+                turn,
+                json!({"outcome": "completed", "text": text}),
+            )
+        };
         let events = vec![
-            // alpha answers in the turn the room message started: it joins.
+            // alpha's room turn: its notes stay on its route, and its final
+            // message joins the room when the turn ends.
             room_event(
                 101,
                 "turn_started",
@@ -6683,79 +6693,99 @@ fi
                 "assistant_message",
                 "claude",
                 "t1",
-                json!({"text": "Ship Friday?"}),
+                json!({"text": "Checking the calendar."}),
             ),
-            // beta's room turn started once its work turn ended.
             room_event(
                 103,
+                "assistant_message",
+                "claude",
+                "t1",
+                json!({"text": "Ship Friday?"}),
+            ),
+            final_of(104, "claude", "t1", "Ship Friday?"),
+            // beta's room turn started once its work turn ended.
+            room_event(
+                105,
                 "turn_started",
                 "agy",
                 "t2",
                 json!({"input_sha256": hash(&prompts[1].1)}),
             ),
             room_event(
-                104,
-                "input_accepted",
-                "agy",
-                "t2",
-                json!({"input_sha256": hash(&prompts[1].1)}),
-            ),
-            room_event(
-                105,
+                106,
                 "assistant_message",
                 "agy",
                 "t2",
                 json!({"text": "Friday works."}),
             ),
-            // alpha's private turn stays in alpha's own chat...
+            final_of(107, "agy", "t2", "Friday works."),
+            // alpha's private turn stays in alpha's own chat, except a message
+            // marked for the room, which joins at once.
             room_event(
-                106,
+                108,
                 "turn_started",
                 "claude",
                 "t3",
                 json!({"input_sha256": hash("private question")}),
             ),
             room_event(
-                107,
+                109,
                 "assistant_message",
                 "claude",
                 "t3",
                 json!({"text": "private answer"}),
             ),
-            // ...except a message marked for the room.
             room_event(
-                108,
+                110,
                 "assistant_message",
                 "claude",
                 "t3",
                 json!({"text": "Build passed.\n\n[panetone:room]"}),
             ),
+            final_of(111, "claude", "t3", "Build passed.\n\n[panetone:room]"),
             // Room input accepted into a turn something else started does not
             // make it a room turn.
             room_event(
-                109,
+                112,
                 "turn_started",
                 "agy",
                 "t4",
                 json!({"input_sha256": hash("own work")}),
             ),
             room_event(
-                110,
+                113,
                 "input_accepted",
                 "agy",
                 "t4",
                 json!({"input_sha256": hash(&prompts[1].1)}),
             ),
             room_event(
-                111,
+                114,
                 "assistant_message",
                 "agy",
                 "t4",
                 json!({"text": "benchmark queued"}),
             ),
+            final_of(115, "agy", "t4", "benchmark queued"),
+            // A room turn answered with nothing to add posts nothing.
+            room_event(
+                116,
+                "turn_started",
+                "claude",
+                "t5",
+                json!({"input_sha256": hash(&prompts[0].1)}),
+            ),
+            room_event(
+                117,
+                "assistant_message",
+                "claude",
+                "t5",
+                json!({"text": "<panetone:no-reply>"}),
+            ),
+            final_of(118, "claude", "t5", "<panetone:no-reply>"),
         ];
         store
-            .ingest_agent_events(100, 111, events, agents, now_ms())
+            .ingest_agent_events(100, 118, events, agents, now_ms())
             .await
             .unwrap();
 
@@ -6803,7 +6833,12 @@ fi
         };
         assert_eq!(
             topic("71"),
-            ["Ship Friday?", "private answer", "Build passed."]
+            [
+                "Checking the calendar.",
+                "Ship Friday?",
+                "private answer",
+                "Build passed."
+            ]
         );
         assert_eq!(topic("72"), ["Friday works.", "benchmark queued"]);
         assert_eq!(
@@ -6909,7 +6944,7 @@ fi
                 "turn_final",
                 "codex",
                 "t1",
-                json!({"outcome": "completed"}),
+                json!({"outcome": "completed", "text": "The tools PR."}),
             ),
             room_event(105, "turn_started", "codex", "t1", json!({})),
             room_event(
@@ -6941,9 +6976,16 @@ fi
                 "t1",
                 json!({"text": "still working"}),
             ),
+            room_event(
+                110,
+                "turn_final",
+                "codex",
+                "t1",
+                json!({"outcome": "completed", "text": "still working"}),
+            ),
         ];
         store
-            .ingest_agent_events(100, 109, events, agents, now_ms())
+            .ingest_agent_events(100, 110, events, agents, now_ms())
             .await
             .unwrap();
         let transcript = service
