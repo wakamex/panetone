@@ -2169,6 +2169,7 @@ fn ingest_event(
         && let Some(route) = route
     {
         record_turn_end(transaction, event, route, state == "projected", now_ms)?;
+        tell_owner_of_silent_turn(transaction, route, event, now_ms)?;
         if let Some(text) = member_room_answer(transaction, rooms, route, event, now_ms)? {
             let room = rooms::room_of(rooms, route.id).expect("the answer's room exists");
             post_to_room(
@@ -2187,6 +2188,91 @@ fn ingest_event(
     insert_agent_event(transaction, event, route_id, state, &record_json, now_ms)?;
     outcome.recorded += 1;
     Ok(())
+}
+
+/// Tells the owner when an agent's turn that their own message started ends
+/// with nothing posted, as when the model returns an empty answer, so the
+/// message does not look ignored. A turn the agent closed with
+/// <panetone:no-reply> said what it meant, and an aborted turn is reported
+/// as a failure already.
+fn tell_owner_of_silent_turn(
+    transaction: &Transaction<'_>,
+    route: &Route,
+    event: &EventRecord,
+    now_ms: i64,
+) -> StoreResult<()> {
+    if event.fields.get("outcome").and_then(|value| value.as_str()) != Some("completed")
+        || (event
+            .observed_at_ms()
+            .is_some_and(|observed| now_ms - observed > STALE_OUTPUT_MS)
+            && !is_latest_turn(transaction, event)?)
+    {
+        return Ok(());
+    }
+    let Some(started) = turn_start(transaction, event)? else {
+        return Ok(());
+    };
+    let answered = transaction
+        .query_row(
+            "SELECT 1 FROM agent_events
+             WHERE agent_id = ?1 AND incarnation_id = ?2
+               AND sequence > ?3 AND sequence < ?4
+               AND kind = 'assistant_message' AND state IN ('projected', 'suppressed')
+               AND json_extract(record_json, '$.turn_id') = ?5
+             LIMIT 1",
+            params![
+                event.agent_id,
+                event.incarnation_id,
+                started,
+                event.sequence as i64,
+                event.fields.get("turn_id").and_then(|value| value.as_str())
+            ],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if answered {
+        return Ok(());
+    }
+    // Only a turn the owner's message started: its origin is a channel
+    // message Panetone delivered.
+    let Some((kind, destination)) = turn_origin(transaction, event)? else {
+        return Ok(());
+    };
+    let Some((kind, destination)) = (if route.is_shared(kind, &destination) {
+        route.private_destination()
+    } else {
+        Some((kind, destination))
+    }) else {
+        return Ok(());
+    };
+    let namespace = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"https://panetone.dev/no-reply/v1");
+    let item = OutboxItem {
+        id: EffectId::new(Uuid::new_v5(
+            &namespace,
+            format!("{}\0{}", event.incarnation_id, event.event_id).as_bytes(),
+        )),
+        route_id: Some(route.id),
+        sender_harness: None,
+        source_agent: None,
+        kind,
+        destination,
+        body: format!(
+            "[no reply] {}'s turn ended without an answer to your message. Send it again if it still matters.",
+            route.title
+        ),
+        attachments: Vec::new(),
+        actions: Vec::new(),
+        state: OutboxState::Pending,
+        attempts: 0,
+        last_error: None,
+        external_receipt: None,
+        uncertain_attempts: 0,
+        part: None,
+        owner: None,
+        turn_end: None,
+    };
+    enqueue_outbox(transaction, None, &item, now_ms)
 }
 
 /// The answer a member route's agent gives its room when a room turn ends:
@@ -2675,25 +2761,65 @@ fn insert_agent_event(
 
 /// The channel and destination of the inbound message that started the turn
 /// an event belongs to, when a channel message started it.
+/// The latest start of the turn of an agent's event, by event sequence.
+fn turn_start(connection: &Connection, event: &EventRecord) -> StoreResult<Option<i64>> {
+    let Some(turn_id) = event.fields.get("turn_id").and_then(|value| value.as_str()) else {
+        return Ok(None);
+    };
+    Ok(connection
+        .query_row(
+            "SELECT sequence FROM agent_events
+             WHERE agent_id = ?1 AND incarnation_id = ?2 AND sequence < ?3
+               AND kind = 'turn_started' AND json_extract(record_json, '$.turn_id') = ?4
+             ORDER BY sequence DESC LIMIT 1",
+            params![
+                event.agent_id,
+                event.incarnation_id,
+                event.sequence as i64,
+                turn_id
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?)
+}
+
+/// The input that started the turn of an agent's event: the first input hash
+/// recorded from the turn's latest start. Claude and agy put it on
+/// `turn_started`, while Codex records it on the `input_accepted` that follows
+/// and reuses one turn ID for several turns.
+pub(super) fn turn_input_sha256(
+    connection: &Connection,
+    event: &EventRecord,
+) -> StoreResult<Option<String>> {
+    let Some(started) = turn_start(connection, event)? else {
+        return Ok(None);
+    };
+    Ok(connection
+        .query_row(
+            "SELECT json_extract(record_json, '$.input_sha256') FROM agent_events
+             WHERE agent_id = ?1 AND incarnation_id = ?2
+               AND sequence >= ?3 AND sequence < ?4
+               AND kind IN ('turn_started', 'input_accepted')
+               AND json_extract(record_json, '$.turn_id') = ?5
+               AND json_extract(record_json, '$.input_sha256') IS NOT NULL
+             ORDER BY sequence LIMIT 1",
+            params![
+                event.agent_id,
+                event.incarnation_id,
+                started,
+                event.sequence as i64,
+                event.fields.get("turn_id").and_then(|value| value.as_str())
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?)
+}
+
 fn turn_origin(
     connection: &Connection,
     event: &EventRecord,
 ) -> StoreResult<Option<(ChannelKind, String)>> {
-    let Some(turn_id) = event.fields.get("turn_id").and_then(|value| value.as_str()) else {
-        return Ok(None);
-    };
-    let Some(input_sha256) = connection
-        .query_row(
-            "SELECT json_extract(record_json, '$.input_sha256') FROM agent_events
-             WHERE agent_id = ?1 AND kind = 'turn_started'
-               AND json_extract(record_json, '$.turn_id') = ?2
-             ORDER BY sequence LIMIT 1",
-            params![event.agent_id, turn_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?
-        .flatten()
-    else {
+    let Some(input_sha256) = turn_input_sha256(connection, event)? else {
         return Ok(None);
     };
     let origin = connection
