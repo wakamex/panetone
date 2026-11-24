@@ -1151,9 +1151,20 @@ async fn an_unacknowledged_steer_waits_for_the_target_to_record_it() {
     assert_eq!(state(lost.id).await, WorkflowState::Submitted);
 
     // The second is never recorded: its sender is told when the window ends.
+    // The window starts when the steer answered, which is the test clock plus
+    // the real time the steer took, so the check runs a minute past it.
+    let window_ms = 10 * 60 * 1000;
     assert_eq!(
         service
-            .settle_steered_sends(100 + 10 * 60 * 1000)
+            .settle_steered_sends(100 + window_ms - 1)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(state(lost.id).await, WorkflowState::Submitted);
+    assert_eq!(
+        service
+            .settle_steered_sends(100 + window_ms + 60 * 1000)
             .await
             .unwrap(),
         1

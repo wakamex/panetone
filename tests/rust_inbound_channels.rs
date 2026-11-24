@@ -765,7 +765,9 @@ async fn signal_receive_deadlines_are_idle_polls() {
             .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"panetone-subscribe\",\"result\":{}}\n")
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(75)).await;
+        // Silent for several receive deadlines, each of which must be an idle
+        // poll rather than an error.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
         let notification = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "receive",
@@ -786,7 +788,9 @@ async fn signal_receive_deadlines_are_idle_polls() {
     });
 
     let mut subscriber =
-        SignalSubscriber::connect(&socket_path, "+15550000", Duration::from_millis(20))
+        // The deadline also bounds the subscribe handshake, so it leaves room
+        // for a busy host to schedule the fake server.
+        SignalSubscriber::connect(&socket_path, "+15550000", Duration::from_millis(250))
             .await
             .unwrap();
     let message = subscriber.next().await.unwrap();

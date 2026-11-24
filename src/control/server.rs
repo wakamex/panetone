@@ -339,11 +339,6 @@ mod tests {
     #[tokio::test]
     async fn handler_runtime_is_not_limited_by_socket_io_timeout() {
         let (mut client, server) = UnixStream::pair().unwrap();
-        let task = tokio::spawn(serve_connection(
-            server,
-            Arc::new(SlowHandler),
-            Duration::from_millis(5),
-        ));
         let request = ControlRequest {
             schema: CONTROL_SCHEMA.into(),
             id: uuid::Uuid::new_v4(),
@@ -352,7 +347,15 @@ mod tests {
         };
         let mut encoded = serde_json::to_vec(&request).unwrap();
         encoded.push(b'\n');
+        // The request is written before the server starts reading, so its
+        // 5 ms read limit cannot expire on a busy host before the request
+        // arrives; only the handler's 25 ms run is longer than the limit.
         client.write_all(&encoded).await.unwrap();
+        let task = tokio::spawn(serve_connection(
+            server,
+            Arc::new(SlowHandler),
+            Duration::from_millis(5),
+        ));
 
         let mut line = String::new();
         BufReader::new(client).read_line(&mut line).await.unwrap();
