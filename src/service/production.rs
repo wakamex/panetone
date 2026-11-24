@@ -22,7 +22,7 @@ use crate::domain::{
 };
 use crate::store::{
     DeliveryProof, EventCursorGap, InboxItem, ROOM_MARKER, ROOM_NAMES_KEY, ReplyDebt, ReplyMessage,
-    RoomMessage, RoomSettings, RouteAgent, StoreHandle, StoredApproval,
+    RoomDelivery, RoomMessage, RoomSettings, RouteAgent, StoreHandle, StoredApproval,
 };
 use crate::supervisor::SupervisorHandle;
 use crate::wakterm::form::{self, FormAction, FormState};
@@ -1077,7 +1077,10 @@ impl ProductionService {
     }
 
     /// Delivers queued room messages to their agents, each labelled with its
-    /// speaker. An agent's first room message also explains the room.
+    /// speaker. Everything waiting for an agent goes in one prompt, so an
+    /// agent that was busy answers the conversation as it now stands, once,
+    /// instead of each message in turn. An agent's first room message also
+    /// explains the room.
     pub async fn rooms_once(&self) -> Result<usize, String> {
         let deliveries = self
             .store
@@ -1091,31 +1094,35 @@ impl ProductionService {
         let names = self.room_names(&live).await?;
         let rooms = self.store.rooms().await.map_err(error_string)?;
         let routes = self.store.list_routes().await.map_err(error_string)?;
+        // Each agent's waiting messages in each room, oldest first.
+        let mut batches: Vec<Vec<RoomDelivery>> = Vec::new();
+        for delivery in deliveries {
+            match batches.iter_mut().find(|batch| {
+                batch[0].route_id == delivery.route_id && batch[0].agent_id == delivery.agent_id
+            }) {
+                Some(batch) => batch.push(delivery),
+                None => batches.push(vec![delivery]),
+            }
+        }
         let mut done = 0;
-        for mut delivery in deliveries {
-            let Some(route) = self
-                .store
-                .get_route(delivery.route_id)
-                .await
-                .map_err(error_string)?
-            else {
-                self.store
-                    .set_room_delivery(delivery, "dropped".into())
-                    .await
-                    .map_err(error_string)?;
+        for mut batch in batches {
+            let room = routes.iter().find(|route| route.id == batch[0].route_id);
+            let (Some(route), Some(settings)) = (
+                room,
+                room.and_then(|route| rooms.get(&route.id.to_string())),
+            ) else {
+                for delivery in batch {
+                    self.store
+                        .set_room_delivery(delivery, "dropped".into())
+                        .await
+                        .map_err(error_string)?;
+                }
                 continue;
             };
-            let Some(settings) = rooms.get(&route.id.to_string()) else {
-                self.store
-                    .set_room_delivery(delivery, "dropped".into())
-                    .await
-                    .map_err(error_string)?;
-                continue;
-            };
-            let agents = room_agents(&live, &routes, &route, Some(settings));
+            let agents = room_agents(&live, &routes, route, Some(settings));
             let Some(binding) = agents
                 .iter()
-                .find(|agent| agent.agent_id == delivery.agent_id)
+                .find(|agent| agent.agent_id == batch[0].agent_id)
                 .cloned()
             else {
                 continue;
@@ -1127,19 +1134,11 @@ impl ProductionService {
                     .any(|agent| agent.agent_id == binding.agent_id)
             });
             // A member agent busy with its own work hears the room when its
-            // turn ends, so each room message starts a turn of its own and the
+            // turn ends, so room messages start turns of their own and the
             // work turn's output stays out of the room.
             if member && live.is_working(&binding) {
                 continue;
             }
-            let speaker = if delivery.speaker_is_agent {
-                names
-                    .get(&delivery.speaker)
-                    .cloned()
-                    .unwrap_or_else(|| delivery.speaker.clone())
-            } else {
-                delivery.speaker.clone()
-            };
             // An agent alone with one person is in an ordinary conversation, so
             // its prompt carries no room intro or speaker name; an endchat
             // profile, for one, keeps every prompt in its log word for word.
@@ -1175,62 +1174,83 @@ impl ProductionService {
                 text.push_str(&room_intro(&route.title, &members, member));
                 text.push_str("\n\n");
             }
-            if named {
-                text.push_str(&format!("{speaker} says: "));
+            if batch.len() > 1 {
+                text.push_str(&format!(
+                    "{} room messages since your last turn, oldest first:\n\n",
+                    batch.len()
+                ));
             }
-            text.push_str(&delivery.text);
+            let messages = batch
+                .iter()
+                .map(|delivery| {
+                    if !named {
+                        return delivery.text.clone();
+                    }
+                    let speaker = if delivery.speaker_is_agent {
+                        names
+                            .get(&delivery.speaker)
+                            .cloned()
+                            .unwrap_or_else(|| delivery.speaker.clone())
+                    } else {
+                        delivery.speaker.clone()
+                    };
+                    format!("{speaker} says: {}", delivery.text)
+                })
+                .collect::<Vec<_>>();
+            text.push_str(&messages.join("\n\n"));
             let namespace = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"https://panetone.dev/rooms/v1");
             let id = EffectId::new(Uuid::new_v5(
                 &namespace,
-                format!("{}\0{}", delivery.id, delivery.attempts).as_bytes(),
+                format!("{}\0{}\0{}", batch[0].id, batch[0].attempts, batch.len()).as_bytes(),
             ));
-            delivery.attempts += 1;
             // Saved before the prompt is written, so the turn it starts or
             // joins is recognized as a room turn however fast it answers.
-            delivery.input_sha256 = Some(DeliveryProof::input_sha256(&text));
-            delivery.tab_expanded_sha256 = DeliveryProof::tab_expanded_sha256(&text);
-            self.store
-                .set_room_delivery(delivery.clone(), "pending".into())
-                .await
-                .map_err(error_string)?;
-            let receipt = match self.wakterm.admit(id, &binding, &text, false, 0).await {
-                Ok(receipt) => receipt,
+            let input_sha256 = DeliveryProof::input_sha256(&text);
+            let tab_expanded_sha256 = DeliveryProof::tab_expanded_sha256(&text);
+            for delivery in &mut batch {
+                delivery.attempts += 1;
+                delivery.input_sha256 = Some(input_sha256.clone());
+                delivery.tab_expanded_sha256 = tab_expanded_sha256.clone();
+                self.store
+                    .set_room_delivery(delivery.clone(), "pending".into())
+                    .await
+                    .map_err(error_string)?;
+            }
+            let state = match self.wakterm.admit(id, &binding, &text, false, 0).await {
                 Err(error) => {
                     tracing::warn!(error = %error, agent = %binding.agent_id, "room message was not delivered");
-                    self.store
-                        .set_room_delivery(delivery, "indeterminate".into())
-                        .await
-                        .map_err(error_string)?;
-                    continue;
+                    "indeterminate"
                 }
-            };
-            let state = match receipt.status {
-                AdmissionStatus::Accepted => "delivered",
-                // A member that started a turn since the snapshot waits too.
-                AdmissionStatus::Busy if member => continue,
-                AdmissionStatus::Busy => match self.wakterm.steer(&binding, &text).await {
-                    Ok(_) => "delivered",
-                    // Nothing was written; the next pass offers it again.
-                    Err(WaktermCliError::TargetBlocked(_)) => continue,
-                    Err(error) => {
-                        tracing::warn!(error = %error, agent = %binding.agent_id, "room message was not steered");
-                        "indeterminate"
-                    }
+                Ok(receipt) => match receipt.status {
+                    AdmissionStatus::Accepted => "delivered",
+                    // A member that started a turn since the snapshot waits too.
+                    AdmissionStatus::Busy if member => continue,
+                    AdmissionStatus::Busy => match self.wakterm.steer(&binding, &text).await {
+                        Ok(_) => "delivered",
+                        // Nothing was written; the next pass offers it again.
+                        Err(WaktermCliError::TargetBlocked(_)) => continue,
+                        Err(error) => {
+                            tracing::warn!(error = %error, agent = %binding.agent_id, "room message was not steered");
+                            "indeterminate"
+                        }
+                    },
+                    _ if receipt.definitive && receipt.prompt_written != Some(true) => continue,
+                    _ => "indeterminate",
                 },
-                _ if receipt.definitive && receipt.prompt_written != Some(true) => continue,
-                _ => "indeterminate",
             };
-            if !introduced {
+            if !introduced && state == "delivered" {
                 self.store
                     .set_metadata(intro_key, "1".into())
                     .await
                     .map_err(error_string)?;
             }
-            self.store
-                .set_room_delivery(delivery, state.into())
-                .await
-                .map_err(error_string)?;
-            done += 1;
+            for delivery in batch {
+                self.store
+                    .set_room_delivery(delivery, state.into())
+                    .await
+                    .map_err(error_string)?;
+                done += 1;
+            }
         }
         Ok(done)
     }
@@ -3935,7 +3955,7 @@ fn room_intro(title: &str, members: &str, member: bool) -> String {
     );
     if member {
         intro.push_str(&format!(
-            " You keep your own chat: room messages reach you once you are not busy, each in a turn of its own, and the final message of each such turn is your answer to the room; what you write along the way stays in your own chat. To post a message from any other turn to the room, such as a result the others are waiting for, put {ROOM_MARKER} on its own line in it."
+            " You keep your own chat: room messages reach you once you are not busy, all that arrived meanwhile in one turn of its own, and the final message of that turn is your answer to the room; what you write along the way stays in your own chat. To post a message from any other turn to the room, such as a result the others are waiting for, put {ROOM_MARKER} on its own line in it."
         ));
     }
     intro
@@ -6856,21 +6876,61 @@ fi
             ]
         );
 
-        // Each agent hears the other member's room messages and nothing private.
+        // Each agent hears the other member's room messages and nothing
+        // private, everything waiting for it in one prompt.
         fs::write(&admitted, "").unwrap();
         assert_eq!(service.rooms_once().await.unwrap(), 3);
-        let heard = admitted_prompts(&admitted)
-            .into_iter()
+        let prompts = admitted_prompts(&admitted);
+        let heard = prompts
+            .iter()
             .map(|(agent, prompt)| format!("{agent} {prompt}"))
             .collect::<Vec<_>>();
         assert_eq!(
             heard,
             [
-                "agent-agy alpha says: Ship Friday?",
+                "agent-agy 2 room messages since your last turn, oldest first:\n\nalpha says: Ship Friday?\n\nalpha says: Build passed.",
                 "agent-claude beta says: Friday works.",
-                "agent-agy alpha says: Build passed.",
             ]
         );
+
+        // The turn a batch starts is a room turn: its answer joins the room.
+        let batch = &prompts[0].1;
+        store
+            .ingest_agent_events(
+                118,
+                121,
+                vec![
+                    room_event(
+                        119,
+                        "turn_started",
+                        "agy",
+                        "t6",
+                        json!({"input_sha256": hash(batch)}),
+                    ),
+                    room_event(
+                        120,
+                        "assistant_message",
+                        "agy",
+                        "t6",
+                        json!({"text": "Friday, after the build."}),
+                    ),
+                    final_of(121, "agy", "t6", "Friday, after the build."),
+                ],
+                project_live_routes(&routes, &service.live_routes().await.unwrap()).unwrap(),
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        let last = service
+            .handle_room("room.poll", &json!({"title": "trio", "after": 0}))
+            .await
+            .unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["text"]
+            .clone();
+        assert_eq!(last, "Friday, after the build.");
 
         // Pausing keeps the members.
         service
