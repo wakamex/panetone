@@ -4113,13 +4113,14 @@ fn reminder_body(owed: &[ReplyDebt], invalid: &[ReplyMessage]) -> String {
 }
 
 /// Whether ingesting an event needs the agents' current routes: for visible
-/// output, a question, a lifecycle change, or a turn's end, which records the
+/// output, a question, a lifecycle change, a turn's end, which records the
 /// turn for the feed, posts a room member's answer, and tells the owner when
-/// their message got none.
+/// their message got none, or a turn's start, which ends a previous room turn
+/// that was cut off.
 fn needs_routes(event: &crate::wakterm::EventRecord) -> bool {
     matches!(
         event.kind.as_str(),
-        "agent_lifecycle" | "approval_requested" | "turn_final"
+        "agent_lifecycle" | "approval_requested" | "turn_final" | "turn_started"
     ) || event.visible_output_body().is_ok_and(|body| body.is_some())
 }
 
@@ -5495,7 +5496,7 @@ elif [[ "$operation" == *"list --format json"* ]]; then
   echo '[{{"pane_id":1,"tab_id":2,"window_id":3,"effective_title":"route"}}]'
 elif [[ "$operation" == *"agent events"*"--after 100"* ]]; then
   echo 100 >> '{}'
-  echo '{{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":100,"oldest_available_sequence":1,"latest_sequence":102,"next_after_sequence":101,"events":[{{"sequence":101,"event_id":"event-101","kind":"turn_started","agent_id":"agent-route","incarnation_id":"inc-route","turn_id":"turn-1"}}]}}'
+  echo '{{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":100,"oldest_available_sequence":1,"latest_sequence":102,"next_after_sequence":101,"events":[{{"sequence":101,"event_id":"event-101","kind":"input_accepted","agent_id":"agent-route","incarnation_id":"inc-route","turn_id":"turn-1"}}]}}'
 elif [[ "$operation" == *"agent events"*"--after 101"* ]]; then
   echo 101 >> '{}'
   echo '{{"schema":"wakterm.agent-events.v1","status":"ok","requested_after_sequence":101,"oldest_available_sequence":1,"latest_sequence":102,"next_after_sequence":102,"events":[{{"sequence":102,"event_id":"event-102","kind":"turn_state_changed","agent_id":"agent-route","incarnation_id":"inc-route","turn_id":"turn-1","turn_state":"waiting_on_user"}}]}}'
@@ -7467,11 +7468,156 @@ fi
             "assistant_message",
             json!({"text": "hi"})
         )));
-        assert!(!needs_routes(&event("turn_started", json!({}))));
+        // A turn's start can end a room turn that was cut off.
+        assert!(needs_routes(&event("turn_started", json!({}))));
         assert!(!needs_routes(&event(
             "input_accepted",
             json!({"input_role": "start"})
         )));
+    }
+
+    #[tokio::test]
+    async fn a_room_turn_cut_off_before_its_end_gives_the_room_its_last_message() {
+        let directory = tempdir().unwrap();
+        let (service, store, _game, admitted) =
+            room_fixture_in_tabs(directory.path(), &[("claude", "alpha"), ("codex", "gamma")])
+                .await;
+        let route = |id: u128, title: &str, topic_id: i64| Route {
+            id: RouteId::new(Uuid::from_u128(id)),
+            title: title.into(),
+            channels: vec![ChannelBinding::Telegram { topic_id }],
+            agent: None,
+        };
+        let routes = [
+            route(701, "alpha", 71),
+            route(703, "gamma", 73),
+            route(710, "duo", 79),
+        ];
+        for route in &routes {
+            store.save_route(route.clone(), 1).await.unwrap();
+        }
+        service
+            .handle_room(
+                "room.open",
+                &json!({"title": "duo", "members": ["alpha", "gamma"]}),
+            )
+            .await
+            .unwrap();
+        let mut prompts = Vec::new();
+        for text in ["still working?", "and now?"] {
+            service
+                .handle_room(
+                    "room.say",
+                    &json!({"title": "duo", "name": "Mihai", "text": text}),
+                )
+                .await
+                .unwrap();
+            fs::write(&admitted, "").unwrap();
+            assert_eq!(service.rooms_once().await.unwrap(), 2);
+            prompts.push(
+                admitted_prompts(&admitted)
+                    .into_iter()
+                    .find(|(agent, _)| agent == "agent-claude")
+                    .unwrap()
+                    .1,
+            );
+        }
+        let hash = |text: &str| DeliveryProof::input_sha256(text);
+        let live = service.live_routes().await.unwrap();
+        let agents = project_live_routes(&routes, &live).unwrap();
+        let events = vec![
+            // A mux restart cuts the room turn off: no turn_final, and the
+            // resumed agent's next turn starts.
+            room_event(
+                101,
+                "turn_started",
+                "claude",
+                "t1",
+                json!({"input_sha256": hash(&prompts[0])}),
+            ),
+            room_event(
+                102,
+                "assistant_message",
+                "claude",
+                "t1",
+                json!({"text": "Yes, I stopped on a question."}),
+            ),
+            room_event(
+                103,
+                "assistant_message",
+                "claude",
+                "t1",
+                json!({"text": "Checking the writers now."}),
+            ),
+            room_event(
+                104,
+                "turn_started",
+                "claude",
+                "t2",
+                json!({"input_sha256": hash("resume")}),
+            ),
+            room_event(
+                105,
+                "assistant_message",
+                "claude",
+                "t2",
+                json!({"text": "private work"}),
+            ),
+            // A private turn cut off the same way gives the room nothing.
+            room_event(
+                106,
+                "turn_started",
+                "claude",
+                "t3",
+                json!({"input_sha256": hash(&prompts[1])}),
+            ),
+            room_event(
+                107,
+                "assistant_message",
+                "claude",
+                "t3",
+                json!({"text": "Half done."}),
+            ),
+            // A crash ends the room turn as aborted.
+            room_event(
+                108,
+                "turn_final",
+                "claude",
+                "t3",
+                json!({"outcome": "aborted", "detail": "process exited"}),
+            ),
+        ];
+        store
+            .ingest_agent_events(100, 108, events, agents, now_ms())
+            .await
+            .unwrap();
+        let transcript = service
+            .handle_room("room.poll", &json!({"title": "duo", "after": 0}))
+            .await
+            .unwrap();
+        let lines = transcript["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| {
+                format!(
+                    "{}: {}",
+                    message["name"].as_str().unwrap(),
+                    message["text"].as_str().unwrap()
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            [
+                "Mihai: still working?",
+                "Mihai: and now?",
+                "alpha: Checking the writers now.",
+                "alpha: Half done.",
+            ]
+        );
+        drop(service);
+        store.shutdown().await.unwrap();
     }
 
     #[test]

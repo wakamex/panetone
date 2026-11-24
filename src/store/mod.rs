@@ -2191,6 +2191,27 @@ fn ingest_event(
             outcome.remember_last_agent(candidate);
         }
     }
+    // A turn's start ends the agent's previous turn; one that never reported
+    // its end, as when a mux restart or a crash cut it off, gives a room
+    // member's last message from it to the room.
+    if event.kind == "turn_started"
+        && let Some(route) = route
+        && let Some((message, text)) =
+            cut_off_room_answer(transaction, rooms, route, event, now_ms)?
+    {
+        let room = rooms::room_of(rooms, route.id).expect("the answer's room exists");
+        post_to_room(
+            transaction,
+            routes,
+            route_agents,
+            route,
+            route_agent,
+            room,
+            &message,
+            &text,
+            now_ms,
+        )?;
+    }
     if event.kind == "turn_final"
         && let Some(route) = route
     {
@@ -2311,16 +2332,31 @@ fn member_room_answer(
     event: &EventRecord,
     now_ms: i64,
 ) -> StoreResult<Option<String>> {
-    if !rooms::room_of(rooms, route.id).is_some_and(|(room_id, _)| room_id != route.id)
-        || event.fields.get("outcome").and_then(|value| value.as_str()) == Some("aborted")
-    {
+    if !rooms::room_of(rooms, route.id).is_some_and(|(room_id, _)| room_id != route.id) {
         return Ok(None);
     }
-    let Some(text) = event
-        .fields
-        .get("text")
-        .and_then(|value| value.as_str())
-        .map(strip_memory_citations)
+    // An aborted turn's final carries its failure; its answer is the last
+    // message it wrote before it was cut off.
+    let text = if event.fields.get("outcome").and_then(|value| value.as_str()) == Some("aborted") {
+        let Some(started) = turn_start(transaction, event)? else {
+            return Ok(None);
+        };
+        last_turn_message(transaction, event, started)?.and_then(|message| {
+            message
+                .fields
+                .get("text")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        })
+    } else {
+        event
+            .fields
+            .get("text")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+    };
+    let Some(text) = text
+        .map(|text| strip_memory_citations(&text))
         .filter(|text| !text.trim().is_empty() && text.trim() != NO_REPLY)
     else {
         return Ok(None);
@@ -2337,6 +2373,126 @@ fn member_room_answer(
     Ok(Some(
         replies::find_tags(&text).map_or(text, |tagged| tagged.clean),
     ))
+}
+
+/// The last message an agent wrote in the turn of `event` before it, from the
+/// turn's start at sequence `started`.
+fn last_turn_message(
+    transaction: &Transaction<'_>,
+    event: &EventRecord,
+    started: i64,
+) -> StoreResult<Option<EventRecord>> {
+    transaction
+        .query_row(
+            "SELECT record_json FROM agent_events
+             WHERE agent_id = ?1 AND incarnation_id = ?2
+               AND sequence > ?3 AND sequence < ?4
+               AND kind = 'assistant_message'
+               AND json_extract(record_json, '$.turn_id') = ?5
+             ORDER BY sequence DESC LIMIT 1",
+            params![
+                event.agent_id,
+                event.incarnation_id,
+                started,
+                event.sequence as i64,
+                event.fields.get("turn_id").and_then(|value| value.as_str())
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| Ok(serde_json::from_str(&json)?))
+        .transpose()
+}
+
+/// When a turn starts, the agent's previous turn is over. If that turn was a
+/// room member's room turn that never reported its end, as when a mux
+/// restart or a crash cut it off, its last message is the member's answer to
+/// the room, unless it is old, says nothing, or already joined with the room
+/// marker.
+fn cut_off_room_answer(
+    transaction: &Transaction<'_>,
+    rooms: &std::collections::BTreeMap<String, RoomSettings>,
+    route: &Route,
+    event: &EventRecord,
+    now_ms: i64,
+) -> StoreResult<Option<(EventRecord, String)>> {
+    if !rooms::room_of(rooms, route.id).is_some_and(|(room_id, _)| room_id != route.id) {
+        return Ok(None);
+    }
+    let turn_id = event.fields.get("turn_id").and_then(|value| value.as_str());
+    // The agent's previous turn, in any incarnation: a restart brings a new one.
+    let Some((started, incarnation_id, previous_turn)) = transaction
+        .query_row(
+            "SELECT sequence, incarnation_id, json_extract(record_json, '$.turn_id')
+             FROM agent_events
+             WHERE agent_id = ?1 AND sequence < ?2 AND kind = 'turn_started'
+               AND json_extract(record_json, '$.turn_id') IS NOT ?3
+             ORDER BY sequence DESC LIMIT 1",
+            params![event.agent_id, event.sequence as i64, turn_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let ended = transaction
+        .query_row(
+            "SELECT 1 FROM agent_events
+             WHERE agent_id = ?1 AND incarnation_id = ?2 AND sequence > ?3 AND sequence < ?4
+               AND kind = 'turn_final' AND json_extract(record_json, '$.turn_id') = ?5
+             LIMIT 1",
+            params![
+                event.agent_id,
+                incarnation_id,
+                started,
+                event.sequence as i64,
+                previous_turn
+            ],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if ended {
+        return Ok(None);
+    }
+    let previous = EventRecord {
+        sequence: event.sequence,
+        event_id: String::new(),
+        kind: "turn_started".into(),
+        agent_id: event.agent_id.clone(),
+        incarnation_id: incarnation_id.clone(),
+        fields: [("turn_id".to_owned(), previous_turn.into())]
+            .into_iter()
+            .collect(),
+    };
+    let Some(message) = last_turn_message(transaction, &previous, started)? else {
+        return Ok(None);
+    };
+    let Some(text) = message
+        .fields
+        .get("text")
+        .and_then(|value| value.as_str())
+        .map(strip_memory_citations)
+        .filter(|text| !text.trim().is_empty() && text.trim() != NO_REPLY)
+    else {
+        return Ok(None);
+    };
+    if rooms::take_marker(&text).is_some()
+        || message
+            .observed_at_ms()
+            .is_none_or(|observed| now_ms - observed > STALE_OUTPUT_MS)
+        || !rooms::is_room_turn(transaction, &message)?
+    {
+        return Ok(None);
+    }
+    let text = replies::find_tags(&text).map_or(text, |tagged| tagged.clean);
+    Ok(Some((message, text)))
 }
 
 /// Adds an agent's message to its room's transcript, queues it for the room's
