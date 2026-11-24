@@ -2785,8 +2785,7 @@ fn turn_start(connection: &Connection, event: &EventRecord) -> StoreResult<Optio
 
 /// The input that started the turn of an agent's event: the first input hash
 /// recorded from the turn's latest start. Claude and agy put it on
-/// `turn_started`, while Codex records it on the `input_accepted` that follows
-/// and reuses one turn ID for several turns.
+/// `turn_started`, while Codex records it on the `input_accepted` that follows.
 pub(super) fn turn_input_sha256(
     connection: &Connection,
     event: &EventRecord,

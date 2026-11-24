@@ -7015,8 +7015,9 @@ fi
         let hash = |text: &str| DeliveryProof::input_sha256(text);
         let live = service.live_routes().await.unwrap();
         let agents = project_live_routes(&routes, &live).unwrap();
-        // Codex records a turn's input on the input_accepted after its start,
-        // and reuses one turn ID for several turns.
+        // Codex records a turn's input on the input_accepted after its start.
+        // The turns share one ID here to check that each is judged by its own
+        // latest start.
         let events = vec![
             room_event(101, "turn_started", "codex", "t1", json!({})),
             room_event(

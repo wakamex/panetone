@@ -2128,8 +2128,9 @@ async fn a_turn_the_owner_started_that_ends_silent_is_reported_to_the_owner() {
         serde_json::from_value(value).unwrap()
     };
     let completed = serde_json::json!({"outcome": "completed"});
-    // Codex-shaped turns: the input is on the input_accepted after the start,
-    // and one turn ID is reused.
+    // Codex-shaped turns: the input is on the input_accepted after the start.
+    // The turns share one ID here to check that each is judged by its own
+    // latest start.
     store
         .ingest_agent_events(
             100,
