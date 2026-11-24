@@ -44,8 +44,8 @@ pub struct RoomSettings {
     #[serde(default)]
     pub paused: bool,
     /// Other routes whose agents are in the room. Each keeps its own channels,
-    /// and only the turns that received a room message, or messages marked
-    /// with [`ROOM_MARKER`], join the room.
+    /// and only the turns a room message started, or messages marked with
+    /// [`ROOM_MARKER`], join the room.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<RouteId>,
 }
@@ -96,8 +96,7 @@ pub fn take_marker(body: &str) -> Option<String> {
     found.then_some(clean)
 }
 
-/// Whether the turn of an agent's event received a room message, either as
-/// the input that started it or steered into it.
+/// Whether the turn of an agent's event was started by a room message.
 pub(super) fn is_room_turn(
     connection: &Connection,
     agent_id: &str,
@@ -111,7 +110,7 @@ pub(super) fn is_room_turn(
                   json_extract(delivery.record_json, '$.input_sha256'),
                   json_extract(delivery.record_json, '$.tab_expanded_sha256')
               )
-             WHERE input.agent_id = ?1 AND input.kind IN ('turn_started', 'input_accepted')
+             WHERE input.agent_id = ?1 AND input.kind = 'turn_started'
                AND json_extract(input.record_json, '$.turn_id') = ?2
              LIMIT 1",
             params![agent_id, turn_id],

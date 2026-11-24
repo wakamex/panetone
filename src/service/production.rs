@@ -1184,6 +1184,10 @@ impl ProductionService {
             };
             let state = match receipt.status {
                 AdmissionStatus::Accepted => "delivered",
+                // A member agent busy with its own work hears the room when its
+                // turn ends, so each room message starts a turn of its own and
+                // the work turn's output stays out of the room.
+                AdmissionStatus::Busy if member => continue,
                 AdmissionStatus::Busy => match self.wakterm.steer(&binding, &text).await {
                     Ok(_) => "delivered",
                     // Nothing was written; the next pass offers it again.
@@ -3911,7 +3915,7 @@ fn room_intro(title: &str, members: &str, member: bool) -> String {
     );
     if member {
         intro.push_str(&format!(
-            " You keep your own chat: only your replies in turns that received a room message reach the room. To post a message from any other turn to the room, such as a result the others are waiting for, put {ROOM_MARKER} on its own line in it."
+            " You keep your own chat: room messages reach you once you are not busy, each in a turn of its own, and only your replies in those turns reach the room. To post a message from any other turn to the room, such as a result the others are waiting for, put {ROOM_MARKER} on its own line in it."
         ));
     }
     intro
@@ -6414,8 +6418,12 @@ elif [[ "$operation" == *"agent admit"* ]]; then
     if [[ "$1" == "--request-id" ]]; then request_id=$2; break; fi
     shift
   done
-  {{ echo "== $agent"; cat; echo; }} >> '{log}'
   incarnation=inc-${{agent#agent-}}
+  if [[ -e '{log}.busy-'"$agent" ]]; then
+    printf '{{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"busy","definitive":true,"prompt_written":false,"agent_id":"%s","incarnation_id":"%s","detail":"busy"}}\n' "$request_id" "$agent" "$incarnation"
+    exit 0
+  fi
+  {{ echo "== $agent"; cat; echo; }} >> '{log}'
   printf '{{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"accepted","definitive":true,"prompt_written":true,"agent_id":"%s","incarnation_id":"%s","detail":null}}\n' "$request_id" "$agent" "$incarnation"
 else
   echo "unexpected fake invocation: $operation" >&2
@@ -6591,6 +6599,10 @@ fi
             "{refused}"
         );
 
+        // beta is busy with its own work: its copy waits for the turn to end
+        // instead of being steered into it.
+        let busy = std::path::PathBuf::from(format!("{}.busy-agent-agy", admitted.display()));
+        fs::write(&busy, "").unwrap();
         service
             .handle_room(
                 "room.say",
@@ -6598,7 +6610,10 @@ fi
             )
             .await
             .unwrap();
-        assert_eq!(service.rooms_once().await.unwrap(), 2);
+        assert_eq!(service.rooms_once().await.unwrap(), 1);
+        assert_eq!(service.rooms_once().await.unwrap(), 0);
+        fs::remove_file(&busy).unwrap();
+        assert_eq!(service.rooms_once().await.unwrap(), 1);
         let prompts = admitted_prompts(&admitted);
         assert_eq!(
             prompts
@@ -6635,13 +6650,13 @@ fi
                 "t1",
                 json!({"text": "Ship Friday?"}),
             ),
-            // beta was busy; the room message was steered into its turn.
+            // beta's room turn started once its work turn ended.
             room_event(
                 103,
                 "turn_started",
                 "agy",
                 "t2",
-                json!({"input_sha256": hash("own work")}),
+                json!({"input_sha256": hash(&prompts[1].1)}),
             ),
             room_event(
                 104,
@@ -6680,9 +6695,32 @@ fi
                 "t3",
                 json!({"text": "Build passed.\n\n[panetone:room]"}),
             ),
+            // Room input accepted into a turn something else started does not
+            // make it a room turn.
+            room_event(
+                109,
+                "turn_started",
+                "agy",
+                "t4",
+                json!({"input_sha256": hash("own work")}),
+            ),
+            room_event(
+                110,
+                "input_accepted",
+                "agy",
+                "t4",
+                json!({"input_sha256": hash(&prompts[1].1)}),
+            ),
+            room_event(
+                111,
+                "assistant_message",
+                "agy",
+                "t4",
+                json!({"text": "benchmark queued"}),
+            ),
         ];
         store
-            .ingest_agent_events(100, 108, events, agents, now_ms())
+            .ingest_agent_events(100, 111, events, agents, now_ms())
             .await
             .unwrap();
 
@@ -6732,7 +6770,7 @@ fi
             topic("71"),
             ["Ship Friday?", "private answer", "Build passed."]
         );
-        assert_eq!(topic("72"), ["Friday works."]);
+        assert_eq!(topic("72"), ["Friday works.", "benchmark queued"]);
         assert_eq!(
             topic("79"),
             [

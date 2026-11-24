@@ -2005,7 +2005,7 @@ fn ingest_event(
         }
         // In a room, an agent's message joins the transcript and goes to the
         // room's other agents. A member route's agent joins only from turns
-        // that received a room message, or with a marked message.
+        // a room message started, or with a marked message.
         if let (Some((room_id, settings)), true, Some(body)) = (
             rooms::room_of(rooms, route.id),
             event.kind == "assistant_message" && approval.is_none(),
