@@ -1172,6 +1172,7 @@ async fn input_recorded_with_its_tabs_expanded_proves_delivery() {
         tab_expanded_sha256,
         deadline_ms: i64::MAX,
         detail: String::new(),
+        request_id: None,
     };
 
     assert!(!store.input_recorded(proof(None)).await.unwrap());
@@ -1277,6 +1278,7 @@ async fn a_turns_output_goes_where_the_message_that_started_it_came_from() {
                 tab_expanded_sha256: None,
                 deadline_ms: i64::MAX,
                 detail: String::new(),
+                request_id: None,
             });
             store
                 .save_inbox(item, "pending", Some((route_id, ChannelKind::Signal)))
@@ -2105,6 +2107,7 @@ async fn a_turn_the_owner_started_that_ends_silent_is_reported_to_the_owner() {
             tab_expanded_sha256: None,
             deadline_ms: i64::MAX,
             detail: String::new(),
+            request_id: None,
         });
         store
             .save_inbox(item, "pending", Some((route.id, ChannelKind::Signal)))
@@ -2202,6 +2205,151 @@ async fn a_turn_the_owner_started_that_ends_silent_is_reported_to_the_owner() {
                 "direct:uuid-owner".to_owned()
             ),
             ("Second answer.".to_owned(), "direct:uuid-owner".to_owned()),
+        ]
+    );
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_request_wakterm_names_links_a_turn_to_the_message_that_started_it() {
+    let directory = tempdir().unwrap();
+    let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+    let mut route = route();
+    for binding in &mut route.channels {
+        if let ChannelBinding::Signal { direct, .. } = binding {
+            *direct = true;
+        }
+    }
+    store.save_route(route.clone(), 1).await.unwrap();
+    store.initialize_event_cursor(100).await.unwrap();
+    let mut proofs = Vec::new();
+    for (id, request) in [(1_u128, "request-answered"), (2, "request-silent")] {
+        let mut item = panetone::store::InboxItem {
+            id: panetone::domain::EffectId::new(Uuid::from_u128(id)),
+            channel: ChannelKind::Signal,
+            external_id: format!("owner:{id}"),
+            destination: "direct:uuid-owner".into(),
+            sender_id: Some("+15551111".into()),
+            sender: Some("Mihai".into()),
+            reply_to_external_id: None,
+            body: format!("[direct message] question {id}"),
+            state: "pending".into(),
+            created_at_ms: id as i64,
+            receipt: None,
+            steering_acknowledged: None,
+            proof: None,
+            transcribed: false,
+            admission_round: 0,
+        };
+        store.accept_inbox(item.clone()).await.unwrap();
+        let proof = panetone::store::DeliveryProof {
+            agent_id: "agent-zola".into(),
+            after_sequence: 100,
+            input_sha256: panetone::store::DeliveryProof::input_sha256(&item.body),
+            tab_expanded_sha256: None,
+            deadline_ms: i64::MAX,
+            detail: String::new(),
+            request_id: Some(request.into()),
+        };
+        proofs.push(proof.clone());
+        item.state = "delivered".into();
+        item.proof = Some(proof);
+        store
+            .save_inbox(item, "pending", Some((route.id, ChannelKind::Signal)))
+            .await
+            .unwrap();
+    }
+    let event = |sequence: u64, kind: &str, turn: &str, fields: serde_json::Value| -> EventRecord {
+        let mut value = serde_json::json!({
+            "sequence": sequence,
+            "event_id": format!("event-{sequence}"),
+            "kind": kind,
+            "agent_id": "agent-zola",
+            "incarnation_id": "incarnation-zola-7",
+            "turn_id": turn,
+            "observed_at": "2026-10-13T18:08:50Z",
+        });
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        serde_json::from_value(value).unwrap()
+    };
+    // The harness recorded each message rewritten, so its hash matches
+    // nothing; only the request Wakterm names links input and message.
+    let rewritten = |request: &str| {
+        serde_json::json!({
+            "input_role": "start",
+            "request_id": request,
+            "input_sha256": panetone::store::DeliveryProof::input_sha256("rewritten"),
+        })
+    };
+    assert!(!store.input_recorded(proofs[0].clone()).await.unwrap());
+    store
+        .ingest_agent_events(
+            100,
+            108,
+            vec![
+                event(101, "turn_started", "turn-1", serde_json::json!({})),
+                event(
+                    102,
+                    "input_accepted",
+                    "turn-1",
+                    rewritten("request-answered"),
+                ),
+                event(
+                    103,
+                    "assistant_message",
+                    "turn-1",
+                    serde_json::json!({"text": "First answer."}),
+                ),
+                event(
+                    104,
+                    "turn_final",
+                    "turn-1",
+                    serde_json::json!({"outcome": "completed", "text": "First answer."}),
+                ),
+                // The input can be recorded after its turn's start.
+                event(105, "turn_started", "turn-2", serde_json::json!({})),
+                event(
+                    106,
+                    "turn_state_changed",
+                    "turn-2",
+                    serde_json::json!({"turn_state": "waiting_on_agent"}),
+                ),
+                event(107, "input_accepted", "turn-2", rewritten("request-silent")),
+                event(
+                    108,
+                    "turn_final",
+                    "turn-2",
+                    serde_json::json!({"outcome": "completed"}),
+                ),
+            ],
+            live_agents(&route),
+            3,
+        )
+        .await
+        .unwrap();
+    // Delivery is proven by the request.
+    assert!(store.input_recorded(proofs[0].clone()).await.unwrap());
+    let posted = store
+        .pending_outbox()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|item| (item.body, item.destination))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        posted,
+        [
+            ("First answer.".to_owned(), "direct:uuid-owner".to_owned()),
+            (
+                format!(
+                    "[no reply] {}'s turn ended without an answer to your message. Send it again if it still matters.",
+                    route.title
+                ),
+                "direct:uuid-owner".to_owned()
+            ),
         ]
     );
     store.shutdown().await.unwrap();

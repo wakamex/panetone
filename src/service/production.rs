@@ -1230,6 +1230,7 @@ impl ProductionService {
                 delivery.attempts += 1;
                 delivery.input_sha256 = Some(input_sha256.clone());
                 delivery.tab_expanded_sha256 = tab_expanded_sha256.clone();
+                delivery.request_id = Some(id.to_string());
                 self.store
                     .set_room_delivery(delivery.clone(), "pending".into())
                     .await
@@ -1792,6 +1793,7 @@ impl ProductionService {
                 tab_expanded_sha256: DeliveryProof::tab_expanded_sha256(&item.body),
                 deadline_ms: now_ms() + INBOX_PROOF_WINDOW_MS,
                 detail: "Panetone restarted while delivering it".into(),
+                request_id: Some(item.admission_id().to_string()),
             });
             self.store
                 .save_inbox(item.clone(), "pending", None)
@@ -6500,6 +6502,7 @@ elif [[ "$operation" == *"agent admit"* ]]; then
     exit 0
   fi
   {{ echo "== $agent"; cat; echo; }} >> '{log}'
+  echo "$agent $request_id" >> '{log}.requests'
   printf '{{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"accepted","definitive":true,"prompt_written":true,"agent_id":"%s","incarnation_id":"%s","detail":null}}\n' "$request_id" "$agent" "$incarnation"
 else
   echo "unexpected fake invocation: $operation" >&2
@@ -7136,6 +7139,99 @@ fi
         }
         // The left-out messages are not offered again.
         assert_eq!(service.rooms_once().await.unwrap(), 0);
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_room_turn_is_recognized_by_the_request_wakterm_names() {
+        let directory = tempdir().unwrap();
+        let (service, store, _game, admitted) =
+            room_fixture_in_tabs(directory.path(), &[("claude", "alpha"), ("codex", "gamma")])
+                .await;
+        let route = |id: u128, title: &str, topic_id: i64| Route {
+            id: RouteId::new(Uuid::from_u128(id)),
+            title: title.into(),
+            channels: vec![ChannelBinding::Telegram { topic_id }],
+            agent: None,
+        };
+        let routes = [
+            route(701, "alpha", 71),
+            route(703, "gamma", 73),
+            route(710, "duo", 79),
+        ];
+        for route in &routes {
+            store.save_route(route.clone(), 1).await.unwrap();
+        }
+        service
+            .handle_room(
+                "room.open",
+                &json!({"title": "duo", "members": ["alpha", "gamma"]}),
+            )
+            .await
+            .unwrap();
+        service
+            .handle_room(
+                "room.say",
+                &json!({"title": "duo", "name": "Mihai", "text": "ready?"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(service.rooms_once().await.unwrap(), 2);
+        let request = fs::read_to_string(format!("{}.requests", admitted.display()))
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("agent-codex ").map(str::to_owned))
+            .unwrap();
+        let live = service.live_routes().await.unwrap();
+        let agents = project_live_routes(&routes, &live).unwrap();
+        // The harness recorded the prompt rewritten, so only the request
+        // Wakterm names links the turn to the room.
+        let events = vec![
+            room_event(101, "turn_started", "codex", "t1", json!({})),
+            room_event(
+                102,
+                "input_accepted",
+                "codex",
+                "t1",
+                json!({"input_role": "start", "request_id": request, "input_sha256": DeliveryProof::input_sha256("rewritten")}),
+            ),
+            room_event(
+                103,
+                "assistant_message",
+                "codex",
+                "t1",
+                json!({"text": "Ready."}),
+            ),
+            room_event(
+                104,
+                "turn_final",
+                "codex",
+                "t1",
+                json!({"outcome": "completed", "text": "Ready."}),
+            ),
+        ];
+        store
+            .ingest_agent_events(100, 104, events, agents, now_ms())
+            .await
+            .unwrap();
+        let transcript = service
+            .handle_room("room.poll", &json!({"title": "duo", "after": 0}))
+            .await
+            .unwrap();
+        let last = transcript["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            (
+                last["name"].as_str().unwrap(),
+                last["text"].as_str().unwrap()
+            ),
+            ("gamma", "Ready.")
+        );
         drop(service);
         store.shutdown().await.unwrap();
     }
@@ -7841,6 +7937,7 @@ fi
             tab_expanded_sha256: DeliveryProof::tab_expanded_sha256(body),
             deadline_ms: i64::MAX,
             detail: "prompt was written".into(),
+            request_id: None,
         });
         store.save_inbox(item, "pending", None).await.unwrap();
         let service = ProductionService::new(

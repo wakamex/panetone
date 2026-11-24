@@ -742,6 +742,8 @@ impl OfflineService {
                     tab_expanded_sha256: DeliveryProof::tab_expanded_sha256(&prompt),
                     deadline_ms: now_ms + SEND_PROOF_WINDOW_MS,
                     detail: "it was typed into the busy agent's turn, but the agent did not acknowledge it".into(),
+                    // Wakterm does not yet name a request on steered input.
+                    request_id: None,
                 });
             }
             record.workflow.submitted_target = Some(target);
@@ -771,6 +773,7 @@ impl OfflineService {
                     .detail
                     .clone()
                     .unwrap_or_else(|| "Wakterm wrote it but did not see the agent start".into()),
+                request_id: Some(record.workflow.target_effect_id.to_string()),
             });
             record.workflow.submitted_target = Some(target);
             transition(&self.store, &mut record, WorkflowState::Submitted, now_ms).await?;

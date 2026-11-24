@@ -173,6 +173,10 @@ pub struct DeliveryProof {
     pub deadline_ms: i64,
     /// Why delivery was unconfirmed, for the sender's notice if no proof comes.
     pub detail: String,
+    /// The Wakterm request that typed the message, which Wakterm names on
+    /// the input's record; a message steered into a busy turn has none yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 impl DeliveryProof {
@@ -2814,23 +2818,60 @@ pub(super) fn turn_input_sha256(
         .optional()?)
 }
 
+/// The input that started the turn of an agent's event, as Wakterm
+/// recorded it: the Panetone request that typed it, when Wakterm names one on
+/// the turn's starting `input_accepted`, and its hash. Matching by request is
+/// exact; the hash serves input Wakterm names no request for, such as
+/// hand-typed input, and events recorded before Wakterm named requests.
+pub(super) struct TurnInput {
+    pub request_id: Option<String>,
+    pub input_sha256: Option<String>,
+}
+
+pub(super) fn turn_input(connection: &Connection, event: &EventRecord) -> StoreResult<TurnInput> {
+    let request_id = connection
+        .query_row(
+            "SELECT json_extract(record_json, '$.request_id') FROM agent_events
+             WHERE agent_id = ?1 AND incarnation_id = ?2 AND sequence < ?3
+               AND kind = 'input_accepted'
+               AND json_extract(record_json, '$.input_role') = 'start'
+               AND json_extract(record_json, '$.turn_id') = ?4
+               AND json_extract(record_json, '$.request_id') IS NOT NULL
+             ORDER BY sequence DESC LIMIT 1",
+            params![
+                event.agent_id,
+                event.incarnation_id,
+                event.sequence as i64,
+                event.fields.get("turn_id").and_then(|value| value.as_str())
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(TurnInput {
+        request_id,
+        input_sha256: turn_input_sha256(connection, event)?,
+    })
+}
+
 fn turn_origin(
     connection: &Connection,
     event: &EventRecord,
 ) -> StoreResult<Option<(ChannelKind, String)>> {
-    let Some(input_sha256) = turn_input_sha256(connection, event)? else {
+    let input = turn_input(connection, event)?;
+    if input.request_id.is_none() && input.input_sha256.is_none() {
         return Ok(None);
-    };
+    }
     let origin = connection
         .query_row(
             "SELECT channel, json_extract(record_json, '$.destination') FROM inbox
              WHERE json_extract(record_json, '$.proof.agent_id') = ?1
-               AND ?2 IN (
-                   json_extract(record_json, '$.proof.input_sha256'),
-                   json_extract(record_json, '$.proof.tab_expanded_sha256')
-               )
+               AND (json_extract(record_json, '$.proof.request_id') = ?3
+                    OR ?2 IN (
+                        json_extract(record_json, '$.proof.input_sha256'),
+                        json_extract(record_json, '$.proof.tab_expanded_sha256')
+                    ))
              ORDER BY created_at_ms DESC LIMIT 1",
-            params![event.agent_id, input_sha256],
+            params![event.agent_id, input.input_sha256, input.request_id],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?;
@@ -3388,13 +3429,15 @@ fn input_recorded(connection: &Connection, proof: &DeliveryProof) -> StoreResult
             "SELECT 1 FROM agent_events
              WHERE agent_id = ?1 AND sequence > ?2
                AND kind IN ('input_accepted', 'turn_started')
-               AND json_extract(record_json, '$.input_sha256') IN (?3, ?4)
+               AND (json_extract(record_json, '$.request_id') = ?5
+                    OR json_extract(record_json, '$.input_sha256') IN (?3, ?4))
              LIMIT 1",
             params![
                 proof.agent_id,
                 proof.after_sequence,
                 proof.input_sha256,
-                proof.tab_expanded_sha256
+                proof.tab_expanded_sha256,
+                proof.request_id
             ],
             |_| Ok(()),
         )

@@ -562,6 +562,7 @@ async fn a_restart_retries_an_interrupted_admission_and_awaits_proof_of_a_steer(
         tab_expanded_sha256: None,
         deadline_ms: 1,
         detail: "Panetone restarted while delivering it".into(),
+        request_id: None,
     };
     for (id, state, proof) in [
         (1, "admission_prepared", Some(proof.clone())),

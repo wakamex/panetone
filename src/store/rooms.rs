@@ -101,18 +101,21 @@ pub(super) fn is_room_turn(
     connection: &Connection,
     event: &crate::wakterm::EventRecord,
 ) -> StoreResult<bool> {
-    let Some(input_sha256) = super::turn_input_sha256(connection, event)? else {
+    let input = super::turn_input(connection, event)?;
+    if input.request_id.is_none() && input.input_sha256.is_none() {
         return Ok(false);
-    };
+    }
     Ok(connection
         .query_row(
             "SELECT 1 FROM room_deliveries
-             WHERE agent_id = ?1 AND ?2 IN (
-                 json_extract(record_json, '$.input_sha256'),
-                 json_extract(record_json, '$.tab_expanded_sha256')
-             )
+             WHERE agent_id = ?1
+               AND (json_extract(record_json, '$.request_id') = ?3
+                    OR ?2 IN (
+                        json_extract(record_json, '$.input_sha256'),
+                        json_extract(record_json, '$.tab_expanded_sha256')
+                    ))
              LIMIT 1",
-            params![event.agent_id, input_sha256],
+            params![event.agent_id, input.input_sha256, input.request_id],
             |_| Ok(()),
         )
         .optional()?
@@ -155,6 +158,10 @@ pub struct RoomDelivery {
     pub input_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_expanded_sha256: Option<String>,
+    /// The Wakterm request that typed the prompt, which Wakterm names on the
+    /// input's record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 pub(super) fn rooms(
@@ -207,6 +214,7 @@ pub(super) fn post(
             attempts: 0,
             input_sha256: None,
             tab_expanded_sha256: None,
+            request_id: None,
         };
         transaction.execute(
             "INSERT INTO room_deliveries(route_id, agent_id, state, record_json, created_at_ms)

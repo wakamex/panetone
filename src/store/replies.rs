@@ -496,11 +496,17 @@ pub(super) fn last_turn_end(
         .is_some();
     let started_by_reminder = connection
         .query_row(
+            // The reminder's own request, when Wakterm names it on the turn's
+            // starting input, or else its hash on that input.
             "SELECT 1 FROM agent_events AS started
              JOIN reply_reminders AS reminder
                ON reminder.agent_id = started.agent_id
-              AND reminder.input_sha256 = json_extract(started.record_json, '$.input_sha256')
-             WHERE started.agent_id = ?1 AND started.kind = 'turn_started'
+              AND (reminder.effect_id = json_extract(started.record_json, '$.request_id')
+                   OR reminder.input_sha256 = json_extract(started.record_json, '$.input_sha256'))
+             WHERE started.agent_id = ?1
+               AND (started.kind = 'turn_started'
+                    OR (started.kind = 'input_accepted'
+                        AND json_extract(started.record_json, '$.input_role') = 'start'))
                AND json_extract(started.record_json, '$.turn_id') = ?2
              LIMIT 1",
             params![agent_id, turn_id],
