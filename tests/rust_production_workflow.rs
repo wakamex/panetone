@@ -475,7 +475,10 @@ elif [[ "$operation" == *"agent caller"* ]]; then
 elif [[ "$operation" == *"agent capabilities"* ]]; then
   echo '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
 elif [[ "$operation" == *"agent catalog"* ]]; then
-  echo '{{"schema":"wakterm.agent-api.v1","as_of_event_sequence":500,"agents":[{{"agent_id":"agent-source","incarnation_id":"inc-source","pane_id":1,"name":"source_codex","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-10-04T00:00:00Z"}},{{"agent_id":"agent-claude","incarnation_id":"inc-claude","pane_id":2,"name":"shared_claude","harness":"claude","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-10-04T00:00:00Z"}},{{"agent_id":"agent-codex","incarnation_id":"inc-codex","pane_id":3,"name":"shared_codex","harness":"codex","status":"busy","turn_state":"waiting_on_agent","alive":true,"observed_at":"2026-10-04T00:00:00Z"}}]}}'
+  # The Codex is in a turn until its one busy admission has been refused.
+  codex='"status":"busy","turn_state":"waiting_on_agent"'
+  if [[ -e '{0}.busy-once' ]]; then codex='"status":"idle","turn_state":"waiting_on_user"'; fi
+  echo '{{"schema":"wakterm.agent-api.v1","as_of_event_sequence":500,"agents":[{{"agent_id":"agent-source","incarnation_id":"inc-source","pane_id":1,"name":"source_codex","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-10-04T00:00:00Z"}},{{"agent_id":"agent-claude","incarnation_id":"inc-claude","pane_id":2,"name":"shared_claude","harness":"claude","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-10-04T00:00:00Z"}},{{"agent_id":"agent-codex","incarnation_id":"inc-codex","pane_id":3,"name":"shared_codex","harness":"codex",'"$codex"',"alive":true,"observed_at":"2026-10-04T00:00:00Z"}}]}}'
 elif [[ "$operation" == *"list --format json"* ]]; then
   echo '[{{"pane_id":1,"tab_id":1,"window_id":1,"effective_title":"source"}},{{"pane_id":2,"tab_id":2,"window_id":1,"effective_title":"shared"}},{{"pane_id":3,"tab_id":2,"window_id":1,"effective_title":"shared"}}]'
 elif [[ "$operation" == *"agent events"* ]]; then

@@ -2068,9 +2068,10 @@ fn ingest_event(
                             .map(|json| serde_json::from_str(&json))
                             .transpose()?
                             .unwrap_or_default();
-                    let name = names.get(&event.agent_id).cloned().unwrap_or_else(|| {
-                        format!("{}_{}", route.title, harness.as_deref().unwrap_or("agent"))
-                    });
+                    let name = names
+                        .get(&event.agent_id)
+                        .cloned()
+                        .unwrap_or_else(|| route.title.clone());
                     let namespace = Uuid::new_v5(
                         &Uuid::NAMESPACE_URL,
                         b"https://panetone.dev/rooms/members/v1",

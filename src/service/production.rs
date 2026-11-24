@@ -784,6 +784,11 @@ impl ProductionService {
             if !offered.insert(binding.agent_id.clone()) {
                 continue;
             }
+            // Wakterm would only refuse an agent in the middle of a turn, so
+            // its queued messages wait without asking until the turn ends.
+            if live.is_working(&binding) {
+                continue;
+            }
             let live_route = route.with_agent(binding);
             attempted += 1;
             match self
@@ -1020,8 +1025,9 @@ impl ProductionService {
             .map_err(error_string)
     }
 
-    /// Names to show for room speakers, remembered so an agent that has gone
-    /// keeps its name in the transcript.
+    /// Names to show for room speakers: an agent's route title, or its Wakterm
+    /// name when its tab holds several agents. Remembered so an agent that
+    /// has gone keeps its name in the transcript.
     async fn room_names(
         &self,
         live: &LiveRouteSnapshot,
@@ -1038,10 +1044,15 @@ impl ProductionService {
         let mut changed = false;
         for live_route in live.routes() {
             for agent in &live_route.agents {
-                let name = live
-                    .agent_name(agent)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| format!("{}_{}", live_route.title, agent.harness));
+                // An agent is known by its route; agents sharing one tab are
+                // told apart by their Wakterm names.
+                let name = if live_route.agents.len() == 1 {
+                    live_route.title.clone()
+                } else {
+                    live.agent_name(agent)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("{}_{}", live_route.title, agent.harness))
+                };
                 if names.get(&agent.agent_id) != Some(&name) {
                     names.insert(agent.agent_id.clone(), name);
                     changed = true;
@@ -6600,7 +6611,7 @@ fi
             .iter()
             .map(|member| member["name"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["alpha_claude", "beta_agy"]);
+        assert_eq!(names, ["alpha", "beta"]);
         let refused = service
             .handle_room("room.open", &json!({"title": "game", "members": ["alpha"]}))
             .await
@@ -6768,9 +6779,9 @@ fi
             lines,
             [
                 "Mihai: plan the release",
-                "alpha_claude: Ship Friday?",
-                "beta_agy: Friday works.",
-                "alpha_claude: Build passed.",
+                "alpha: Ship Friday?",
+                "beta: Friday works.",
+                "alpha: Build passed.",
             ]
         );
 
@@ -6799,9 +6810,9 @@ fi
             topic("79"),
             [
                 "Mihai: plan the release",
-                "alpha_claude: Ship Friday?",
-                "beta_agy: Friday works.",
-                "alpha_claude: Build passed.",
+                "alpha: Ship Friday?",
+                "beta: Friday works.",
+                "alpha: Build passed.",
             ]
         );
 
@@ -6815,9 +6826,9 @@ fi
         assert_eq!(
             heard,
             [
-                "agent-agy alpha_claude says: Ship Friday?",
-                "agent-claude beta_agy says: Friday works.",
-                "agent-agy alpha_claude says: Build passed.",
+                "agent-agy alpha says: Ship Friday?",
+                "agent-claude beta says: Friday works.",
+                "agent-agy alpha says: Build passed.",
             ]
         );
 
@@ -6935,9 +6946,9 @@ operation="$*"
 if [[ "$operation" == *"agent capabilities"* ]]; then
   printf '%s\n' '{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}'
 elif [[ "$operation" == *"agent catalog"* ]]; then
-  printf '%s\n' '{"schema":"wakterm.agent-api.v1","as_of_event_sequence":10,"agents":[{"agent_id":"agent-failure","incarnation_id":"inc-failure","pane_id":11,"name":"failure","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-27T00:00:00Z"},{"agent_id":"agent-success","incarnation_id":"inc-success","pane_id":12,"name":"success","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-27T00:00:00Z"},{"agent_id":"agent-source","incarnation_id":"inc-source","pane_id":1,"name":"source","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-27T00:00:00Z"}]}'
+  printf '%s\n' '{"schema":"wakterm.agent-api.v1","as_of_event_sequence":10,"agents":[{"agent_id":"agent-failure","incarnation_id":"inc-failure","pane_id":11,"name":"failure","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-27T00:00:00Z"},{"agent_id":"agent-success","incarnation_id":"inc-success","pane_id":12,"name":"success","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-27T00:00:00Z"},{"agent_id":"agent-source","incarnation_id":"inc-source","pane_id":1,"name":"source","harness":"codex","status":"idle","turn_state":"waiting_on_user","alive":true,"observed_at":"2026-08-27T00:00:00Z"},{"agent_id":"agent-working","incarnation_id":"inc-working","pane_id":13,"name":"working","harness":"codex","status":"busy","turn_state":"waiting_on_agent","alive":true,"observed_at":"2026-08-27T00:00:00Z"}]}'
 elif [[ "$operation" == *"list --format json"* ]]; then
-  printf '%s\n' '[{"pane_id":11,"tab_id":11,"window_id":1,"effective_title":"failure"},{"pane_id":12,"tab_id":12,"window_id":1,"effective_title":"success"},{"pane_id":1,"tab_id":1,"window_id":1,"effective_title":"source"}]'
+  printf '%s\n' '[{"pane_id":11,"tab_id":11,"window_id":1,"effective_title":"failure"},{"pane_id":12,"tab_id":12,"window_id":1,"effective_title":"success"},{"pane_id":1,"tab_id":1,"window_id":1,"effective_title":"source"},{"pane_id":13,"tab_id":13,"window_id":1,"effective_title":"working"}]'
 else
   echo "unexpected fake invocation: $operation" >&2
   exit 9
@@ -6978,7 +6989,9 @@ fi
         };
         let failed_target = target(901, "failure", 11);
         let submitted_target = target(902, "success", 12);
+        let working_target = target(906, "working", 13);
         let store = StoreHandle::open(directory.path().join("state.sqlite3")).unwrap();
+        store.save_route(working_target.clone(), 1).await.unwrap();
         store.save_route(source.clone(), 1).await.unwrap();
         store.save_route(failed_target.clone(), 1).await.unwrap();
         store.save_route(submitted_target.clone(), 1).await.unwrap();
@@ -6988,6 +7001,7 @@ fi
             RecordingChannels::default(),
         ));
         workflows.wakterm().script_receipts([
+            AdmissionStatus::Busy,
             AdmissionStatus::Busy,
             AdmissionStatus::Busy,
             AdmissionStatus::Busy,
@@ -7028,6 +7042,12 @@ fi
                 &submitted_target,
                 30,
             )
+            .await
+            .unwrap();
+        // An agent Wakterm lists as mid-turn is not asked until it is idle.
+        let working_id = WorkflowId::new(Uuid::from_u128(906));
+        workflows
+            .submit(command(906, &working_target), &source, &working_target, 40)
             .await
             .unwrap();
         let service = ProductionService {
@@ -7100,7 +7120,25 @@ fi
             "[Panetone] Your queued message {failed_id} to failure (\"request 903\") was not delivered: ObserverFailure:"
         )));
         assert!(told[0].prompt.contains("Nothing was typed into failure"));
-        assert_eq!(store.status().await.unwrap().awaiting_target_idle, 1);
+        assert_eq!(
+            store
+                .get_workflow(working_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .workflow
+                .state,
+            WorkflowState::AwaitingTargetIdle
+        );
+        let asked_working = workflows
+            .wakterm()
+            .calls()
+            .into_iter()
+            .filter(|call| call.binding.agent_id == "agent-working")
+            .count();
+        // Asked again, the fake's next receipt would have delivered it.
+        assert_eq!(asked_working, 0, "the working agent was asked again");
+        assert_eq!(store.status().await.unwrap().awaiting_target_idle, 2);
         drop(service);
         drop(workflows);
         store.shutdown().await.unwrap();
