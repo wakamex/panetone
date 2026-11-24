@@ -147,10 +147,20 @@ const HELP: &str = "/who  the agents here and who is working
 /off  turn the room back into an ordinary route and leave
 /quit  leave; the room stays open";
 
-/// Runs the chat client until the user leaves.
-pub async fn run(socket: PathBuf, title: String, me: String) -> anyhow::Result<()> {
+/// Runs the chat client until the user leaves. With `members`, the room
+/// also holds those routes' agents, and is created when no route has its title.
+pub async fn run(
+    socket: PathBuf,
+    title: String,
+    members: Vec<String>,
+    me: String,
+) -> anyhow::Result<()> {
     let style = Style::detect(me.clone());
-    let opened = call(&socket, "room.open", json!({"title": title})).await?;
+    let mut params = json!({"title": title});
+    if !members.is_empty() {
+        params["members"] = json!(members);
+    }
+    let opened = call(&socket, "room.open", params).await?;
     let room = opened["room"].as_str().unwrap_or(&title).to_owned();
     let members = opened["members"].as_array().cloned().unwrap_or_default();
     println!(

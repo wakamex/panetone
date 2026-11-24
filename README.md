@@ -204,6 +204,14 @@ target/release/panetone chat evilcorp
 
 This makes the route a room. Everyone in a room sees every message: what you type goes to each of the route's agents, and each agent's output goes to the other agents, the terminal and the route's Telegram or Signal channel. Messages from the route's channel join the room too. The first message an agent gets explains the room and tells it to answer with exactly `<panetone:no-reply>` when it has nothing to add, which keeps the room quiet. A route's only agent, such as an endchat profile, gets plain messages with no explanation, and speakers are named only once a second person has spoken. Your name defaults to your login name; `--as NAME` sets another. In the chat, `/pause` stops passing agents' messages to each other while yours still reach everyone, `/resume` restarts that, `/off` turns the room back into an ordinary route, and `/quit` leaves with the room still open. In Wakterm each agent is marked with its harness icon from the Wakterm tab bar, printed as the private-use character Wakterm draws as that icon; elsewhere, or with `PANETONE_CHAT_PLAIN` set, a coloured dot.
 
+A room can also hold agents that stay in their own tabs, on their own routes:
+
+```sh
+target/release/panetone chat trio --with alpha --with beta --with gamma
+```
+
+Each `--with` route becomes a member of room `trio`, which needs no tab of its own: when no route has its title, Panetone creates it with its own Telegram topic, where the room is shown and where messages join the room. A member route keeps its channels, replies owed and job notices. Its agent's output still goes to its own chat, and joins the room only from a turn that received a room message, as the turn's first input or steered into it, or when the agent marks a message with `[panetone:room]` on its own line, which lets a result from any turn, such as a finished job, reach the room. The room's topic shows each such message as `NAME: text`. A route can be a member of one room only, and a room cannot be another room's member. Later, `panetone chat trio` reopens the room with the same members, and `/off` ends it, leaving each member an ordinary route.
+
 Run a side-effect-free local check against the loaded Wakterm service:
 
 ```sh

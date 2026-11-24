@@ -21,8 +21,8 @@ use crate::domain::{
     signal_group_account,
 };
 use crate::store::{
-    DeliveryProof, EventCursorGap, InboxItem, ReplyDebt, ReplyMessage, RoomMessage, RoomSettings,
-    RouteAgent, StoreHandle, StoredApproval,
+    DeliveryProof, EventCursorGap, InboxItem, ROOM_MARKER, ROOM_NAMES_KEY, ReplyDebt, ReplyMessage,
+    RoomMessage, RoomSettings, RouteAgent, StoreHandle, StoredApproval,
 };
 use crate::supervisor::SupervisorHandle;
 use crate::wakterm::form::{self, FormAction, FormState};
@@ -51,7 +51,6 @@ const ENDCHAT_PROFILES_KEY: &str = "endchat_profiles_v1";
 /// Metadata listing the IDs of routes whose incoming audio is transcribed.
 const TRANSCRIBE_ROUTES_KEY: &str = "transcribe_routes_v1";
 /// Metadata remembering each room speaker's display name, by agent ID.
-const ROOM_NAMES_KEY: &str = "room_names_v1";
 /// How long a channel message waits on a blocked pane before its sender is told why.
 const INBOX_WAITING_NOTICE_MS: i64 = 60_000;
 
@@ -994,20 +993,16 @@ impl ProductionService {
     async fn post_to_room(
         &self,
         live: &LiveRouteSnapshot,
+        routes: &[Route],
         route: &Route,
+        settings: Option<&RoomSettings>,
         speaker: String,
         text: String,
     ) -> Result<RoomMessage, String> {
-        let recipients = live
-            .route(&route.title)
-            .map(|live_route| {
-                live_route
-                    .agents
-                    .iter()
-                    .map(|agent| agent.agent_id.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let recipients = room_agents(live, routes, route, settings)
+            .into_iter()
+            .map(|agent| agent.agent_id)
+            .collect();
         self.store
             .post_room_message(
                 route.id,
@@ -1079,6 +1074,7 @@ impl ProductionService {
         let live = self.live_routes().await.map_err(error_string)?;
         let names = self.room_names(&live).await?;
         let rooms = self.store.rooms().await.map_err(error_string)?;
+        let routes = self.store.list_routes().await.map_err(error_string)?;
         let mut done = 0;
         for mut delivery in deliveries {
             let Some(route) = self
@@ -1093,22 +1089,27 @@ impl ProductionService {
                     .map_err(error_string)?;
                 continue;
             };
-            if !rooms.contains_key(&route.id.to_string()) {
+            let Some(settings) = rooms.get(&route.id.to_string()) else {
                 self.store
                     .set_room_delivery(delivery, "dropped".into())
                     .await
                     .map_err(error_string)?;
                 continue;
-            }
-            let Some(binding) = live.route(&route.title).ok().and_then(|live_route| {
+            };
+            let agents = room_agents(&live, &routes, &route, Some(settings));
+            let Some(binding) = agents
+                .iter()
+                .find(|agent| agent.agent_id == delivery.agent_id)
+                .cloned()
+            else {
+                continue;
+            };
+            let member = !live.route(&route.title).is_ok_and(|live_route| {
                 live_route
                     .agents
                     .iter()
-                    .find(|agent| agent.agent_id == delivery.agent_id)
-                    .cloned()
-            }) else {
-                continue;
-            };
+                    .any(|agent| agent.agent_id == binding.agent_id)
+            });
             let speaker = if delivery.speaker_is_agent {
                 names
                     .get(&delivery.speaker)
@@ -1120,9 +1121,7 @@ impl ProductionService {
             // An agent alone with one person is in an ordinary conversation, so
             // its prompt carries no room intro or speaker name; an endchat
             // profile, for one, keeps every prompt in its log word for word.
-            let alone = live
-                .route(&route.title)
-                .is_ok_and(|live_route| live_route.agents.len() == 1);
+            let alone = agents.len() == 1;
             let named = !alone
                 || self
                     .store
@@ -1140,24 +1139,18 @@ impl ProductionService {
                     .is_some();
             let mut text = String::new();
             if !introduced {
-                let members = live
-                    .route(&route.title)
-                    .map(|live_route| {
-                        live_route
-                            .agents
-                            .iter()
-                            .filter(|agent| agent.agent_id != binding.agent_id)
-                            .map(|agent| {
-                                names
-                                    .get(&agent.agent_id)
-                                    .cloned()
-                                    .unwrap_or_else(|| agent.agent_id.clone())
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                let members = agents
+                    .iter()
+                    .filter(|agent| agent.agent_id != binding.agent_id)
+                    .map(|agent| {
+                        names
+                            .get(&agent.agent_id)
+                            .cloned()
+                            .unwrap_or_else(|| agent.agent_id.clone())
                     })
-                    .unwrap_or_default();
-                text.push_str(&room_intro(&route.title, &members));
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                text.push_str(&room_intro(&route.title, &members, member));
                 text.push_str("\n\n");
             }
             if named {
@@ -1170,6 +1163,14 @@ impl ProductionService {
                 format!("{}\0{}", delivery.id, delivery.attempts).as_bytes(),
             ));
             delivery.attempts += 1;
+            // Saved before the prompt is written, so the turn it starts or
+            // joins is recognized as a room turn however fast it answers.
+            delivery.input_sha256 = Some(DeliveryProof::input_sha256(&text));
+            delivery.tab_expanded_sha256 = DeliveryProof::tab_expanded_sha256(&text);
+            self.store
+                .set_room_delivery(delivery.clone(), "pending".into())
+                .await
+                .map_err(error_string)?;
             let receipt = match self.wakterm.admit(id, &binding, &text, false, 0).await {
                 Ok(receipt) => receipt,
                 Err(error) => {
@@ -1683,7 +1684,15 @@ impl ProductionService {
                     .strip_prefix(&format!("{speaker} says: "))
                     .unwrap_or(&item.body)
                     .to_owned();
-                self.post_to_room(&live, route, speaker, text).await?;
+                self.post_to_room(
+                    &live,
+                    &routes,
+                    route,
+                    rooms.get(&route.id.to_string()),
+                    speaker,
+                    text,
+                )
+                .await?;
                 item.state = "delivered".into();
                 self.store
                     .save_inbox(item.clone(), "pending", Some((route.id, item.channel)))
@@ -2494,18 +2503,62 @@ impl ProductionService {
             .get("title")
             .and_then(serde_json::Value::as_str)
             .ok_or("a room request needs a title")?;
-        let routes = self.store.list_routes().await.map_err(error_string)?;
-        let route = exact_route(&routes, title)
-            .map_err(|_| format!("no route is titled {title:?}"))?
-            .clone();
+        let member_titles = match params.get("members") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_array()
+                    .ok_or("members must be a list of route titles")?
+                    .iter()
+                    .map(|title| title.as_str().ok_or("members must be route titles"))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        };
+        let _change = match (method, &member_titles) {
+            ("room.open", Some(_)) => Some(self.route_changes.lock().await),
+            _ => None,
+        };
+        let mut routes = self.store.list_routes().await.map_err(error_string)?;
+        let route = match exact_route(&routes, title) {
+            Ok(route) => route.clone(),
+            // A room of member routes needs no tab of its own; it gets a
+            // Telegram topic where the room is shown and people can join in.
+            Err("not_found")
+                if method == "room.open"
+                    && member_titles
+                        .as_ref()
+                        .is_some_and(|titles| !titles.is_empty()) =>
+            {
+                if !valid_route_title(title) {
+                    return Err(format!("{title:?} is not a valid route title"));
+                }
+                let topic_id = self
+                    .channels
+                    .create_telegram_topic(title)
+                    .await
+                    .map_err(error_string)?;
+                let route = telegram_route(title.to_owned(), topic_id);
+                self.store
+                    .save_route(route.clone(), now_ms())
+                    .await
+                    .map_err(error_string)?;
+                routes.push(route.clone());
+                route
+            }
+            Err(_) => return Err(format!("no route is titled {title:?}")),
+        };
         let live = self.live_routes().await.map_err(error_string)?;
         let names = self.room_names(&live).await?;
         let rooms = self.store.rooms().await.map_err(error_string)?;
         let mut settings = rooms.get(&route.id.to_string()).cloned();
         match method {
             "room.open" => {
-                if settings.is_none() {
-                    settings = Some(RoomSettings::default());
+                let mut opened = settings.clone().unwrap_or_default();
+                if let Some(titles) = &member_titles {
+                    opened.members = room_members(&routes, &rooms, &route, titles)?;
+                }
+                if settings.as_ref() != Some(&opened) {
+                    settings = Some(opened);
                     self.store
                         .set_room(route.id, settings.clone())
                         .await
@@ -2526,8 +2579,15 @@ impl ProductionService {
                 if settings.is_none() {
                     return Err(format!("{title} is not a room; open it first"));
                 }
-                self.post_to_room(&live, &route, speaker.to_owned(), text.to_owned())
-                    .await?;
+                self.post_to_room(
+                    &live,
+                    &routes,
+                    &route,
+                    settings.as_ref(),
+                    speaker.to_owned(),
+                    text.to_owned(),
+                )
+                .await?;
                 // The route's private chat mirrors the room.
                 if let Some((kind, destination)) =
                     crate::service::offline::private_destination(&route)
@@ -2573,7 +2633,10 @@ impl ProductionService {
                 } else if let Some(paused) =
                     params.get("paused").and_then(serde_json::Value::as_bool)
                 {
-                    settings = Some(RoomSettings { paused });
+                    settings = Some(RoomSettings {
+                        paused,
+                        ..settings.unwrap_or_default()
+                    });
                 }
                 self.store
                     .set_room(route.id, settings.clone())
@@ -2603,22 +2666,16 @@ impl ProductionService {
             }
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         };
-        let members = live
-            .route(&route.title)
-            .map(|live_route| {
-                live_route
-                    .agents
-                    .iter()
-                    .map(|agent| {
-                        json!({
-                            "name": names.get(&agent.agent_id).cloned().unwrap_or_else(|| agent.agent_id.clone()),
-                            "harness": agent.harness,
-                            "working": live.is_working(agent),
-                        })
-                    })
-                    .collect::<Vec<_>>()
+        let members = room_agents(&live, &routes, &route, settings.as_ref())
+            .iter()
+            .map(|agent| {
+                json!({
+                    "name": names.get(&agent.agent_id).cloned().unwrap_or_else(|| agent.agent_id.clone()),
+                    "harness": agent.harness,
+                    "working": live.is_working(agent),
+                })
             })
-            .unwrap_or_default();
+            .collect::<Vec<_>>();
         let messages = messages
             .into_iter()
             .map(|message| {
@@ -3843,15 +3900,76 @@ fn reminder_body(owed: &[ReplyDebt], invalid: &[ReplyMessage]) -> String {
 }
 
 /// What an agent is told the first time a room message reaches it.
-fn room_intro(title: &str, members: &str) -> String {
+fn room_intro(title: &str, members: &str, member: bool) -> String {
     let others = if members.is_empty() {
         "the people in this chat".to_owned()
     } else {
         format!("{members} and the people in this chat")
     };
-    format!(
+    let mut intro = format!(
         "[Panetone room {title}] You are in a group chat with {others}. Everything you write in your replies is shown to everyone: it goes to the other agents as \"<your name> says: ...\", and their messages and the people's reach you the same way. Talk to the others by name when you mean them. When a message needs nothing from you, reply with exactly <panetone:no-reply> so the room stays quiet."
-    )
+    );
+    if member {
+        intro.push_str(&format!(
+            " You keep your own chat: only your replies in turns that received a room message reach the room. To post a message from any other turn to the room, such as a result the others are waiting for, put {ROOM_MARKER} on its own line in it."
+        ));
+    }
+    intro
+}
+
+/// The routes named as a room's members. A route can be in one room only,
+/// and a room cannot be another room's member.
+fn room_members(
+    routes: &[Route],
+    rooms: &BTreeMap<String, RoomSettings>,
+    room: &Route,
+    titles: &[&str],
+) -> Result<Vec<RouteId>, String> {
+    let mut members = Vec::new();
+    for title in titles {
+        let member =
+            exact_route(routes, title).map_err(|_| format!("no route is titled {title:?}"))?;
+        if member.id == room.id {
+            return Err(format!("{} cannot be a member of itself", room.title));
+        }
+        if rooms.contains_key(&member.id.to_string()) {
+            return Err(format!("{} is a room itself", member.title));
+        }
+        if let Some((other, _)) = crate::store::room_of(rooms, member.id)
+            && other != room.id
+        {
+            let other = routes
+                .iter()
+                .find(|route| route.id == other)
+                .map_or_else(|| other.to_string(), |route| route.title.clone());
+            return Err(format!(
+                "{} is already a member of room {other}",
+                member.title
+            ));
+        }
+        if !members.contains(&member.id) {
+            members.push(member.id);
+        }
+    }
+    Ok(members)
+}
+
+/// The live agents in a room: those of its own route and of its member routes.
+fn room_agents(
+    live: &LiveRouteSnapshot,
+    routes: &[Route],
+    room: &Route,
+    settings: Option<&RoomSettings>,
+) -> Vec<AgentBinding> {
+    let members = settings
+        .into_iter()
+        .flat_map(|settings| settings.members.iter())
+        .filter_map(|id| routes.iter().find(|route| route.id == *id));
+    std::iter::once(room)
+        .chain(members)
+        .filter_map(|route| live.route(&route.title).ok())
+        .flat_map(|live_route| live_route.agents.iter().cloned())
+        .collect()
 }
 
 fn resolve_live(
@@ -6262,6 +6380,19 @@ fi
         directory: &std::path::Path,
         harnesses: &[&str],
     ) -> (ProductionService, StoreHandle, Route, std::path::PathBuf) {
+        let tabs = harnesses
+            .iter()
+            .map(|harness| (*harness, "game"))
+            .collect::<Vec<_>>();
+        room_fixture_in_tabs(directory, &tabs).await
+    }
+
+    /// [`room_fixture`] with each agent, given by harness, in a tab of the
+    /// given title; agent `agent-HARNESS` is named `TITLE_HARNESS`.
+    async fn room_fixture_in_tabs(
+        directory: &std::path::Path,
+        tabs: &[(&str, &str)],
+    ) -> (ProductionService, StoreHandle, Route, std::path::PathBuf) {
         let binary = directory.join("wakterm-fake");
         let admitted = directory.join("admitted.log");
         fs::write(
@@ -6295,11 +6426,11 @@ fi
                 catalog = json!({
                     "schema": "wakterm.agent-api.v1",
                     "as_of_event_sequence": 10,
-                    "agents": harnesses.iter().enumerate().map(|(index, harness)| json!({
+                    "agents": tabs.iter().enumerate().map(|(index, (harness, title))| json!({
                         "agent_id": format!("agent-{harness}"),
                         "incarnation_id": format!("inc-{harness}"),
                         "pane_id": index + 1,
-                        "name": format!("game_{harness}"),
+                        "name": format!("{title}_{harness}"),
                         "harness": harness,
                         "status": "idle",
                         "turn_state": "waiting_on_user",
@@ -6307,11 +6438,11 @@ fi
                         "observed_at": "2026-10-20T00:00:00Z",
                     })).collect::<Vec<_>>(),
                 }),
-                panes = json!(harnesses.iter().enumerate().map(|(index, _)| json!({
+                panes = json!(tabs.iter().enumerate().map(|(index, (_, title))| json!({
                     "pane_id": index + 1,
                     "tab_id": index + 1,
                     "window_id": 1,
-                    "effective_title": "game",
+                    "effective_title": title,
                 })).collect::<Vec<_>>()),
             ),
         )
@@ -6374,6 +6505,282 @@ fi
         );
         drop(service);
         store.shutdown().await.unwrap();
+    }
+
+    /// The prompts the fake Wakterm admitted, by agent, in order.
+    fn admitted_prompts(log: &std::path::Path) -> Vec<(String, String)> {
+        fs::read_to_string(log)
+            .unwrap()
+            .split("== ")
+            .skip(1)
+            .map(|entry| {
+                let (agent, prompt) = entry.split_once('\n').unwrap();
+                (agent.to_owned(), prompt.trim_end_matches('\n').to_owned())
+            })
+            .collect()
+    }
+
+    fn room_event(
+        sequence: u64,
+        kind: &str,
+        agent: &str,
+        turn: &str,
+        extra: serde_json::Value,
+    ) -> crate::wakterm::EventRecord {
+        let mut event = json!({
+            "sequence": sequence,
+            "event_id": format!("event-{sequence}"),
+            "kind": kind,
+            "agent_id": format!("agent-{agent}"),
+            "incarnation_id": format!("inc-{agent}"),
+            "turn_id": turn,
+            "observed_at": "2099-01-01T00:00:00Z",
+        });
+        event
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(event).unwrap()
+    }
+
+    #[tokio::test]
+    async fn member_routes_share_a_room_and_keep_their_own_chats() {
+        let directory = tempdir().unwrap();
+        let (service, store, _game, admitted) = room_fixture_in_tabs(
+            directory.path(),
+            &[("claude", "alpha"), ("agy", "beta"), ("codex", "gamma")],
+        )
+        .await;
+        let route = |id: u128, title: &str, topic_id: i64| Route {
+            id: RouteId::new(Uuid::from_u128(id)),
+            title: title.into(),
+            channels: vec![ChannelBinding::Telegram { topic_id }],
+            agent: None,
+        };
+        let routes = [
+            route(701, "alpha", 71),
+            route(702, "beta", 72),
+            route(703, "gamma", 73),
+            route(710, "trio", 79),
+        ];
+        for route in &routes {
+            store.save_route(route.clone(), 1).await.unwrap();
+        }
+
+        // gamma is not a member, so its agent hears nothing.
+        let opened = service
+            .handle_room(
+                "room.open",
+                &json!({"title": "trio", "members": ["alpha", "beta"]}),
+            )
+            .await
+            .unwrap();
+        let names = opened["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|member| member["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["alpha_claude", "beta_agy"]);
+        let refused = service
+            .handle_room("room.open", &json!({"title": "game", "members": ["alpha"]}))
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("already a member of room trio"),
+            "{refused}"
+        );
+
+        service
+            .handle_room(
+                "room.say",
+                &json!({"title": "trio", "name": "Mihai", "text": "plan the release"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(service.rooms_once().await.unwrap(), 2);
+        let prompts = admitted_prompts(&admitted);
+        assert_eq!(
+            prompts
+                .iter()
+                .map(|(agent, _)| agent.as_str())
+                .collect::<Vec<_>>(),
+            ["agent-claude", "agent-agy"]
+        );
+        for (_, prompt) in &prompts {
+            assert!(prompt.contains("[Panetone room trio]"), "{prompt}");
+            assert!(
+                prompt.contains("put [panetone:room] on its own line"),
+                "{prompt}"
+            );
+            assert!(prompt.ends_with("Mihai says: plan the release"), "{prompt}");
+        }
+        let hash = |text: &str| DeliveryProof::input_sha256(text);
+
+        let live = service.live_routes().await.unwrap();
+        let agents = project_live_routes(&routes, &live).unwrap();
+        let events = vec![
+            // alpha answers in the turn the room message started: it joins.
+            room_event(
+                101,
+                "turn_started",
+                "claude",
+                "t1",
+                json!({"input_sha256": hash(&prompts[0].1)}),
+            ),
+            room_event(
+                102,
+                "assistant_message",
+                "claude",
+                "t1",
+                json!({"text": "Ship Friday?"}),
+            ),
+            // beta was busy; the room message was steered into its turn.
+            room_event(
+                103,
+                "turn_started",
+                "agy",
+                "t2",
+                json!({"input_sha256": hash("own work")}),
+            ),
+            room_event(
+                104,
+                "input_accepted",
+                "agy",
+                "t2",
+                json!({"input_sha256": hash(&prompts[1].1)}),
+            ),
+            room_event(
+                105,
+                "assistant_message",
+                "agy",
+                "t2",
+                json!({"text": "Friday works."}),
+            ),
+            // alpha's private turn stays in alpha's own chat...
+            room_event(
+                106,
+                "turn_started",
+                "claude",
+                "t3",
+                json!({"input_sha256": hash("private question")}),
+            ),
+            room_event(
+                107,
+                "assistant_message",
+                "claude",
+                "t3",
+                json!({"text": "private answer"}),
+            ),
+            // ...except a message marked for the room.
+            room_event(
+                108,
+                "assistant_message",
+                "claude",
+                "t3",
+                json!({"text": "Build passed.\n\n[panetone:room]"}),
+            ),
+        ];
+        store
+            .ingest_agent_events(100, 108, events, agents, now_ms())
+            .await
+            .unwrap();
+
+        let transcript = service
+            .handle_room("room.poll", &json!({"title": "trio", "after": 0}))
+            .await
+            .unwrap();
+        let lines = transcript["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| {
+                format!(
+                    "{}: {}",
+                    message["name"].as_str().unwrap(),
+                    message["text"].as_str().unwrap()
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            [
+                "Mihai: plan the release",
+                "alpha_claude: Ship Friday?",
+                "beta_agy: Friday works.",
+                "alpha_claude: Build passed.",
+            ]
+        );
+
+        // Each member's own topic shows all its output, without the marker;
+        // the room's topic shows the room under the speakers' names.
+        let posts = store
+            .pending_outbox()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|item| (item.destination, item.body))
+            .collect::<Vec<_>>();
+        let topic = |topic: &str| {
+            posts
+                .iter()
+                .filter(|(destination, _)| destination == topic)
+                .map(|(_, body)| body.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            topic("71"),
+            ["Ship Friday?", "private answer", "Build passed."]
+        );
+        assert_eq!(topic("72"), ["Friday works."]);
+        assert_eq!(
+            topic("79"),
+            [
+                "Mihai: plan the release",
+                "alpha_claude: Ship Friday?",
+                "beta_agy: Friday works.",
+                "alpha_claude: Build passed.",
+            ]
+        );
+
+        // Each agent hears the other member's room messages and nothing private.
+        fs::write(&admitted, "").unwrap();
+        assert_eq!(service.rooms_once().await.unwrap(), 3);
+        let heard = admitted_prompts(&admitted)
+            .into_iter()
+            .map(|(agent, prompt)| format!("{agent} {prompt}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            heard,
+            [
+                "agent-agy alpha_claude says: Ship Friday?",
+                "agent-claude beta_agy says: Friday works.",
+                "agent-agy alpha_claude says: Build passed.",
+            ]
+        );
+
+        // Pausing keeps the members.
+        service
+            .handle_room("room.set", &json!({"title": "trio", "paused": true}))
+            .await
+            .unwrap();
+        let rooms = store.rooms().await.unwrap();
+        assert_eq!(rooms[&routes[3].id.to_string()].members.len(), 2);
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn the_room_marker_is_found_only_on_its_own_line_outside_code() {
+        use crate::store::rooms_take_marker as take;
+        assert_eq!(take("done\n[panetone:room]").as_deref(), Some("done"));
+        assert_eq!(
+            take("[panetone:room]\nfirst\n\n\n\nsecond").as_deref(),
+            Some("first\n\nsecond")
+        );
+        assert_eq!(take("say [panetone:room] inline"), None);
+        assert_eq!(take("```\n[panetone:room]\n```"), None);
+        assert_eq!(take("    [panetone:room]"), None);
     }
 
     #[tokio::test]

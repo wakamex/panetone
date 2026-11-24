@@ -28,7 +28,10 @@ mod replies;
 mod rooms;
 
 pub use replies::{ReplyDebt, ReplyMessage, TurnEnd};
-pub use rooms::{RoomDelivery, RoomMessage, RoomSettings};
+pub use rooms::{
+    ROOM_MARKER, ROOM_NAMES_KEY, RoomDelivery, RoomMessage, RoomSettings, room_of,
+    take_marker as rooms_take_marker,
+};
 
 pub const SCHEMA_VERSION: i64 = 9;
 const COMMAND_CAPACITY: usize = 128;
@@ -1914,6 +1917,15 @@ fn ingest_event(
         .map_err(|detail| StoreError::Conflict(detail.into()))?
         .map(|body| strip_memory_citations(&body))
         .filter(|body| !body.trim().is_empty());
+    // A message marked for the room joins it from any turn, and is shown
+    // without the marker.
+    let (visible_body, room_marked) = match visible_body {
+        Some(body) if event.kind == "assistant_message" => match rooms::take_marker(&body) {
+            Some(clean) => (Some(clean).filter(|body| !body.is_empty()), true),
+            None => (Some(body), false),
+        },
+        other => (other, false),
+    };
     // Output an agent produced long before Panetone saw it is a replay of
     // its history, such as a new incarnation reporting its transcript
     // again; it was shown when it was new. Late output of the agent's latest
@@ -1992,12 +2004,22 @@ fn ingest_event(
             )?;
         }
         // In a room, an agent's message joins the transcript and goes to the
-        // room's other agents.
-        if let (Some(settings), true, Some(body)) = (
-            rooms.get(&route.id.to_string()),
+        // room's other agents. A member route's agent joins only from turns
+        // that received a room message, or with a marked message.
+        if let (Some((room_id, settings)), true, Some(body)) = (
+            rooms::room_of(rooms, route.id),
             event.kind == "assistant_message" && approval.is_none(),
             visible_body.as_deref(),
-        ) {
+        ) && (room_id == route.id
+            || room_marked
+            || event
+                .fields
+                .get("turn_id")
+                .and_then(|value| value.as_str())
+                .map(|turn_id| rooms::is_room_turn(transaction, &event.agent_id, turn_id))
+                .transpose()?
+                .unwrap_or(false))
+        {
             let text = tagged
                 .as_ref()
                 .map_or(body, |tagged| tagged.clean.as_str())
@@ -2012,25 +2034,73 @@ fn ingest_event(
                     route_agents
                         .iter()
                         .filter(|candidate| {
-                            candidate.route_id == route.id
+                            (candidate.route_id == room_id
+                                || settings.members.contains(&candidate.route_id))
                                 && candidate.agent.agent_id != event.agent_id
                         })
                         .map(|candidate| candidate.agent.agent_id.clone())
                         .collect()
                 };
+                let harness = route_agent.map(|candidate| candidate.agent.harness.clone());
                 rooms::post(
                     transaction,
-                    route.id,
+                    room_id,
                     RoomMessage {
                         id: 0,
                         kind: "agent".into(),
                         speaker: event.agent_id.clone(),
-                        harness: route_agent.map(|candidate| candidate.agent.harness.clone()),
+                        harness: harness.clone(),
                         text: text.trim().to_owned(),
                         created_at_ms: now_ms,
                     },
                     &recipients,
                 )?;
+                // A member's own channel shows its output as usual; the room's
+                // channel shows it too, under the agent's name.
+                if room_id != route.id
+                    && let Some((kind, destination)) = routes
+                        .iter()
+                        .find(|candidate| candidate.id == room_id)
+                        .and_then(Route::private_destination)
+                {
+                    let names: std::collections::BTreeMap<String, String> =
+                        get_metadata(transaction, ROOM_NAMES_KEY)?
+                            .map(|json| serde_json::from_str(&json))
+                            .transpose()?
+                            .unwrap_or_default();
+                    let name = names.get(&event.agent_id).cloned().unwrap_or_else(|| {
+                        format!("{}_{}", route.title, harness.as_deref().unwrap_or("agent"))
+                    });
+                    let namespace = Uuid::new_v5(
+                        &Uuid::NAMESPACE_URL,
+                        b"https://panetone.dev/rooms/members/v1",
+                    );
+                    let item = OutboxItem {
+                        id: EffectId::new(Uuid::new_v5(
+                            &namespace,
+                            format!("{}\0{}", event.incarnation_id, event.event_id).as_bytes(),
+                        )),
+                        route_id: Some(room_id),
+                        sender_harness: harness,
+                        source_agent: route_agent.map(|candidate| candidate.agent.clone()),
+                        kind,
+                        destination,
+                        body: format!("{name}: {}", text.trim()),
+                        attachments: Vec::new(),
+                        actions: Vec::new(),
+                        state: OutboxState::Pending,
+                        attempts: 0,
+                        last_error: None,
+                        external_receipt: None,
+                        uncertain_attempts: 0,
+                        part: None,
+                        owner: None,
+                        turn_end: None,
+                    };
+                    for chunk in crate::domain::chunk_outbox(item) {
+                        enqueue_outbox(transaction, None, &chunk, now_ms)?;
+                    }
+                }
             }
         }
         let destination = if approval.is_some() {

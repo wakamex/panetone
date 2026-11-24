@@ -169,6 +169,11 @@ struct SendArgs {
 struct ChatArgs {
     /// The route to chat in. It becomes a room if it is not one already.
     room: String,
+    /// Another route whose agents join the room while keeping their own tab,
+    /// route and channels; repeat it for each. A room of member routes needs
+    /// no tab of its own and is created when no route has its title.
+    #[arg(long = "with", value_name = "ROUTE")]
+    members: Vec<String>,
     /// The name others see for you (default: your login name, capitalized).
     #[arg(long = "as")]
     name: Option<String>,
@@ -406,7 +411,13 @@ async fn main() -> Result<()> {
                     .map(|first| first.to_uppercase().chain(letters).collect())
                     .unwrap_or(login)
             });
-            panetone::chat::run(control_socket(args.control.socket)?, args.room, name).await
+            panetone::chat::run(
+                control_socket(args.control.socket)?,
+                args.room,
+                args.members,
+                name,
+            )
+            .await
         }
         Command::Route(args) => run_route(args).await,
         Command::Output(args) => run_output(args).await,

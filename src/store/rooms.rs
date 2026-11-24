@@ -1,6 +1,7 @@
 //! Rooms: routes where everyone sees everything. Each message, from the user
-//! or from one of the route's agents, is kept in the room's transcript and
-//! delivered to every other agent in the room.
+//! or from one of the room's agents, is kept in the room's transcript and
+//! delivered to every other agent in the room. A room's agents are those of
+//! its own route and of its member routes, which keep their own channels.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,15 @@ pub(super) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS room_messages (
          record_json TEXT NOT NULL,
          created_at_ms INTEGER NOT NULL
      );
-     CREATE INDEX IF NOT EXISTS room_deliveries_state ON room_deliveries(state, id);";
+     CREATE INDEX IF NOT EXISTS room_deliveries_state ON room_deliveries(state, id);
+     CREATE INDEX IF NOT EXISTS room_deliveries_agent ON room_deliveries(agent_id);";
+
+/// Display names of room speakers by agent ID, remembered so an agent that
+/// has gone keeps its name in the transcript.
+pub const ROOM_NAMES_KEY: &str = "room_names_v1";
+
+/// The line an agent writes to post a message to its room from any turn.
+pub const ROOM_MARKER: &str = "[panetone:room]";
 
 const ROOMS_KEY: &str = "rooms_v1";
 
@@ -34,6 +43,82 @@ pub struct RoomSettings {
     /// user's still are.
     #[serde(default)]
     pub paused: bool,
+    /// Other routes whose agents are in the room. Each keeps its own channels,
+    /// and only the turns that received a room message, or messages marked
+    /// with [`ROOM_MARKER`], join the room.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<RouteId>,
+}
+
+/// The room a route's agents are in: the route itself when it is a room, or
+/// the room that lists it as a member.
+pub fn room_of(
+    rooms: &std::collections::BTreeMap<String, RoomSettings>,
+    route_id: RouteId,
+) -> Option<(RouteId, &RoomSettings)> {
+    if let Some(settings) = rooms.get(&route_id.to_string()) {
+        return Some((route_id, settings));
+    }
+    rooms.iter().find_map(|(key, settings)| {
+        settings
+            .members
+            .contains(&route_id)
+            .then(|| uuid::Uuid::parse_str(key).ok())
+            .flatten()
+            .map(|room| (RouteId::from(room), settings))
+    })
+}
+
+/// A message without its standalone [`ROOM_MARKER`] lines outside code, or
+/// `None` when it has none.
+pub fn take_marker(body: &str) -> Option<String> {
+    let mut fence: Option<&str> = None;
+    let mut found = false;
+    let mut kept = Vec::new();
+    for line in body.split('\n') {
+        let trimmed = line.trim();
+        if let Some(marker) = fence {
+            if trimmed.starts_with(marker) {
+                fence = None;
+            }
+        } else if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fence = Some(&trimmed[..3]);
+        } else if trimmed == ROOM_MARKER && !line.starts_with("    ") && !line.starts_with('\t') {
+            found = true;
+            continue;
+        }
+        kept.push(line);
+    }
+    let mut clean = kept.join("\n").trim().to_owned();
+    while clean.contains("\n\n\n") {
+        clean = clean.replace("\n\n\n", "\n\n");
+    }
+    found.then_some(clean)
+}
+
+/// Whether the turn of an agent's event received a room message, either as
+/// the input that started it or steered into it.
+pub(super) fn is_room_turn(
+    connection: &Connection,
+    agent_id: &str,
+    turn_id: &str,
+) -> StoreResult<bool> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM agent_events input JOIN room_deliveries delivery
+               ON delivery.agent_id = input.agent_id
+              AND json_extract(input.record_json, '$.input_sha256') IN (
+                  json_extract(delivery.record_json, '$.input_sha256'),
+                  json_extract(delivery.record_json, '$.tab_expanded_sha256')
+              )
+             WHERE input.agent_id = ?1 AND input.kind IN ('turn_started', 'input_accepted')
+               AND json_extract(input.record_json, '$.turn_id') = ?2
+             LIMIT 1",
+            params![agent_id, turn_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 /// One message in a room's transcript.
@@ -66,6 +151,12 @@ pub struct RoomDelivery {
     pub text: String,
     #[serde(default)]
     pub attempts: u32,
+    /// Hashes of the prompt as delivered, as Wakterm reports its input, so
+    /// the turn that received it can be recognized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_expanded_sha256: Option<String>,
 }
 
 pub(super) fn rooms(
@@ -116,6 +207,8 @@ pub(super) fn post(
             speaker_is_agent: message.kind == "agent",
             text: message.text.clone(),
             attempts: 0,
+            input_sha256: None,
+            tab_expanded_sha256: None,
         };
         transaction.execute(
             "INSERT INTO room_deliveries(route_id, agent_id, state, record_json, created_at_ms)
