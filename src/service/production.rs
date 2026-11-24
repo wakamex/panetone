@@ -1110,6 +1110,12 @@ impl ProductionService {
                     .iter()
                     .any(|agent| agent.agent_id == binding.agent_id)
             });
+            // A member agent busy with its own work hears the room when its
+            // turn ends, so each room message starts a turn of its own and the
+            // work turn's output stays out of the room.
+            if member && live.is_working(&binding) {
+                continue;
+            }
             let speaker = if delivery.speaker_is_agent {
                 names
                     .get(&delivery.speaker)
@@ -1184,9 +1190,7 @@ impl ProductionService {
             };
             let state = match receipt.status {
                 AdmissionStatus::Accepted => "delivered",
-                // A member agent busy with its own work hears the room when its
-                // turn ends, so each room message starts a turn of its own and
-                // the work turn's output stays out of the room.
+                // A member that started a turn since the snapshot waits too.
                 AdmissionStatus::Busy if member => continue,
                 AdmissionStatus::Busy => match self.wakterm.steer(&binding, &text).await {
                     Ok(_) => "delivered",
@@ -6408,7 +6412,13 @@ operation="$*"
 if [[ "$operation" == *"agent capabilities"* ]]; then
   printf '%s\n' '{{"schema":"wakterm.agent-api.v1","api_major":1,"capabilities":["catalog.v1","prompt_admission.v1","return_request_terminal_stream.v1","event_stream.v1"]}}'
 elif [[ "$operation" == *"agent catalog"* ]]; then
-  printf '%s\n' '{catalog}'
+  catalog='{catalog}'
+  for busy in '{log}'.busy-*; do
+    [[ -e "$busy" ]] || continue
+    agent=${{busy##*.busy-}}
+    catalog=$(printf '%s' "$catalog" | sed -E "s/(\"agent_id\":\"$agent\"[^}}]*\"turn_state\":\")waiting_on_user/\1waiting_on_agent/")
+  done
+  printf '%s\n' "$catalog"
 elif [[ "$operation" == *"list --format json"* ]]; then
   printf '%s\n' '{panes}'
 elif [[ "$operation" == *"agent admit"* ]]; then
@@ -6419,7 +6429,8 @@ elif [[ "$operation" == *"agent admit"* ]]; then
     shift
   done
   incarnation=inc-${{agent#agent-}}
-  if [[ -e '{log}.busy-'"$agent" ]]; then
+  if [[ -e '{log}.busy-'"$agent" || -e '{log}.refuse-'"$agent" ]]; then
+    echo "$agent" >> '{log}.refused'
     printf '{{"schema":"wakterm.agent-api.v1","request_id":"%s","status":"busy","definitive":true,"prompt_written":false,"agent_id":"%s","incarnation_id":"%s","detail":"busy"}}\n' "$request_id" "$agent" "$incarnation"
     exit 0
   fi
@@ -6600,8 +6611,10 @@ fi
         );
 
         // beta is busy with its own work: its copy waits for the turn to end
-        // instead of being steered into it.
-        let busy = std::path::PathBuf::from(format!("{}.busy-agent-agy", admitted.display()));
+        // instead of being steered into it, without asking Wakterm meanwhile.
+        let marker =
+            |name: &str| std::path::PathBuf::from(format!("{}.{name}", admitted.display()));
+        let busy = marker("busy-agent-agy");
         fs::write(&busy, "").unwrap();
         service
             .handle_room(
@@ -6612,7 +6625,18 @@ fi
             .unwrap();
         assert_eq!(service.rooms_once().await.unwrap(), 1);
         assert_eq!(service.rooms_once().await.unwrap(), 0);
+        assert!(!marker("refused").exists());
+        // beta starts a turn after the snapshot showed it idle: Wakterm
+        // refuses, and the message still waits.
         fs::remove_file(&busy).unwrap();
+        let refuse = marker("refuse-agent-agy");
+        fs::write(&refuse, "").unwrap();
+        assert_eq!(service.rooms_once().await.unwrap(), 0);
+        assert_eq!(
+            fs::read_to_string(marker("refused")).unwrap(),
+            "agent-agy\n"
+        );
+        fs::remove_file(&refuse).unwrap();
         assert_eq!(service.rooms_once().await.unwrap(), 1);
         let prompts = admitted_prompts(&admitted);
         assert_eq!(
