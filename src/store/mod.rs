@@ -2060,7 +2060,7 @@ fn ingest_event(
         // message here, and from a room turn with its final message, when
         // the turn ends; its notes along the way stay on its own route.
         if let (Some((room_id, settings)), true, Some(body)) = (
-            rooms::room_of(rooms, route.id),
+            rooms::room_of(rooms, route.id, &event.agent_id),
             event.kind == "assistant_message" && approval.is_none(),
             visible_body.as_deref(),
         ) && (room_id == route.id || room_marked)
@@ -2199,7 +2199,8 @@ fn ingest_event(
         && let Some((message, text)) =
             cut_off_room_answer(transaction, rooms, route, event, now_ms)?
     {
-        let room = rooms::room_of(rooms, route.id).expect("the answer's room exists");
+        let room =
+            rooms::room_of(rooms, route.id, &event.agent_id).expect("the answer's room exists");
         post_to_room(
             transaction,
             routes,
@@ -2218,7 +2219,8 @@ fn ingest_event(
         record_turn_end(transaction, event, route, state == "projected", now_ms)?;
         tell_owner_of_silent_turn(transaction, route, event, now_ms)?;
         if let Some(text) = member_room_answer(transaction, rooms, route, event, now_ms)? {
-            let room = rooms::room_of(rooms, route.id).expect("the answer's room exists");
+            let room =
+                rooms::room_of(rooms, route.id, &event.agent_id).expect("the answer's room exists");
             post_to_room(
                 transaction,
                 routes,
@@ -2332,7 +2334,9 @@ fn member_room_answer(
     event: &EventRecord,
     now_ms: i64,
 ) -> StoreResult<Option<String>> {
-    if !rooms::room_of(rooms, route.id).is_some_and(|(room_id, _)| room_id != route.id) {
+    if !rooms::room_of(rooms, route.id, &event.agent_id)
+        .is_some_and(|(room_id, _)| room_id != route.id)
+    {
         return Ok(None);
     }
     // An aborted turn's final carries its failure; its answer is the last
@@ -2416,7 +2420,9 @@ fn cut_off_room_answer(
     event: &EventRecord,
     now_ms: i64,
 ) -> StoreResult<Option<(EventRecord, String)>> {
-    if !rooms::room_of(rooms, route.id).is_some_and(|(room_id, _)| room_id != route.id) {
+    if !rooms::room_of(rooms, route.id, &event.agent_id)
+        .is_some_and(|(room_id, _)| room_id != route.id)
+    {
         return Ok(None);
     }
     let turn_id = event.fields.get("turn_id").and_then(|value| value.as_str());
@@ -2525,7 +2531,9 @@ fn post_to_room(
         route_agents
             .iter()
             .filter(|candidate| {
-                (candidate.route_id == room_id || settings.members.contains(&candidate.route_id))
+                (candidate.route_id == room_id
+                    || settings.members.contains(&candidate.route_id)
+                    || settings.agents.contains(&candidate.agent.agent_id))
                     && candidate.agent.agent_id != event.agent_id
             })
             .map(|candidate| candidate.agent.agent_id.clone())

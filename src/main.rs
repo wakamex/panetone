@@ -169,10 +169,11 @@ struct SendArgs {
 struct ChatArgs {
     /// The route to chat in. It becomes a room if it is not one already.
     room: String,
-    /// Another route whose agents join the room while keeping their own tab,
-    /// route and channels; repeat it for each. A room of member routes needs
-    /// no tab of its own and is created when no route has its title.
-    #[arg(long = "with", value_name = "ROUTE")]
+    /// A route whose agents join the room while keeping their own tab, route
+    /// and channels, or one agent's Wakterm name for that agent alone, as
+    /// `panetone send --to` takes them; repeat it for each. A room of members
+    /// needs no tab of its own and is created when no route has its title.
+    #[arg(long = "with", value_name = "ROUTE_OR_AGENT")]
     members: Vec<String>,
     /// The name others see for you (default: your login name, capitalized).
     #[arg(long = "as")]

@@ -48,24 +48,29 @@ pub struct RoomSettings {
     /// [`ROOM_MARKER`], join the room.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<RouteId>,
+    /// Single agents in the room, by Wakterm agent ID, each without the
+    /// other agents of its tab; they are members as a member route's agents
+    /// are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<String>,
 }
 
-/// The room a route's agents are in: the route itself when it is a room, or
-/// the room that lists it as a member.
-pub fn room_of(
-    rooms: &std::collections::BTreeMap<String, RoomSettings>,
+/// The room an agent of a route is in: the route itself when it is a room,
+/// or the room that lists the route or the agent as a member.
+pub fn room_of<'a>(
+    rooms: &'a std::collections::BTreeMap<String, RoomSettings>,
     route_id: RouteId,
-) -> Option<(RouteId, &RoomSettings)> {
+    agent_id: &str,
+) -> Option<(RouteId, &'a RoomSettings)> {
     if let Some(settings) = rooms.get(&route_id.to_string()) {
         return Some((route_id, settings));
     }
     rooms.iter().find_map(|(key, settings)| {
-        settings
-            .members
-            .contains(&route_id)
-            .then(|| uuid::Uuid::parse_str(key).ok())
-            .flatten()
-            .map(|room| (RouteId::from(room), settings))
+        (settings.members.contains(&route_id)
+            || settings.agents.iter().any(|agent| agent == agent_id))
+        .then(|| uuid::Uuid::parse_str(key).ok())
+        .flatten()
+        .map(|room| (RouteId::from(room), settings))
     })
 }
 

@@ -2641,7 +2641,8 @@ impl ProductionService {
             "room.open" => {
                 let mut opened = settings.clone().unwrap_or_default();
                 if let Some(titles) = &member_titles {
-                    opened.members = room_members(&routes, &rooms, &route, titles)?;
+                    (opened.members, opened.agents) =
+                        room_members(&routes, &rooms, &live, &route, titles)?;
                 }
                 if settings.as_ref() != Some(&opened) {
                     settings = Some(opened);
@@ -4146,44 +4147,72 @@ fn room_intro(title: &str, members: &str, member: bool) -> String {
     intro
 }
 
-/// The routes named as a room's members. A route can be in one room only,
-/// and a room cannot be another room's member.
+/// The members a room is opened with, each named as a route title, for every
+/// agent of that route, or as a Wakterm agent's name, for that agent alone,
+/// as `panetone send --to` resolves them. A route or agent can be in one room
+/// only, and a room cannot be another room's member.
 fn room_members(
     routes: &[Route],
     rooms: &BTreeMap<String, RoomSettings>,
+    live: &LiveRouteSnapshot,
     room: &Route,
     titles: &[&str],
-) -> Result<Vec<RouteId>, String> {
+) -> Result<(Vec<RouteId>, Vec<String>), String> {
+    let room_title = |id: RouteId| {
+        routes
+            .iter()
+            .find(|route| route.id == id)
+            .map_or_else(|| id.to_string(), |route| route.title.clone())
+    };
     let mut members = Vec::new();
+    let mut agents = Vec::new();
     for title in titles {
-        let member =
-            exact_route(routes, title).map_err(|_| format!("no route is titled {title:?}"))?;
+        let Ok(member) = exact_route(routes, title) else {
+            let (live_route, agent) = live
+                .agent_named(title)
+                .ok_or_else(|| format!("no route or live agent is named {title:?}"))?;
+            let agent_route = exact_route(routes, &live_route.title)
+                .map_err(|_| format!("agent {title} has no route"))?;
+            if agent_route.id == room.id {
+                return Err(format!("{title} is already in {}", room.title));
+            }
+            if let Some((other, _)) = crate::store::room_of(rooms, agent_route.id, &agent.agent_id)
+                && other != room.id
+            {
+                return Err(format!(
+                    "{title} is already a member of room {}",
+                    room_title(other)
+                ));
+            }
+            if !agents.contains(&agent.agent_id) {
+                agents.push(agent.agent_id);
+            }
+            continue;
+        };
         if member.id == room.id {
             return Err(format!("{} cannot be a member of itself", room.title));
         }
         if rooms.contains_key(&member.id.to_string()) {
             return Err(format!("{} is a room itself", member.title));
         }
-        if let Some((other, _)) = crate::store::room_of(rooms, member.id)
+        if let Some((other, _)) = crate::store::room_of(rooms, member.id, "")
             && other != room.id
         {
-            let other = routes
-                .iter()
-                .find(|route| route.id == other)
-                .map_or_else(|| other.to_string(), |route| route.title.clone());
             return Err(format!(
-                "{} is already a member of room {other}",
-                member.title
+                "{} is already a member of room {}",
+                member.title,
+                room_title(other)
             ));
         }
         if !members.contains(&member.id) {
             members.push(member.id);
         }
     }
-    Ok(members)
+    Ok((members, agents))
 }
 
-/// The live agents in a room: those of its own route and of its member routes.
+/// The live agents in a room: those of its own route and of its member
+/// routes, and its single member agents.
 fn room_agents(
     live: &LiveRouteSnapshot,
     routes: &[Route],
@@ -4194,11 +4223,26 @@ fn room_agents(
         .into_iter()
         .flat_map(|settings| settings.members.iter())
         .filter_map(|id| routes.iter().find(|route| route.id == *id));
-    std::iter::once(room)
+    let mut agents = std::iter::once(room)
         .chain(members)
         .filter_map(|route| live.route(&route.title).ok())
         .flat_map(|live_route| live_route.agents.iter().cloned())
-        .collect()
+        .collect::<Vec<_>>();
+    for agent_id in settings
+        .into_iter()
+        .flat_map(|settings| settings.agents.iter())
+    {
+        if let Some(agent) = live
+            .routes()
+            .iter()
+            .flat_map(|live_route| live_route.agents.iter())
+            .find(|agent| &agent.agent_id == agent_id)
+            && !agents.contains(agent)
+        {
+            agents.push(agent.clone());
+        }
+    }
+    agents
 }
 
 fn resolve_live(
@@ -7616,6 +7660,128 @@ fi
                 "alpha: Half done.",
             ]
         );
+        drop(service);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_room_can_hold_one_agent_of_a_shared_tab_by_its_name() {
+        let directory = tempdir().unwrap();
+        let (service, store, _game, admitted) = room_fixture_in_tabs(
+            directory.path(),
+            &[("claude", "shared"), ("codex", "shared")],
+        )
+        .await;
+        let route = |id: u128, title: &str, topic_id: i64| Route {
+            id: RouteId::new(Uuid::from_u128(id)),
+            title: title.into(),
+            channels: vec![ChannelBinding::Telegram { topic_id }],
+            agent: None,
+        };
+        let routes = [route(701, "shared", 71), route(710, "solo", 79)];
+        for route in &routes {
+            store.save_route(route.clone(), 1).await.unwrap();
+        }
+        // The tab's Codex alone, by the name panetone send --to also takes.
+        let opened = service
+            .handle_room(
+                "room.open",
+                &json!({"title": "solo", "members": ["shared_codex"]}),
+            )
+            .await
+            .unwrap();
+        let names = opened["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|member| member["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["shared_codex"]);
+        let unknown = service
+            .handle_room(
+                "room.open",
+                &json!({"title": "solo", "members": ["nobody"]}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            unknown.contains("no route or live agent is named"),
+            "{unknown}"
+        );
+
+        service
+            .handle_room(
+                "room.say",
+                &json!({"title": "solo", "name": "Mihai", "text": "codex only"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(service.rooms_once().await.unwrap(), 1);
+        let prompts = admitted_prompts(&admitted);
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].0, "agent-codex");
+        let hash = |text: &str| DeliveryProof::input_sha256(text);
+        let live = service.live_routes().await.unwrap();
+        let agents = project_live_routes(&routes, &live).unwrap();
+        let events = vec![
+            room_event(
+                101,
+                "turn_started",
+                "codex",
+                "t1",
+                json!({"input_sha256": hash(&prompts[0].1)}),
+            ),
+            room_event(
+                102,
+                "assistant_message",
+                "codex",
+                "t1",
+                json!({"text": "Codex here."}),
+            ),
+            room_event(
+                103,
+                "turn_final",
+                "codex",
+                "t1",
+                json!({"outcome": "completed", "text": "Codex here."}),
+            ),
+            // The tab's other agent is not in the room, marker or not.
+            room_event(
+                104,
+                "turn_started",
+                "claude",
+                "t2",
+                json!({"input_sha256": hash("own work")}),
+            ),
+            room_event(
+                105,
+                "assistant_message",
+                "claude",
+                "t2",
+                json!({"text": "Claude here.\n[panetone:room]"}),
+            ),
+        ];
+        store
+            .ingest_agent_events(100, 105, events, agents, now_ms())
+            .await
+            .unwrap();
+        let transcript = service
+            .handle_room("room.poll", &json!({"title": "solo", "after": 0}))
+            .await
+            .unwrap();
+        let lines = transcript["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| {
+                format!(
+                    "{}: {}",
+                    message["name"].as_str().unwrap(),
+                    message["text"].as_str().unwrap()
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lines, ["Mihai: codex only", "shared_codex: Codex here."]);
         drop(service);
         store.shutdown().await.unwrap();
     }
