@@ -76,6 +76,24 @@ class ReportId(unittest.TestCase):
         self.assertEqual(len(set(ids)), 1, "the same request is sent again")
         self.assertEqual(len(ids), 3)
 
+    def test_a_daemon_restart_during_the_send_is_waited_out(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            gone = len(calls) == 1
+            return subprocess.CompletedProcess(
+                command,
+                1 if gone else 0,
+                stdout="" if gone else "{}",
+                stderr="Error: control socket error: No such file or directory (os error 2)" if gone else "",
+            )
+
+        with mock.patch("watch.subprocess.run", fake_run):
+            sent = send_report({"task:endchat": "retrying"}, "report", {}, interval=0)
+        self.assertEqual(sent.returncode, 0)
+        self.assertEqual(len(calls), 2)
+
     def test_an_agent_that_stays_away_still_fails_the_run(self):
         def fake_run(command, **kwargs):
             return subprocess.CompletedProcess(

@@ -89,18 +89,19 @@ def report_id(keys, occurrences=None):
     return str(uuid.uuid5(REPORT_NAMESPACE, "\n".join(sorted(names))))
 
 
-# Refusals that mean the route's agent is away for the moment, as while a mux
-# restart brings the agents back; nothing was accepted, so the same request
-# can be sent again.
-AGENT_AWAY = ("source_route_unavailable", "target_route_unavailable")
+# Failures that mean the send could not be taken for the moment: the route's
+# agent is away, as while a mux restart brings the agents back, or the daemon
+# is restarting and its control socket is gone. Nothing was accepted, so the
+# same request can be sent again.
+TRANSIENT = ("source_route_unavailable", "target_route_unavailable", "control socket error")
 
 
 def send_report(new, message, occurrences, tries=40, interval=3):
     """Sends a report, returning the completed process. An ID Panetone has
     seen with other content belongs to an earlier occurrence the count did
     not record, so the problems are counted as new occurrences once more. A
-    route whose agent is away is waited for up to two minutes, as a daemon
-    restart is."""
+    route whose agent is away, or a daemon that is restarting, is waited for
+    up to two minutes."""
     def send():
         for attempt in range(tries):
             sent = subprocess.run(
@@ -108,7 +109,7 @@ def send_report(new, message, occurrences, tries=40, interval=3):
                 capture_output=True,
                 text=True,
             )
-            if sent.returncode == 0 or not any(code in sent.stdout for code in AGENT_AWAY):
+            if sent.returncode == 0 or not any(code in sent.stdout + sent.stderr for code in TRANSIENT):
                 return sent
             if attempt < tries - 1:
                 time.sleep(interval)
